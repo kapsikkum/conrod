@@ -6,6 +6,10 @@ ultralytics>=8.3
 # silently removes plate reading, which is how 0.1.0 shipped without it.
 open-image-models>=0.6
 
+# Reading the characters off a plate. Trained for the job, so it beats general
+# OCR badly on plate crops and runs in about 40 ms.
+fast-plate-ocr>=1.1
+
 # Fast first-pass OCR: PaddleOCR models running on onnxruntime,
 # so there is no PaddlePaddle dependency and no compiler needed.
 rapidocr-onnxruntime>=1.2

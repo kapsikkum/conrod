@@ -94,6 +94,20 @@ def _check_plates(settings: Settings) -> tuple[str, str]:
     return OK, f"{settings.plate_model} loaded and ran"
 
 
+def _check_plate_reader(settings: Settings) -> tuple[str, str]:
+    """Loads its own ONNX model, so a frozen build can break it on its own."""
+    from . import plates
+    from PIL import Image as _Image
+
+    if not settings.plate_reader:
+        return SKIP, "turned off in settings"
+    card = _Image.new("RGB", (280, 90), (245, 245, 245))
+    ImageDraw.Draw(card).text((40, 35), "73111J", fill=(10, 10, 40))
+    text, conf = plates._read_plate_text(card, settings)
+    return OK, (f"{settings.plate_reader_model} ran"
+                + (f", read {text} at {conf:.2f}" if text else ", read nothing"))
+
+
 def _check_exiftool() -> tuple[str, str]:
     try:
         exe = find_exiftool()
@@ -127,6 +141,7 @@ def run() -> int:
         ("vehicle detector", lambda: _check_detector(settings)),
         ("text reader", lambda: _check_ocr(settings)),
         ("plate detector", lambda: _check_plates(settings)),
+        ("plate reader", lambda: _check_plate_reader(settings)),
         ("native window", _check_window),
         ("exiftool", _check_exiftool),
     ]
