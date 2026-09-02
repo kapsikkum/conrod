@@ -160,7 +160,13 @@ def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = F
         resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
                            timeout=settings.vlm_timeout)
         resp.raise_for_status()
-        body = resp.json().get("response", "")
+        data = resp.json()
+        body = data.get("response") or ""
+        if not body.strip():
+            # Reasoning models (qwen3-vl, for one) put the answer in
+            # "thinking" and leave "response" empty even with think disabled.
+            # Without this the app reads nothing back from them at all.
+            body = data.get("thinking") or ""
     except Exception:
         return VehicleDescription()
     finally:

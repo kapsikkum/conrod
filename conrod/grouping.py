@@ -126,6 +126,10 @@ def cluster(rows: list[tuple[int, str, int]], *, max_bits: int = 14,
 # Below this level of agreement the group has no answer, only a disagreement.
 MIN_AGREEMENT = 0.5
 
+# A make on its own is a weaker claim than a full name, so it needs a clearer
+# majority before it is worth writing down.
+MIN_MAKE_AGREEMENT = 0.6
+
 
 @dataclass
 class Consensus:
@@ -184,6 +188,20 @@ def consensus(members: list[dict]) -> Consensus:
             # writing nothing. Report the disagreement and let review settle it.
             out.disputed = sorted({f"{a} {b}".strip() for a, b in named})
             out.make = out.model = None
+
+            # The full name is noise, but the make on its own may not be.
+            # Eight frames of one blue Falcon came back as a Fairmont, a
+            # Mustang, a Fiesta, an Astra and a Commodore -- yet six of the
+            # eight said Ford. "Ford" is then a claim some frames actually
+            # made and the rest mostly agree with, and unlike a voted pair it
+            # cannot name a car that does not exist. The model is left empty
+            # and the disagreement still shown, so review has the full story.
+            makes = [a for a, _ in named if a]
+            if makes:
+                top, hits = Counter(m.lower() for m in makes).most_common(1)[0]
+                if hits / len(named) >= MIN_MAKE_AGREEMENT:
+                    out.make = next(m for m in makes if m.lower() == top)
+                    out.agreement = hits / len(named)
 
     out.colour, _ = _vote([m.get("colour") for m in members])
 
