@@ -73,7 +73,13 @@ class VehicleAnalysis:
     @property
     def title(self) -> str:
         """A short human label for the review UI."""
-        bits = [b for b in (self.colour, self.make, self.model) if b]
+        # The model often already carries the make ("Holden Commodore"), which
+        # rendered as "blue Holden Holden Commodore" in the grid.
+        model = self.model or ""
+        make = self.make or ""
+        if make and model.lower().startswith(make.lower()):
+            make = ""
+        bits = [b for b in (self.colour, make, model) if b]
         label = " ".join(bits) if bits else self.kind
         if self.race_number:
             label = f"#{self.race_number} {label}"

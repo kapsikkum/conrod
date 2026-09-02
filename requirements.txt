@@ -19,6 +19,3 @@ httpx>=0.27
 
 pillow>=10
 numpy>=1.26
-
-# Native window. Without it the app still runs, in a browser.
-pywebview>=6.0

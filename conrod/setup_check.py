@@ -62,6 +62,7 @@ def inspect(settings: Settings) -> Environment:
 
         exe = find_exiftool()
         version = subprocess.run([exe, "-ver"], capture_output=True, text=True,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                                  timeout=15).stdout.strip()
         env.checks.append(Check("exiftool", "ExifTool", True,
                                 f"version {version}"))

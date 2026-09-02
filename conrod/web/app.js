@@ -305,10 +305,12 @@ $("#btn-reset-settings").onclick = async () => {
 /* ── scanning ─────────────────────────────────────────────── */
 
 $("#btn-pick").onclick = async () => {
-  if (window.pywebview?.api?.pick_folder) {
-    const picked = await window.pywebview.api.pick_folder();
-    if (picked) { $("#scan-path").value = picked; countFrames(); }
+  try {
+    const { path } = await api("/api/pick-folder", { method: "POST" });
+    if (path) { $("#scan-path").value = path; countFrames(); }
     return;
+  } catch {
+    // No dialog available; fall back to browsing in the page.
   }
   openBrowser($("#scan-path").value || "");
 };
@@ -539,7 +541,9 @@ function card(item) {
   const node = el("div", { className: "card" + (item.rejected ? " rejected" : "") });
   node.dataset.id = item.id;
 
-  const thumb = el("img", { className: "thumb", src: item.crop_url, loading: "lazy",
+  // Ask for a thumbnail, not the 2048px crop the readers work from.
+  const thumb = el("img", { className: "thumb", src: `${item.crop_url}?w=420`,
+                            loading: "lazy", decoding: "async",
                             alt: item.title || item.cls, title: "Click for the whole frame" });
   thumb.onclick = (e) => {
     if (e.shiftKey) { toggleSelect(node, item.id); return; }

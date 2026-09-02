@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -78,13 +79,36 @@ _MIGRATIONS = [
 ]
 
 
+_prepared: set[str] = set()
+_prepare_lock = threading.Lock()
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or DB_PATH, timeout=30, check_same_thread=False)
+    """Open a connection, creating the schema at most once per process.
+
+    This used to run executescript(SCHEMA) and the ALTER TABLE migrations on
+    every single connection. Those are writes, so every HTTP request queued
+    behind the analysis workers for the database write lock, and a scan being
+    watched in the UI failed with "database is locked". Now the first
+    connection prepares the file and the rest just open it.
+    """
+    target = str(path or DB_PATH)
+    conn = sqlite3.connect(target, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    # WAL lets the UI read while a scan writes. NORMAL is the matching
+    # durability setting: a crash can lose the last commits, which for a
+    # re-runnable scan is a fair trade for not fsyncing on every frame.
+    conn.execute("PRAGMA busy_timeout=30000")
+
+    if target not in _prepared:
+        with _prepare_lock:
+            if target not in _prepared:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(SCHEMA)
+                _migrate(conn)
+                _prepared.add(target)
     return conn
 
 

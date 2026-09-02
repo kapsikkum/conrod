@@ -37,6 +37,7 @@ hiddenimports = [
     "conrod.keywords", "conrod.mapping", "conrod.ocr", "conrod.pipeline",
     "conrod.plates", "conrod.server", "conrod.setup_check", "conrod.store",
     "conrod.selftest", "conrod.vlm", "conrod.writer",
+    "conrod.nativeui",
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
 ]

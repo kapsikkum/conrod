@@ -90,6 +90,10 @@ def main() -> int:
     from conrod.mapping import NumberMap
 
     force_browser = "--browser" in sys.argv
+    serve_only = "--serve" in sys.argv      # no window at all; for development
+    port = None
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
     if "--cli" in sys.argv:
         from cli import main as cli_main
 
@@ -103,7 +107,8 @@ def main() -> int:
             number_map = NumberMap.load(settings.extra["map_path"])
         except Exception:
             pass
-    return launch(settings, number_map, force_browser=force_browser)
+    return launch(settings, number_map, force_browser=force_browser,
+                  serve_only=serve_only, port=port)
 
 
 if __name__ == "__main__":

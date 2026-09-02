@@ -1,24 +1,44 @@
-"""Desktop window.
+r"""The application window.
 
-Runs the local server on a free port and shows it in a native window via
-pywebview, which uses the WebView2 runtime already present on Windows 11. If
-pywebview is missing the app still runs — it just opens in the default browser
-instead, which is also what happens when the exe is launched with --browser.
+Conrod runs a local server and shows it in a chromeless browser window --
+Edge's "app mode", which on Windows 11 is the same WebView2 engine a native
+webview would use, minus the toolbar.
+
+It used to use pywebview, which reaches WebView2 through pythonnet. That
+worked from source and inside one frozen build, then failed inside another
+built from the same commit:
+
+    Failed to resolve Python.Runtime.Loader.Initialize from
+    ...\_internal\pythonnet\runtime\Python.Runtime.dll
+
+The bundled payload was byte-identical to the one that worked, so the failure
+is environmental and not something the build can guarantee away. A .NET
+bridge is too much machinery to stake the main window on when the window is
+just a page; launching a browser in app mode has no moving parts to break.
+
+The folder picker that pywebview provided is now a real Win32 dialog served
+over HTTP (see nativeui.py), so it works in every mode -- including the plain
+browser fallback, which never had one.
 """
 
 from __future__ import annotations
 
+import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 import uvicorn
 
 from . import server
-from .config import Settings
+from .config import DATA_ROOT, Settings
 from .mapping import NumberMap
+
+WINDOW = (1440, 940)
 
 
 def _free_port(preferred: int = 8760) -> int:
@@ -43,29 +63,57 @@ def _wait_until_up(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
-class _Api:
-    """Exposed to the page as window.pywebview.api.
+def _browser_binaries() -> list[Path]:
+    """Chromium browsers that support --app, most preferred first."""
+    roots = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+             os.environ.get("LOCALAPPDATA")]
+    relative = [
+        Path("Microsoft/Edge/Application/msedge.exe"),
+        Path("Google/Chrome/Application/chrome.exe"),
+        Path("BraveSoftware/Brave-Browser/Application/brave.exe"),
+    ]
+    found = []
+    for rel in relative:
+        for root in roots:
+            if not root:
+                continue
+            candidate = Path(root) / rel
+            if candidate.is_file():
+                found.append(candidate)
+                break
+    return found
 
-    Only exists to give the folder picker a real native dialog; everything
-    else goes through HTTP so the browser fallback behaves identically.
+
+def _open_app_window(url: str) -> subprocess.Popen | None:
+    """Open a chromeless window and return the process owning it.
+
+    A dedicated --user-data-dir matters for two reasons: without it the
+    command hands the URL to an already-running browser and returns
+    immediately, leaving nothing to wait on, and the window would inherit the
+    user's extensions and session.
     """
+    profile = DATA_ROOT / "window"
+    profile.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self):
-        self.window = None
-
-    def pick_folder(self) -> str | None:
-        import webview
-
-        if not self.window:
-            return None
-        result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
-        if not result:
-            return None
-        return result[0] if isinstance(result, (list, tuple)) else str(result)
+    width, height = WINDOW
+    for binary in _browser_binaries():
+        try:
+            return subprocess.Popen(
+                [str(binary), f"--app={url}",
+                 f"--user-data-dir={profile}",
+                 f"--window-size={width},{height}",
+                 "--no-first-run", "--no-default-browser-check",
+                 "--disable-features=Translate,MediaRouter"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            continue
+    return None
 
 
 def launch(settings: Settings | None = None, number_map: NumberMap | None = None,
-           *, force_browser: bool = False, port: int | None = None) -> int:
+           *, force_browser: bool = False, serve_only: bool = False,
+           port: int | None = None) -> int:
     settings = settings or Settings.load()
     server.configure(settings, number_map or NumberMap())
 
@@ -82,23 +130,26 @@ def launch(settings: Settings | None = None, number_map: NumberMap | None = None
         print("The application server did not start.", file=sys.stderr)
         return 1
 
-    if not force_browser:
+    if serve_only:
+        print(f"Conrod is serving on {url}")
         try:
-            import webview
-
-            api = _Api()
-            api.window = webview.create_window(
-                "Conrod", url, width=1440, height=920,
-                min_size=(1024, 700), js_api=api,
-            )
-            webview.start()
-            return 0
-        except ImportError:
+            while thread.is_alive():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
             pass
-        except Exception as exc:
-            print(f"Native window unavailable ({exc}); opening a browser.",
-                  file=sys.stderr)
+        return 0
 
+    window = None if force_browser else _open_app_window(url)
+    if window is not None:
+        try:
+            window.wait()          # the app lives as long as its window
+        except KeyboardInterrupt:
+            window.terminate()
+        return 0
+
+    if not force_browser:
+        print("No Chromium browser found for an app window; using the default "
+              "browser instead.", file=sys.stderr)
     print(f"Conrod is running at {url}")
     webbrowser.open(url)
     try:

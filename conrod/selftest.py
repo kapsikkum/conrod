@@ -105,15 +105,18 @@ def _check_exiftool() -> tuple[str, str]:
 
 
 def _check_window() -> tuple[str, str]:
-    """Only a build failure. From source, a missing pywebview just means the
-    documented --browser fallback, which is a supported way to run."""
-    try:
-        import webview  # noqa: F401
-    except ImportError:
-        if getattr(sys, "frozen", False):
-            return FAIL, "pywebview missing from the bundle; no native window"
-        return SKIP, "pywebview not installed; browser fallback only"
-    return OK, "pywebview present"
+    """Is there a browser that can host a chromeless app window?
+
+    This used to ask whether pywebview imported, and reported PASS on the
+    0.1.1 build whose window silently fell back to a browser tab. Check the
+    thing that is actually used.
+    """
+    from .desktop import _browser_binaries
+
+    found = _browser_binaries()
+    if not found:
+        return FAIL, "no Edge/Chrome/Brave found; UI would open in a browser tab"
+    return OK, f"{found[0].name} will host the window"
 
 
 def run() -> int:

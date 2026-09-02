@@ -41,33 +41,45 @@ body {
 }
 
 /* ── splash ─────────────────────────────────────────────── */
-
+/* A small centred card, not a full-screen takeover: this shows for about a
+   second while the detectors warm up, and a full-bleed screen for that is
+   theatre. */
 #splash {
   position: fixed; inset: 0; z-index: 200;
   background: var(--bg);
-  display: grid; grid-template-columns: 1fr 1fr;
-  transition: opacity .45s ease;
+  display: grid; place-items: center;
+  transition: opacity .35s ease;
 }
 #splash.gone { opacity: 0; pointer-events: none; }
-.splash-left { padding: 56px; display: flex; flex-direction: column; }
-.splash-mark { height: 150px; color: var(--scan); }
-.splash-bottom { margin-top: auto; }
-.splash-hi { color: var(--text-dim); font-size: 24px; margin: 0; font-weight: 350; }
-.splash-name { font-size: 52px; font-weight: 300; margin: 2px 0 4px; letter-spacing: -.02em; }
+.splash-card {
+  width: 320px; padding: 26px 28px 24px;
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.45);
+  display: grid; grid-template-columns: auto 1fr; gap: 0 18px;
+  align-items: center;
+}
+.splash-mark { height: 58px; color: var(--scan); grid-row: span 2; }
+.splash-name { font-size: 26px; font-weight: 300; margin: 0; letter-spacing: -.02em; }
 .splash-name b { font-weight: 700; }
-.splash-ver { color: var(--text-mute); font-size: 12px; font-weight: 600; margin: 0 0 26px; }
-.splash-msg { color: var(--text-dim); margin: 0; }
-.splash-sub { color: var(--text-mute); font-style: italic; margin: 2px 0 22px; }
-.splash-bar { height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
-.mark { height: 100%; width: auto; display: block; }
+.splash-ver { color: var(--text-mute); font-size: 11px; font-weight: 600; margin: 1px 0 0; }
+.splash-msg {
+  grid-column: 2; color: var(--text-dim); font-size: 12px;
+  margin: 12px 0 8px; min-height: 1em;
+}
+.splash-bar {
+  grid-column: 1 / -1;
+  height: 3px; border-radius: 3px; background: var(--surface-3); overflow: hidden;
+}
 .splash-bar i {
   display: block; height: 100%; width: 35%;
   background: var(--scan);
-  border-radius: 4px; animation: sweep 1.5s ease-in-out infinite;
+  border-radius: 3px; animation: sweep 1.5s ease-in-out infinite;
 }
+.mark { height: 100%; width: auto; display: block; }
+
 @keyframes sweep { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
-.splash-right { background: #17171b center/cover no-repeat; }
-.splash-copy { color: var(--text-mute); font-size: 12px; margin-top: 26px; }
 
 /* ── chrome ─────────────────────────────────────────────── */
 
@@ -292,7 +304,10 @@ aside {
 .card.rejected { opacity: .4; }
 
 .card .thumb {
-  aspect-ratio: 16 / 10; width: 100%; object-fit: contain;
+  /* Crops of panning shots are very wide. "contain" letterboxed them into
+     thick black bars; the crop is already centred on the vehicle, so filling
+     the frame shows more car and makes the grid scan evenly. */
+  aspect-ratio: 3 / 2; width: 100%; object-fit: cover; object-position: center;
   background: #08080a; cursor: zoom-in; display: block;
 }
 .card .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 7px; }

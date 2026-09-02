@@ -20,6 +20,10 @@ from PIL import Image
 
 from .config import find_exiftool
 
+# A windowed build has no console, so each exiftool spawn would otherwise
+# flash a black window. Zero on any platform that lacks the flag.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 class ExifTool:
     """A persistent exiftool process.
@@ -44,6 +48,7 @@ class ExifTool:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=NO_WINDOW,
         )
         return self
 
@@ -204,6 +209,7 @@ def _run_batch_extract(exe: str, tag: str, files: Sequence[Path], dest: Path) ->
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            creationflags=NO_WINDOW,
         )
     finally:
         arg_path.unlink(missing_ok=True)

@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+
+from PIL import Image
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -170,6 +172,22 @@ def update_settings(body: SettingsUpdate) -> dict:
 
 
 # --- browsing for a folder ------------------------------------------------
+
+@app.post("/api/pick-folder")
+def pick_folder() -> dict:
+    """Show the real Explorer folder dialog.
+
+    The window is a browser window, so the page cannot open this itself. The
+    in-page folder list stays as a fallback for when the dialog cannot run.
+    """
+    from . import nativeui
+
+    try:
+        chosen = nativeui.pick_folder()
+    except OSError as exc:
+        raise HTTPException(500, f"folder dialog unavailable: {exc}")
+    return {"path": chosen or ""}
+
 
 @app.get("/api/browse")
 def browse(path: str | None = None) -> dict:
@@ -608,8 +626,32 @@ def job_cover(job_id: int) -> FileResponse:
     return FileResponse(Path(row["crop_path"]), media_type="image/jpeg")
 
 
+# Crops are written at up to 2048px because the readers need that
+# resolution. The review grid shows them in a 268px card, so serving the
+# originals meant ~14 MB and sixty full-size decodes for one screen of
+# results. Thumbnails are generated once and cached beside the crop.
+THUMB_WIDTHS = (420, 900)
+
+
+def _thumbnail(path: Path, width: int) -> Path:
+    thumb = path.with_suffix(f".t{width}.jpg")
+    if thumb.exists() and thumb.stat().st_mtime >= path.stat().st_mtime:
+        return thumb
+    try:
+        with Image.open(path) as img:
+            if img.width <= width:
+                return path
+            img = img.convert("RGB")
+            height = round(img.height * width / img.width)
+            img.resize((width, height), Image.LANCZOS).save(
+                thumb, "JPEG", quality=82, optimize=True)
+        return thumb
+    except Exception:
+        return path
+
+
 @app.get("/api/crop/{det_id}")
-def crop(det_id: int) -> FileResponse:
+def crop(det_id: int, w: int | None = None) -> FileResponse:
     with store.session() as conn:
         row = conn.execute("SELECT crop_path FROM detections WHERE id=?",
                            (det_id,)).fetchone()
@@ -618,6 +660,9 @@ def crop(det_id: int) -> FileResponse:
     path = Path(row["crop_path"])
     if not path.exists():
         raise HTTPException(404, "crop file is gone")
+    if w:
+        width = min(THUMB_WIDTHS, key=lambda c: abs(c - w))
+        path = _thumbnail(path, width)
     return FileResponse(path, media_type="image/jpeg")
 
 
