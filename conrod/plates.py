@@ -28,6 +28,22 @@ _reader = None
 _reader_lock = threading.Lock()
 
 
+def _quieten_onnx() -> None:
+    """Stop ONNX Runtime narrating into the activity log.
+
+    Both plate models emit a page of "Error merging shape info ... falling
+    back to lenient merge" warnings the first time they load. The lenient
+    merge is the correct outcome and the models read plates fine, but at the
+    default severity it buries everything the log window is actually for.
+    """
+    try:
+        import onnxruntime
+
+        onnxruntime.set_default_logger_severity(3)   # errors only
+    except Exception:
+        pass
+
+
 def _get_reader(settings: Settings):
     """A recogniser trained on plates, rather than general-purpose OCR.
 
@@ -40,6 +56,7 @@ def _get_reader(settings: Settings):
     global _reader
     with _reader_lock:
         if _reader is None:
+            _quieten_onnx()
             from fast_plate_ocr import LicensePlateRecognizer
 
             _reader = LicensePlateRecognizer(settings.plate_reader_model)
@@ -121,6 +138,7 @@ def _get_detector(settings: Settings):
     global _detector
     with _detector_lock:
         if _detector is None:
+            _quieten_onnx()
             from open_image_models import LicensePlateDetector
 
             _detector = LicensePlateDetector(
