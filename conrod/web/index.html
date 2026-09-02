@@ -82,6 +82,12 @@
       </div>
       <div class="field-row"><input id="scan-label" placeholder="Name for this job (optional)"></div>
       <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
+
+      <div class="field-row entry-row">
+        <label for="scan-entries" class="filebtn">Entry list…</label>
+        <input type="file" id="scan-entries" accept=".csv,text/csv" hidden>
+        <span class="muted" id="entries-status">No entry list — numbers are written on their own</span>
+      </div>
       <p class="muted" id="scan-count"></p>
 
       <div id="browser" class="browser" hidden>
@@ -118,6 +124,7 @@
         <p class="mono" id="scan-counter">0 / 0</p>
         <p class="muted mono" id="scan-eta"></p>
         <p class="muted mono" id="scan-found"></p>
+        <button id="btn-pause" class="ghost">Pause</button>
         <button id="btn-stop" class="ghost danger">Stop scan</button>
         <button id="btn-scan-review" class="primary" hidden>Review results</button>
       </div>

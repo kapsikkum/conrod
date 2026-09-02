@@ -63,15 +63,38 @@ def write_keywords(tool: ExifTool, image: Path, keywords: Sequence[str],
         args += [f"-{tag}-={kw}" for kw in keywords]
     for tag in tags:
         args += [f"-{tag}+={kw}" for kw in keywords]
-    if caption:
-        args += [f"-XMP-dc:Description={caption}"]
-        if is_jpeg:
-            args += [f"-IPTC:Caption-Abstract={caption}"]
     args.append(str(target))
 
     output = tool.execute(*args)
     ok = "1 image files updated" in output or "1 output files created" in output
+
+    if caption:
+        _write_caption(tool, target, caption, is_jpeg, settings)
     return WriteResult(image, target, keywords, ok, output.strip())
+
+
+def _write_caption(tool: ExifTool, target: Path, caption: str, is_jpeg: bool,
+                   settings: Settings) -> None:
+    """Fill in a caption without destroying one the photographer wrote.
+
+    This is a separate exiftool call because it needs a different write mode.
+    Keywords are merged -- ours are added alongside whatever is already
+    there -- but a description is a single value, so writing one replaces it.
+    An earlier version did exactly that, and a caption typed in Lightroom was
+    silently lost the first time a shoot was keyworded.
+
+    '-wm cg' is create-only: exiftool writes the tag when it is absent and
+    leaves it alone when it is not.
+    """
+    args = ["-overwrite_original", "-charset", "filename=utf8"]
+    if not settings.overwrite_caption:
+        args.append("-wm")
+        args.append("cg")
+    args.append(f"-XMP-dc:Description={caption}")
+    if is_jpeg:
+        args.append(f"-IPTC:Caption-Abstract={caption}")
+    args.append(str(target))
+    tool.execute(*args)
 
 
 def _create_sidecar(tool: ExifTool, image: Path, sidecar: Path) -> bool:

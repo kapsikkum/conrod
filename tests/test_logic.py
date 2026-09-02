@@ -220,3 +220,53 @@ class SettingsRoundTrip(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExistingMetadataIsPreserved(unittest.TestCase):
+    """A shoot is usually keyworded after it has been culled and captioned,
+    so the write must add to the sidecar rather than replace it. Keywords
+    merge on their own; a description is a single value and an earlier
+    version replaced it, losing captions typed in Lightroom."""
+
+    def setUp(self):
+        from conrod.config import find_exiftool
+
+        try:
+            find_exiftool()
+        except RuntimeError:
+            self.skipTest("exiftool not installed")
+
+    def test_rating_label_keywords_and_caption_all_survive(self):
+        import subprocess
+        from conrod.config import Settings, find_exiftool
+        from conrod.exif import ExifTool
+        from conrod import writer
+
+        exe = find_exiftool()
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "frame.CR3"
+            raw.write_bytes(b"not really a raw, only the sidecar is written")
+            sidecar = raw.with_suffix(".xmp")
+            sidecar.write_text(writer._EMPTY_XMP, encoding="utf-8")
+            subprocess.run([
+                exe, "-overwrite_original", "-XMP:Rating=4", "-XMP:Label=Yellow",
+                "-XMP-dc:Subject=Bathurst", "-XMP-dc:Description=Mine, not yours",
+                str(sidecar)], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, check=False)
+
+            settings = Settings()
+            settings.write_sidecar_for_raw = True
+            with ExifTool(exe) as tool:
+                writer.write_keywords(tool, raw, ["#21", "Mini"], settings,
+                                      caption="generated")
+
+            out = subprocess.run(
+                [exe, "-s3", "-Rating", "-Label", "-Subject", "-Description",
+                 str(sidecar)], capture_output=True, text=True, check=False)
+            rating, label, subject, description = out.stdout.strip().split("\n")
+
+        self.assertEqual(rating, "4")
+        self.assertEqual(label, "Yellow")
+        self.assertIn("Bathurst", subject)      # theirs kept
+        self.assertIn("#21", subject)           # ours added
+        self.assertEqual(description, "Mine, not yours")   # never replaced

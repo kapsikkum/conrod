@@ -452,3 +452,20 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
 .scan-side { width: 250px; flex: none; }
 .scan-side p { margin: 10px 0 0; }
 .scan-side button { width: 100%; margin-top: 16px; }
+
+.job-card { position: relative; }
+.job-card .resume {
+  position: absolute; right: 10px; top: 10px;
+  background: var(--accent); color: #fff; border: 0;
+  padding: 5px 11px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.job-card .resume:hover { filter: brightness(1.12); }
+
+.entry-row { align-items: center; gap: 12px; }
+.filebtn {
+  background: var(--surface-3); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 14px; font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.filebtn:hover { border-color: var(--accent); }

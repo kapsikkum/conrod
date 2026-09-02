@@ -148,6 +148,9 @@ class Settings:
 
     # --- writing ---
     write_sidecar_for_raw: bool = True
+    # Off by default: a description is a single value, so writing one replaces
+    # whatever the photographer put there. Keywords merge; captions do not.
+    overwrite_caption: bool = False
     keyword_prefix: str = ""
     write_plate_keyword: bool = True
     write_caption: bool = False
@@ -158,6 +161,9 @@ class Settings:
     # at Ollama regardless, and queuing a couple of requests keeps the GPU fed
     # while the CPU stages run. More than about four wins nothing on 8 GB.
     analysis_workers: int = 3
+    # exiftool is single-threaded Perl, so extraction scales with processes:
+    # 4 measured 2.5x faster than 1 on a folder of CR3s.
+    preview_workers: int = 4
     detect_workers: int = 2
     workers: int = max(2, (os.cpu_count() or 8) - 2)
 

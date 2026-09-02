@@ -159,7 +159,10 @@ def list_jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                (SELECT COUNT(*) FROM images i WHERE i.job_id = j.id) AS image_count,
                (SELECT COUNT(*) FROM detections d
                   JOIN images i2 ON i2.id = d.image_id
-                 WHERE i2.job_id = j.id) AS detection_count
+                 WHERE i2.job_id = j.id) AS detection_count,
+               (SELECT COUNT(*) FROM images i3
+                 WHERE i3.job_id = j.id AND i3.status != 'detected')
+                 AS unfinished_count
           FROM jobs j ORDER BY j.id DESC
         """
     ).fetchall()

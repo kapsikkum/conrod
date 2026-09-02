@@ -57,8 +57,22 @@ class JobSummary:
 
 def run(root: Path, settings: Settings, *, label: str | None = None,
         recursive: bool = True, on_progress: Progress = _noop,
-        should_stop: Callable[[], bool] | None = None) -> JobSummary:
-    """Scan, detect and analyse a folder. Does not write metadata."""
+        should_stop: Callable[[], bool] | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
+        resume_job: int | None = None) -> JobSummary:
+    """Scan, detect and analyse a folder. Does not write metadata.
+
+    ``resume_job`` continues a job that was stopped or interrupted: frames it
+    already got through are skipped, so a 6,000-frame shoot that died an hour
+    in does not start again from nothing.
+    """
+    # Progress reporting is a side channel: a failure in the UI's callback
+    # must never take down a scan that is hours into a shoot.
+    raw_progress = on_progress
+
+    def on_progress(event: dict) -> None:      # noqa: F811 - deliberate shadow
+        _safely(raw_progress, event)
+
     root = root.resolve()
     files = scan(root, recursive)
     on_progress({"stage": "scan", "done": len(files), "total": len(files),
@@ -85,10 +99,30 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
     conn = store.connect()
     try:
-        job_id = store.create_job(conn, root, label, dict(settings.to_dict()))
-        store.add_images(conn, job_id, files)
+        if resume_job is not None:
+            job_id = resume_job
+            store.set_job_status(conn, job_id, "scanning")
+            store.add_images(conn, job_id, files)   # ignores ones already there
+        else:
+            job_id = store.create_job(conn, root, label, dict(settings.to_dict()))
+            store.add_images(conn, job_id, files)
 
-        previews = _prepare_previews(files, on_progress)
+        # Frames already carrying a result are not worth doing twice.
+        already = {Path(r["path"]) for r in conn.execute(
+            "SELECT path FROM images WHERE job_id=? AND status='detected'",
+            (job_id,)).fetchall()}
+        if already:
+            files = [f for f in files if f not in already]
+            on_progress({"stage": "resume", "done": len(already),
+                         "total": len(already) + len(files),
+                         "message": f"resuming: {len(already)} frames already done, "
+                                    f"{len(files)} to go"})
+        if not files:
+            store.set_job_status(conn, job_id, "analysed")
+            conn.commit()
+            return JobSummary(job_id, 0, 0, 0)
+
+        previews = _prepare_previews(files, on_progress, settings)
 
         work: "queue.Queue" = queue.Queue(maxsize=64)
         errors: list[str] = []
@@ -115,12 +149,16 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                              (job_id,)).fetchall()}
 
         total_detections = 0
+        processed = 0
         for index, path in enumerate(files, start=1):
+            if wait_if_paused:
+                wait_if_paused()
             if should_stop and should_stop():
                 on_progress({"stage": "stopped", "done": index, "total": len(files),
                              "message": "stopped by request"})
                 break
 
+            processed = index
             image_id = rows[path]
             is_jpeg = path.suffix.lower() in JPEG_SUFFIXES
             source = previews.get(path, path if is_jpeg else None)
@@ -155,7 +193,17 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                         "x": x1 / frame_w, "y": y1 / frame_h,
                         "w": (x2 - x1) / frame_w, "h": (y2 - y1) / frame_h,
                     })
-                    work.put((det_id, det.crop_path, det.is_bike, det.cls))
+                    # Bounded put with a stop check rather than a blocking
+                    # one, so a wedged analysis pool cannot hang the scan.
+                    while True:
+                        if should_stop and should_stop():
+                            break
+                        try:
+                            work.put((det_id, det.crop_path, det.is_bike,
+                                      det.cls), timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
 
                 on_progress({"stage": "frame", "done": index, "total": len(files),
                              "frame": {"name": path.name, "preview": str(source),
@@ -175,9 +223,15 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
         conn.commit()
         for _ in pool:
-            work.put(None)
+            while True:
+                try:
+                    work.put(None, timeout=1.0)
+                    break
+                except queue.Full:
+                    if not any(w.is_alive() for w in pool):
+                        break       # nothing left to tell
         for worker in pool:
-            worker.join()
+            worker.join(timeout=300)
 
         store.set_job_status(conn, job_id, "analysed")
         conn.commit()
@@ -186,23 +240,58 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             on_progress({"stage": "warn", "done": 0, "total": 0,
                          "message": f"{len(errors)} frames failed; first: {errors[0]}"})
 
-        return JobSummary(job_id, len(files), total_detections,
+        return JobSummary(job_id, processed, total_detections,
                           counters["identified"])
     finally:
         conn.close()
 
 
-def _prepare_previews(files: Iterable[Path], on_progress: Progress) -> dict[Path, Path]:
-    """Extract embedded JPEGs from every RAW in one batched exiftool pass."""
+def _prepare_previews(files: Iterable[Path], on_progress: Progress,
+                      settings: Settings) -> dict[Path, Path]:
+    """Extract the embedded JPEG from every RAW, reporting as it goes.
+
+    This is the longest silent stretch of a big shoot -- thousands of
+    full-resolution JPEGs written out before a single vehicle is detected --
+    so it reports every batch rather than only at the end.
+    """
     raws = [f for f in files if f.suffix.lower() in RAW_SUFFIXES]
     if not raws:
         return {}
+
+    started = time.monotonic()
+
+    def report(done: int, total: int) -> None:
+        rate = done / max(time.monotonic() - started, 0.001)
+        left = (total - done) / rate if rate else 0
+        on_progress({"stage": "preview", "done": done, "total": total,
+                     "message": f"extracting previews {done}/{total}"
+                                + (f" · about {_mmss(left)} left" if done > 8 else "")})
+
     on_progress({"stage": "preview", "done": 0, "total": len(raws),
                  "message": f"extracting previews from {len(raws)} RAW files"})
-    previews = extract_previews(raws, CACHE_DIR / "previews")
+    previews = extract_previews(raws, CACHE_DIR / "previews",
+                                on_progress=report,
+                                workers=max(1, settings.preview_workers))
     on_progress({"stage": "preview", "done": len(previews), "total": len(raws),
                  "message": f"extracted {len(previews)}/{len(raws)} previews"})
     return previews
+
+
+def _mmss(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds}s"
+
+
+def _safely(fn, *args) -> None:
+    """Call a callback that must never take the caller down with it."""
+    try:
+        fn(*args)
+    except Exception:
+        pass
 
 
 def _analysis_worker(work, settings: Settings, counters: dict,

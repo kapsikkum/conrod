@@ -85,11 +85,34 @@ async function loadHome() {
       className: "badge",
       textContent: `${job.detection_count || 0} vehicles`,
     }));
+    const left = job.unfinished_count || 0;
     card.append(
       shot,
       el("div", { className: "name", textContent: job.label || job.root }),
-      el("div", { className: "sub", textContent: `${job.image_count} images` })
+      el("div", { className: "sub",
+                  textContent: left ? `${job.image_count} images · ${left} not done`
+                                    : `${job.image_count} images` })
     );
+    if (left) {
+      // A big shoot that was stopped, paused or interrupted picks up where it
+      // left off rather than starting again.
+      const resume = el("button", { className: "resume", textContent: `Resume ${left}` });
+      resume.onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          await api("/api/scan", { method: "POST", body: JSON.stringify({
+            path: job.root, label: job.label, recursive: true, resume_job: job.id,
+          })});
+          show("scan");
+          $("#scan-setup-pane").hidden = true;
+          $("#scanner").hidden = false;
+          $("#btn-stop").hidden = false;
+          $("#btn-pause").hidden = false;
+          pollScan();
+        } catch (err) { toast(err.message); }
+      };
+      card.append(resume);
+    }
     card.onclick = () => { state.jobId = job.id; show("review"); };
     return card;
   }));
@@ -375,15 +398,42 @@ $("#btn-scan").onclick = async () => {
     $("#scanner").hidden = false;
     $("#btn-scan-review").hidden = true;
     $("#btn-stop").hidden = false;
+    $("#btn-pause").hidden = false;
     pollScan();
   } catch (err) {
     toast(err.message);
   }
 };
 
+$("#scan-entries").onchange = async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  $("#entries-status").textContent = "Reading…";
+  try {
+    const text = await file.text();
+    const res = await api("/api/entries", {
+      method: "POST", body: JSON.stringify({ name: file.name, text }),
+    });
+    $("#entries-status").textContent =
+      `${file.name} — ${res.entries} entries` +
+      (res.sample?.length ? ` (#${res.sample.join(", #")}…)` : "");
+    toast(`Entry list loaded: ${res.entries} entries`);
+    loadSettings();
+  } catch (err) {
+    $("#entries-status").textContent = err.message;
+    toast(err.message);
+  }
+};
+
 $("#btn-stop").onclick = async () => {
   await api("/api/scan/stop", { method: "POST", body: "{}" });
-  toast("Stopping after the current frame…");
+  toast("Stopping after the current frame — you can resume it later");
+};
+
+$("#btn-pause").onclick = async () => {
+  const paused = $("#btn-pause").dataset.paused === "1";
+  await api(`/api/scan/${paused ? "resume" : "pause"}`, { method: "POST", body: "{}" });
+  toast(paused ? "Resuming" : "Paused — anything mid-analysis will still finish");
 };
 
 $("#btn-scan-review").onclick = () => show("review");
@@ -397,6 +447,7 @@ function pollScan() {
     if (!data.active) {
       clearInterval(state.scanTimer);
       $("#btn-stop").hidden = true;
+      $("#btn-pause").hidden = true;
       $("#btn-scan-review").hidden = false;
       document.querySelector(".scanner").classList.remove("busy");
       if (data.error) toast(data.error);
@@ -407,6 +458,11 @@ function pollScan() {
 }
 
 function renderScan(data) {
+  const pause = $("#btn-pause");
+  pause.dataset.paused = data.paused ? "1" : "0";
+  pause.textContent = data.paused ? "Resume" : "Pause";
+  pause.classList.toggle("accent", !!data.paused);
+
   const scanner = document.querySelector(".scanner");
   scanner.classList.toggle("busy", data.active && data.stage !== "analyse");
 

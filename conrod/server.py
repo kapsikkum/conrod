@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from . import keywords as keywords_mod
 from . import pipeline, setup_check, store
 from .analyze import VehicleAnalysis
-from .config import DEFAULTS, IMAGE_SUFFIXES, Settings
+from .config import DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES, Settings
 from .mapping import NumberMap
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -40,9 +40,15 @@ _write_lock = threading.Lock()
 _run: dict[str, Any] = {
     "active": False, "job_id": None, "stage": "", "done": 0, "total": 0,
     "message": "", "error": None, "started": 0.0, "stop": False,
-    "current": None, "preview": None, "frame_token": 0,
+    "paused": False, "current": None, "preview": None, "frame_token": 0,
 }
 _run_lock = threading.Lock()
+
+# Set means "keep going". The detect loop waits on this between frames, so a
+# pause takes effect within one frame and leaves the analysis pool to drain
+# what it already has rather than abandoning work in flight.
+_resume_gate = threading.Event()
+_resume_gate.set()
 
 # Recently detected frames, keyed by detection id, so a vehicle result arriving
 # from the analysis pool can be matched back to the frame it came from.
@@ -229,12 +235,47 @@ def browse_count(path: str, recursive: bool = True) -> dict:
             "sample": [f.name for f in files[:5]]}
 
 
+class EntryList(BaseModel):
+    name: str
+    text: str
+
+
+@app.post("/api/entries")
+def upload_entries(body: EntryList) -> dict:
+    """Take an entry-list CSV chosen in the scan wizard.
+
+    The text comes in the request rather than as a multipart upload so the
+    app needs no extra dependency for one small file. It is saved under the
+    data root so the same list is still loaded next time.
+    """
+    name = Path(body.name or "entries.csv").name
+    if not name.lower().endswith(".csv"):
+        name += ".csv"
+    target = DATA_ROOT / "entries" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body.text, encoding="utf-8")
+
+    try:
+        mapping = NumberMap.load(target)
+    except (ValueError, OSError) as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc))
+
+    _state["number_map"], _state["map_path"] = mapping, str(target)
+    settings: Settings = _state["settings"]
+    settings.extra["map_path"] = str(target)
+    settings.save()
+    return {"ok": True, "entries": len(mapping), "path": str(target),
+            "sample": list(mapping.rows)[:6]}
+
+
 # --- running a scan -------------------------------------------------------
 
 class ScanRequest(BaseModel):
     path: str
     label: str | None = None
     recursive: bool = True
+    resume_job: int | None = None
 
 
 @app.post("/api/scan")
@@ -246,9 +287,11 @@ def start_scan(body: ScanRequest) -> dict:
         if not root.is_dir():
             raise HTTPException(400, "not a folder")
         _frames.clear()
-        _run.update({"active": True, "job_id": None, "stage": "starting",
-                     "done": 0, "total": 0, "message": "", "error": None,
-                     "started": time.time(), "stop": False})
+        _resume_gate.set()
+        _run.update({"active": True, "job_id": body.resume_job,
+                     "stage": "starting", "done": 0, "total": 0, "message": "",
+                     "error": None, "started": time.time(), "stop": False,
+                     "paused": False})
 
     def progress(event: dict) -> None:
         stage = event.get("stage", _run["stage"])
@@ -315,6 +358,8 @@ def start_scan(body: ScanRequest) -> dict:
                 root, _state["settings"], label=body.label,
                 recursive=body.recursive, on_progress=progress,
                 should_stop=lambda: _run["stop"],
+                wait_if_paused=_resume_gate.wait,
+                resume_job=body.resume_job,
             )
             _run["job_id"] = summary.job_id
             _run["stage"] = "done"
@@ -345,7 +390,25 @@ def scan_status() -> dict:
 @app.post("/api/scan/stop")
 def stop_scan() -> dict:
     _run["stop"] = True
+    _resume_gate.set()          # a paused scan must be able to stop
     return {"ok": True}
+
+
+@app.post("/api/scan/pause")
+def pause_scan() -> dict:
+    """Hold the scan between frames. Whatever is mid-analysis still finishes."""
+    if not _run["active"]:
+        raise HTTPException(409, "no scan is running")
+    _resume_gate.clear()
+    _run["paused"] = True
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/scan/resume")
+def resume_scan() -> dict:
+    _resume_gate.set()
+    _run["paused"] = False
+    return {"ok": True, "paused": False}
 
 
 @app.get("/api/scan/frame")
