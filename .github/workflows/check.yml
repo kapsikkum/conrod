@@ -22,9 +22,16 @@ jobs:
           python -c "
           import importlib
           mods = ['config','exif','store','detect','ocr','plates','vlm','analyze',
-                  'mapping','keywords','writer','culling','pipeline','setup_check','server']
+                  'mapping','keywords','writer','culling','pipeline','setup_check','server',
+                  'selftest']
           for m in mods: importlib.import_module('conrod.'+m)
           print('ok')
           "
       - name: Offline unit tests
         run: python -m unittest discover -s tests -v
+
+      # Runs the readers for real — a YOLO inference, an OCR pass and a plate
+      # detector load — so a broken dependency is caught on the commit that
+      # introduces it rather than at release time.
+      - name: Self-test
+        run: python main.py --selftest

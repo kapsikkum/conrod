@@ -69,6 +69,20 @@ jobs:
       - name: Build
         run: pyinstaller conrod.spec --noconfirm
 
+      # Importing the package proves nothing about the bundle: 0.1.0 imported
+      # fine and then failed every detection because the spec had excluded a
+      # package torch loads at import time. This runs a real inference, a real
+      # OCR pass and a real plate-detector load inside the frozen build, and
+      # fails the release if any of them break.
+      - name: Self-test the frozen build
+        shell: bash
+        run: |
+          status=0
+          ./dist/Conrod/Conrod.exe --selftest || status=$?
+          echo "--- self-test log ---"
+          cat "$USERPROFILE/.conrod/conrod.log" 2>/dev/null || true
+          exit $status
+
       - name: Package
         shell: bash
         run: |

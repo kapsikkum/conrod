@@ -36,7 +36,7 @@ hiddenimports = [
     "conrod.analyze", "conrod.culling", "conrod.detect", "conrod.exif",
     "conrod.keywords", "conrod.mapping", "conrod.ocr", "conrod.pipeline",
     "conrod.plates", "conrod.server", "conrod.setup_check", "conrod.store",
-    "conrod.vlm", "conrod.writer",
+    "conrod.selftest", "conrod.vlm", "conrod.writer",
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
 ]
@@ -44,9 +44,21 @@ hiddenimports += collect_submodules("rapidocr_onnxruntime")
 
 # Excluded to keep the build down: these arrive via torch/ultralytics but the
 # app never plots anything or trains.
+#
+# Do not add to this list by eye. Every entry here was checked by blocking it
+# from the import graph and then running a real detection, because three
+# plausible-looking exclusions turned out to be load-bearing and each one
+# broke only the frozen build:
+#
+#   sympy               torch imports it while loading
+#   pandas              ultralytics imports it on the inference path
+#   torchvision.datasets  torchvision's own __init__ imports it
+#
+# `Conrod.exe --selftest` runs that real detection and is a required step in
+# the release workflow, so a bad exclusion cannot reach a published build.
 excludes = [
-    "matplotlib", "tkinter", "PyQt5", "PyQt6", "PySide2", "PySide6",
-    "IPython", "notebook", "pandas", "scipy", "sympy", "torchvision.datasets",
+    "matplotlib", "scipy", "tkinter", "PyQt5", "PyQt6", "PySide2", "PySide6",
+    "IPython", "notebook",
 ]
 
 a = Analysis(

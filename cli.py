@@ -77,7 +77,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     elapsed = time.monotonic() - started
 
     print(f"\n\nJob {summary.job_id}: {summary.images} frames, "
-          f"{summary.detections} vehicles, {summary.numbered} numbers read "
+          f"{summary.detections} vehicles, {summary.identified} identified "
           f"in {elapsed / 60:.1f} min")
     print(f"Review them with:  python cli.py review")
     print(f"Then write with:   python cli.py write {summary.job_id}"

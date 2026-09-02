@@ -31,6 +31,9 @@ MODEL_DIR = DATA_ROOT / "models"
 CACHE_DIR = DATA_ROOT / "cache"
 DB_PATH = DATA_ROOT / "conrod.db"
 SETTINGS_PATH = DATA_ROOT / "settings.json"
+# A windowed build has no console, so this is the only place a crash before the
+# window opens can leave a trace. See _ensure_streams in main.py.
+LOG_PATH = DATA_ROOT / "conrod.log"
 
 for _d in (MODEL_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)

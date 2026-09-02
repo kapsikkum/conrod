@@ -80,6 +80,12 @@ python -m venv .venv
 
 `main.py --browser` opens in your default browser instead of a native window.
 `main.py --cli` gives the command line described below.
+`main.py --selftest` (or `Conrod.exe --selftest`) runs the detector, the text
+reader and the plate detector for real and reports what works — the first thing
+to try if a build misbehaves. CI runs it against every release build.
+
+If the app dies before its window appears, the reason is in
+`%USERPROFILE%\.conrod\conrod.log`.
 
 Model weights, extracted previews and the job database live in
 `%USERPROFILE%\.conrod`.
