@@ -40,6 +40,7 @@ const state = {
   screen: "home",
   logAt: 0,
   logTimer: null,
+  healthTimer: null,
   jobId: null,
   view: "review",
   number: null,
@@ -115,6 +116,36 @@ async function loadHome() {
       };
       card.append(resume);
     }
+    const menu = el("div", { className: "job-menu" });
+    const rename = el("button", { className: "iconbtn", textContent: "Rename",
+                                  title: "Rename this scan" });
+    rename.onclick = async (e) => {
+      e.stopPropagation();
+      const name = prompt("Name for this scan", job.label || "");
+      if (name === null) return;
+      await api(`/api/jobs/${job.id}`, {
+        method: "POST", body: JSON.stringify({ label: name }),
+      });
+      loadHome();
+    };
+    const remove = el("button", { className: "iconbtn danger", textContent: "Delete",
+                                  title: "Forget this scan" });
+    remove.onclick = async (e) => {
+      e.stopPropagation();
+      const what = job.label || job.root;
+      if (!confirm(`Forget the scan "${what}"?
+
+`
+                 + `Its results and cached crops go. Your photos and any XMP `
+                 + `already written are not touched.`)) return;
+      await api(`/api/jobs/${job.id}`, { method: "DELETE" });
+      if (state.jobId === job.id) state.jobId = null;
+      toast("Scan deleted");
+      loadHome();
+    };
+    menu.append(rename, remove);
+    card.append(menu);
+
     card.onclick = () => { state.jobId = job.id; show("review"); };
     return card;
   }));
@@ -440,6 +471,26 @@ $("#btn-pause").onclick = async () => {
 
 $("#btn-scan-review").onclick = () => show("review");
 
+/* ── health light ─────────────────────────────────────────── */
+async function pollHealth() {
+  try {
+    const h = await api("/api/health");
+    const node = $("#health");
+    node.className = "health " + h.level + (h.scanning ? " busy" : "");
+    $("#health-text").textContent = h.paused ? "Paused"
+      : h.scanning ? "Scanning" : h.level === "ok" ? "Ready" : h.summary;
+    node.title = h.problems?.length
+      ? h.problems.map((p) => `${p.label}: ${p.detail || (p.required ? "missing" : "unavailable")}`).join(String.fromCharCode(10))
+      : h.summary;
+  } catch {
+    $("#health").className = "health error";
+    $("#health-text").textContent = "No connection";
+  }
+  clearTimeout(state.healthTimer);
+  state.healthTimer = setTimeout(pollHealth, 8000);
+}
+$("#health").onclick = () => show("setup");
+
 /* ── activity log ─────────────────────────────────────────── */
 /* exiftool, the detector and the vision model all write to a console the
    packaged app does not have. This is where that output goes instead. */
@@ -672,10 +723,17 @@ function card(item) {
   const plate = el("input", { className: "plate", value: item.plate || "",
                               placeholder: "plate", autocomplete: "off" });
 
+  // Show the confidence of whatever was actually read. This used to report
+  // the race-number confidence unconditionally, so a card with a plate read at
+  // 0.89 and no competition number displayed a red 0%.
+  const readConf = item.number ? item.number_conf
+                 : item.plate ? item.plate_conf : null;
+  const readWhat = item.number ? "number" : item.plate ? "plate" : "";
   const conf = el("span", { className: "tag conf",
-    textContent: item.number_conf != null
-      ? `${Math.round(item.number_conf * 100)}%` : "no read" });
-  conf.dataset.band = band(item.number_conf);
+    title: readWhat ? `Confidence in the ${readWhat} read` : "Nothing was read",
+    textContent: readConf != null && (item.number || item.plate)
+      ? `${readWhat} ${Math.round(readConf * 100)}%` : "no read" });
+  conf.dataset.band = (item.number || item.plate) ? band(readConf) : "none";
 
   const src = el("span", {
     className: "tag " + (item.number_source || "").replace("+", " "),
@@ -692,7 +750,7 @@ function card(item) {
     title.textContent = saved.title || item.cls;
     who.textContent = saved.who || "";
     kw.textContent = (saved.keywords || []).join(" · ");
-    conf.textContent = "100%"; conf.dataset.band = "high";
+    conf.textContent = "confirmed"; conf.dataset.band = "high";
     src.textContent = "manual"; src.className = "tag manual"; src.hidden = false;
     teamTag.hidden = true;
     loadSummary();
@@ -832,11 +890,14 @@ $("#btn-write").onclick = async () => {
     $("#splash").classList.add("gone");
     setTimeout(() => { $("#splash").hidden = true; }, 500);
     $("#app").hidden = false;
+    pollHealth();
 
     if (scan.active) {
       show("scan");
       $("#scan-setup-pane").hidden = true;
       $("#scanner").hidden = false;
+      $("#btn-stop").hidden = false;
+      $("#btn-pause").hidden = false;
       pollScan();
     } else if (!setup.ready) {
       show("setup");

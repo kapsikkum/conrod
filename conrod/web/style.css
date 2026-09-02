@@ -336,6 +336,8 @@ aside {
 .conf[data-band="high"] { color: var(--good); }
 .conf[data-band="mid"]  { color: var(--warn2); }
 .conf[data-band="low"]  { color: var(--bad); }
+/* Nothing was read is not a failure worth colouring red. */
+.conf[data-band="none"] { color: var(--text-mute); }
 .card .who { font-size: 12px; color: var(--accent); }
 .card .kw { font-size: 11.5px; color: var(--text-mute); line-height: 1.45; }
 .card .actions { margin-left: auto; display: flex; gap: 5px; }
@@ -499,3 +501,50 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
 .logline.warn { color: var(--warn, #e0a03a); }
 .logline.error { color: var(--bad, #e0605a); }
 button.small { padding: 4px 10px; font-size: 12px; }
+
+/* ── health light ─────────────────────────────────────────── */
+.health {
+  display: flex; align-items: center; gap: 8px;
+  margin-left: 14px; padding: 5px 12px 5px 10px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 999px; cursor: pointer;
+  font-size: 12px; color: var(--text-dim);
+  transition: border-color .2s ease, color .2s ease;
+}
+.health:hover { border-color: var(--line-strong, #3a3a45); color: var(--text); }
+.health .light {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-mute); flex: none;
+  box-shadow: 0 0 0 0 currentColor;
+}
+.health.ok    .light { background: #46c07a; }
+.health.warn  .light { background: #e0a03a; }
+.health.error .light { background: #e0605a; }
+.health.ok    { color: var(--text-dim); }
+.health.warn  { color: #e0a03a; border-color: #7a5a1e; }
+.health.error { color: #e0605a; border-color: #7a2f2c; }
+
+/* While a scan runs the light breathes, so the header shows activity even
+   when the scan view is not the one on screen. */
+.health.busy .light { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: .45; transform: scale(.8); }
+}
+
+/* ── job card actions ─────────────────────────────────────── */
+.job-menu {
+  position: absolute; right: 10px; bottom: 10px;
+  display: flex; gap: 6px;
+  opacity: 0; transform: translateY(4px);
+  transition: opacity .16s ease, transform .16s ease;
+}
+.job-card:hover .job-menu, .job-menu:focus-within { opacity: 1; transform: none; }
+.iconbtn {
+  background: rgba(18,18,22,.86); color: var(--text-dim);
+  border: 1px solid var(--line); border-radius: 7px;
+  padding: 4px 10px; font-size: 11.5px; cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+.iconbtn:hover { color: var(--text); border-color: var(--accent); }
+.iconbtn.danger:hover { color: #e0605a; border-color: #e0605a; }

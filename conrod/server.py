@@ -129,6 +129,65 @@ def setup_status() -> dict:
     return {**env.to_dict(), "fix": _fix}
 
 
+_health: dict = {"at": 0.0, "value": None}
+_health_lock = threading.Lock()
+
+
+@app.get("/api/health")
+def health() -> dict:
+    """One light for the whole app: is anything missing or degraded?
+
+    Cached, because it shells out to exiftool and asks Ollama what it has
+    loaded, and the header polls it.
+    """
+    with _health_lock:
+        fresh = _health["value"] and time.time() - _health["at"] < 20
+        if fresh:
+            return _health["value"]
+
+    env = setup_check.inspect(_state["settings"])
+    missing_required = [c for c in env.checks if c.required and not c.ok]
+    missing_optional = [c for c in env.checks if not c.required and not c.ok]
+
+    settings: Settings = _state["settings"]
+    switched_off = [name for flag, name in (
+        (settings.use_vlm, "Vision model"),
+        (settings.read_plates, "Plate reading"),
+    ) if not flag]
+
+    if missing_required:
+        level, summary = "error", missing_required[0].label + " is missing"
+    elif missing_optional:
+        level = "warn"
+        summary = missing_optional[0].label + " unavailable"
+    elif switched_off:
+        # Everything is installed, but a reader is turned off, so the app is
+        # producing less than it could. Saying "Ready" here would be misleading.
+        level = "warn"
+        summary = f"{switched_off[0]} is turned off"
+    else:
+        level, summary = "ok", "Everything is installed"
+
+    if _run.get("error"):
+        level, summary = "error", "The last scan failed"
+    elif _run.get("active"):
+        summary = "Scanning" + (" (paused)" if _run.get("paused") else "")
+
+    value = {
+        "level": level,
+        "summary": summary,
+        "scanning": bool(_run.get("active")),
+        "paused": bool(_run.get("paused")),
+        "problems": [{"label": c.label, "detail": c.detail, "required": c.required}
+                     for c in missing_required + missing_optional]
+                    + [{"label": name, "detail": "turned off in settings",
+                        "required": False} for name in switched_off],
+    }
+    with _health_lock:
+        _health.update({"at": time.time(), "value": value})
+    return value
+
+
 class FixRequest(BaseModel):
     name: str
 
@@ -179,6 +238,12 @@ def update_settings(body: SettingsUpdate) -> dict:
     settings: Settings = _state["settings"]
     settings.apply(body.settings)
     settings.save()
+
+    # Settings can change what the health light is reporting on -- which
+    # vision model to look for, whether plates are read at all -- so the
+    # cached answer is no longer valid.
+    with _health_lock:
+        _health["at"] = 0.0
 
     if body.map_path is not None:
         path = body.map_path.strip()
@@ -463,6 +528,51 @@ def scan_frame():
 def list_jobs() -> list[dict]:
     with store.session() as conn:
         return [dict(r) for r in store.list_jobs(conn)]
+
+
+class JobPatch(BaseModel):
+    label: str | None = None
+
+
+@app.post("/api/jobs/{job_id}")
+def rename_job(job_id: int, body: JobPatch) -> dict:
+    with store.session() as conn:
+        if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(404, "no such scan")
+        conn.execute("UPDATE jobs SET label=? WHERE id=?",
+                     ((body.label or "").strip() or None, job_id))
+    return {"ok": True}
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: int) -> dict:
+    """Forget a scan.
+
+    Only the record: the photos are never touched, and the extracted previews
+    are left alone because another scan of the same folder would just have to
+    make them again.
+    """
+    with store.session() as conn:
+        row = conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "no such scan")
+        crops = [r["crop_path"] for r in conn.execute(
+            """SELECT d.crop_path FROM detections d
+                 JOIN images i ON i.id = d.image_id
+                WHERE i.job_id = ? AND d.crop_path IS NOT NULL""", (job_id,))]
+        # ON DELETE CASCADE clears images and detections with the job.
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    removed = 0
+    for path in crops:
+        for candidate in (Path(path), *Path(path).parent.glob(
+                Path(path).stem + ".t*.jpg")):
+            try:
+                candidate.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    return {"ok": True, "crops_removed": removed}
 
 
 @app.get("/api/jobs/{job_id}/summary")
