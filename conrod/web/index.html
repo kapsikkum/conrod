@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conrod</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="splash">
+  <div class="splash-left">
+    <div class="splash-mark"><svg class="mark" viewBox="0 0 26 72" fill="none" aria-hidden="true"><path d="M19 3 L12 45 L13.5 50 L7.5 54 L7.5 59 L4 69" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="splash-bottom">
+      <p class="splash-hi">Welcome to</p>
+      <p class="splash-name"><b>con</b>rod</p>
+      <p class="splash-ver">v. 0.2.0</p>
+      <p class="splash-msg" id="splash-msg">Warming up the detectors</p>
+      <div class="splash-bar"><i></i></div>
+    </div>
+  </div>
+  <div class="splash-right" id="splash-art"></div>
+</div>
+
+<div class="app" id="app" hidden>
+  <header>
+    <div class="brand">
+      <div class="brand-mark"><svg class="mark" viewBox="0 0 26 72" fill="none" aria-hidden="true"><path d="M19 3 L12 45 L13.5 50 L7.5 54 L7.5 59 L4 69" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <h1>Conrod</h1>
+      <span class="pill" id="mode-pill">LOCAL</span>
+    </div>
+    <nav class="tabs" id="main-tabs">
+      <button data-screen="home" class="active">Home</button>
+      <button data-screen="scan">Scan</button>
+      <button data-screen="review">Review</button>
+      <button data-screen="settings">Settings</button>
+      <button data-screen="setup">Setup<span class="dot" id="setup-dot" hidden></span></button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <!-- ─────────────────────────── HOME ──────────────────────────── -->
+  <section class="screen" id="screen-home">
+    <div class="home">
+      <div class="home-main">
+        <div class="rail-card" style="display:flex;align-items:center;gap:18px">
+          <div style="flex:1">
+            <h4>Scan a shoot</h4>
+            <p>Point it at a folder. It finds the vehicles, reads numbers,
+               plates and liveries, and writes XMP.</p>
+            <button class="primary" data-goto="scan">+ New scan</button>
+          </div>
+        </div>
+        <div class="section-label"><span>Jobs</span><span id="job-count"></span></div>
+        <div class="cards" id="job-cards"></div>
+        <div class="empty" id="home-empty" hidden>No scans yet.</div>
+      </div>
+
+      <aside class="rail">
+        <div class="rail-card">
+          <h4>Totals</h4>
+          <div class="big-stat" id="rail-time">—</div>
+          <div class="big-label">Frames scanned</div>
+          <div class="stat-grid" id="rail-grid"></div>
+        </div>
+        <div class="rail-card" id="rail-setup">
+          <h4>Setup</h4>
+          <p id="rail-setup-note">Checking…</p>
+          <button class="ghost" data-goto="setup">Open setup</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ──────────────────────────── SCAN ─────────────────────────── -->
+  <section class="screen" id="screen-scan" hidden>
+    <div class="pane wide" id="scan-setup-pane">
+      <h2>Scan a folder</h2>
+      <div class="field-row">
+        <input id="scan-path" placeholder="D:\Personal Work\2026\09\01" spellcheck="false">
+        <button id="btn-pick" class="ghost">Browse…</button>
+        <button id="btn-count" class="ghost">Count frames</button>
+      </div>
+      <div class="field-row"><input id="scan-label" placeholder="Name for this job (optional)"></div>
+      <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
+      <p class="muted" id="scan-count"></p>
+
+      <div id="browser" class="browser" hidden>
+        <div class="browser-head">
+          <button id="browse-up" class="ghost">↑ Up</button>
+          <span id="browse-here" class="muted"></span>
+          <button id="browse-use" class="primary">Use this folder</button>
+          <button id="browse-close" class="ghost">Close</button>
+        </div>
+        <ul id="browse-list"></ul>
+      </div>
+
+      <div class="actions-row">
+        <button id="btn-scan" class="primary">Start scan</button>
+      </div>
+    </div>
+
+    <!-- live scanning view -->
+    <div class="scanner" id="scanner" hidden>
+      <div class="scan-card">
+        <div class="scan-head">
+          <span class="mono" id="scan-file">—</span>
+          <span class="mono phase" id="scan-phase">SCANNING</span>
+        </div>
+        <div class="scan-stage" id="scan-stage">
+          <img id="scan-img" alt="">
+          <div class="sweep" id="scan-sweep"></div>
+          <div class="overlay" id="scan-overlay"></div>
+        </div>
+        <div class="scan-log mono" id="scan-log"></div>
+      </div>
+      <div class="scan-side">
+        <div class="bar"><div class="fill" id="scan-fill"></div></div>
+        <p class="mono" id="scan-counter">0 / 0</p>
+        <p class="muted mono" id="scan-eta"></p>
+        <p class="muted mono" id="scan-found"></p>
+        <button id="btn-stop" class="ghost danger">Stop scan</button>
+        <button id="btn-scan-review" class="primary" hidden>Review results</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ────────────────────────── SETTINGS ───────────────────────── -->
+  <section class="screen" id="screen-settings" hidden>
+    <div class="pane wide">
+      <h2>Settings</h2>
+      <p class="lede">Defaults are what measured best on real Mount Panorama frames.</p>
+      <div id="settings-form"></div>
+      <div class="actions-row">
+        <button id="btn-save-settings" class="primary">Save</button>
+        <button id="btn-reset-settings" class="ghost">Reset to defaults</button>
+        <span class="muted" id="settings-note"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── SETUP ─────────────────────────── -->
+  <section class="screen" id="screen-setup" hidden>
+    <div class="pane">
+      <h2>Setup</h2>
+      <p class="lede">
+        The detectors are small and fetch themselves. The vision model is about
+        6&nbsp;GB and runs under Ollama — it is what identifies make, model,
+        colour and team. Without it the app still reads plates, numbers and text.
+      </p>
+      <ul class="checks" id="check-list"></ul>
+      <div id="fix-progress" class="progress-box" hidden>
+        <div class="bar"><div class="fill" id="fix-fill"></div></div>
+        <p class="muted mono" id="fix-status"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────────────────── REVIEW ────────────────────────── -->
+  <section class="screen split" id="screen-review" hidden>
+    <div style="display:flex;flex-direction:column;flex:1;min-width:0">
+      <div class="toolbar">
+        <select id="job-select" aria-label="Job"></select>
+        <div class="tabs sub" id="view-tabs">
+          <button data-view="review" class="active">Needs review</button>
+          <button data-view="number">By number</button>
+          <button data-view="plate">Plates</button>
+          <button data-view="all">All</button>
+          <button data-view="rejected">Rejected</button>
+        </div>
+        <input id="search" placeholder="Search make, team, plate…" spellcheck="false">
+        <div class="spacer"></div>
+        <button id="btn-dry" class="ghost">Preview keywords</button>
+        <button id="btn-write" class="primary">Write XMP</button>
+      </div>
+      <main>
+        <aside id="sidebar" hidden>
+          <h3>Numbers</h3>
+          <ul id="number-list"></ul>
+        </aside>
+        <div id="grid-wrap">
+          <div id="bulk-bar" hidden>
+            <span id="bulk-count"></span>
+            <input id="bulk-number" placeholder="number" inputmode="numeric" size="6">
+            <button id="bulk-apply" class="primary">Apply to selected</button>
+            <button id="bulk-reject" class="ghost danger">Reject selected</button>
+            <button id="bulk-clear" class="ghost">Clear</button>
+          </div>
+          <div id="grid"></div>
+          <div id="empty" class="empty" hidden></div>
+          <button id="more" hidden class="ghost">Load more</button>
+        </div>
+      </main>
+    </div>
+  </section>
+</div>
+
+<dialog id="frame-dialog">
+  <img id="frame-img" alt="Full frame">
+  <p id="frame-caption" class="muted"></p>
+  <button id="frame-close" class="ghost">Close</button>
+</dialog>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

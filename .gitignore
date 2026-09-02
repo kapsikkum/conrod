@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Builds
+build/
+dist/
+*.spec.bak
+
+# Model weights and caches live outside the repo, but never commit strays
+*.pt
+*.onnx
+
+# Local scratch
+samples/*.local.csv
+.DS_Store
+Thumbs.db

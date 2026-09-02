@@ -1,0 +1,104 @@
+name: Release
+
+# Tag-triggered: push v0.3.0 and this builds the Windows app and attaches it
+# to a GitHub Release. Nothing is built on ordinary pushes — Windows runners
+# are slow and a release per commit is noise.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Work out the version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stamp the version into the package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, os
+          version = os.environ["VERSION"]
+          p = pathlib.Path("conrod/__init__.py")
+          s = p.read_text(encoding="utf-8")
+          import re
+          s = re.sub(r'__version__ = "[^"]*"', f'__version__ = "{version}"', s)
+          p.write_text(s, encoding="utf-8")
+          html = pathlib.Path("conrod/web/index.html")
+          h = html.read_text(encoding="utf-8")
+          h = re.sub(r'v\. [0-9][^<]*', f'v. {version}', h)
+          html.write_text(h, encoding="utf-8")
+          print("stamped", version)
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview
+
+      - name: Sanity check before building
+        run: python -c "import conrod, conrod.server, conrod.pipeline; print(conrod.__version__)"
+
+      - name: Build
+        run: pyinstaller conrod.spec --noconfirm
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "Conrod-${{ steps.version.outputs.value }}-win64.zip" Conrod/
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Conrod-windows
+          path: dist/Conrod-*.zip
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Conrod-*.zip
+          generate_release_notes: true
+          body: |
+            ## Conrod ${{ steps.version.outputs.value }}
+
+            Download the zip, unpack it anywhere, run `Conrod.exe`.
+
+            **First run needs two things Conrod cannot bundle.** The Setup
+            screen checks for both and links to them:
+
+            - **ExifTool** — reads previews and writes the XMP.
+            - **Ollama** plus `ollama pull qwen2.5vl:7b` (~6 GB) — identifies
+              make, model, colour and team. Without it Conrod still reads
+              plates, competition numbers and livery text.
+
+            The vehicle detector and plate detector download themselves on
+            first run (~27 MB together).

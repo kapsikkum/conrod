@@ -1,0 +1,30 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  import-and-unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Every module imports
+        run: |
+          python -c "
+          import importlib
+          mods = ['config','exif','store','detect','ocr','plates','vlm','analyze',
+                  'mapping','keywords','writer','culling','pipeline','setup_check','server']
+          for m in mods: importlib.import_module('conrod.'+m)
+          print('ok')
+          "
+      - name: Offline unit tests
+        run: python -m unittest discover -s tests -v

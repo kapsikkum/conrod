@@ -1,0 +1,16 @@
+# Vehicle detection (also used once to export the model to ONNX)
+ultralytics>=8.3
+
+# Fast first-pass OCR: PaddleOCR models running on onnxruntime,
+# so there is no PaddlePaddle dependency and no compiler needed.
+rapidocr-onnxruntime>=1.2
+
+# Review UI + local API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Talking to Ollama
+httpx>=0.27
+
+pillow>=10
+numpy>=1.26
