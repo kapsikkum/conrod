@@ -61,7 +61,7 @@ function show(screen) {
   $$("#main-tabs button").forEach((b) =>
     b.classList.toggle("active", b.dataset.screen === screen));
   if (screen === "home") loadHome();
-  if (screen === "setup") loadSetup();
+  if (screen === "setup") { loadSetup(); checkUpdate(); }
   if (screen === "settings") loadSettings();
   if (screen === "review") refreshReview();
 }
@@ -135,9 +135,7 @@ async function loadHome() {
       const what = job.label || job.root;
       if (!confirm(`Forget the scan "${what}"?
 
-`
-                 + `Its results and cached crops go. Your photos and any XMP `
-                 + `already written are not touched.`)) return;
+Its results and cached crops go. Your photos and any XMP already written are not touched.`)) return;
       await api(`/api/jobs/${job.id}`, { method: "DELETE" });
       if (state.jobId === job.id) state.jobId = null;
       toast("Scan deleted");
@@ -470,6 +468,70 @@ $("#btn-pause").onclick = async () => {
 };
 
 $("#btn-scan-review").onclick = () => show("review");
+
+/* ── updates ──────────────────────────────────────────────── */
+async function checkUpdate() {
+  const note = $("#version-note"), box = document.querySelector(".version-box");
+  const install = $("#btn-update-install");
+  note.textContent = "Checking GitHub…";
+  try {
+    const u = await api("/api/update/check");
+    $("#version-current").textContent = u.current;
+    if (!u.ok) { note.textContent = u.error; return; }
+    if (!u.newer) {
+      note.textContent = `Up to date (latest is ${u.latest})`;
+      box.classList.remove("update-available");
+      install.hidden = true;
+      return;
+    }
+    box.classList.add("update-available");
+    const mb = u.size ? ` · ${(u.size / 1e6).toFixed(0)} MB` : "";
+    if (u.from_source) {
+      note.textContent = `${u.latest} is out${mb}, but this is running from `
+                       + `source — update with git pull.`;
+      install.hidden = true;
+    } else {
+      note.textContent = `Version ${u.latest} is available${mb}.`;
+      install.hidden = false;
+    }
+  } catch (err) {
+    note.textContent = err.message;
+  }
+}
+
+$("#btn-update-check").onclick = checkUpdate;
+
+$("#btn-update-install").onclick = async () => {
+  if (!confirm(`Download the new version and restart Conrod?
+
+The download is checked against the checksum published with the release before anything is replaced.`)) return;
+  $("#btn-update-install").disabled = true;
+  $("#update-progress").hidden = false;
+  await api("/api/update/install", { method: "POST", body: "{}" });
+  pollUpdate();
+};
+
+async function pollUpdate() {
+  try {
+    const u = await api("/api/update/status");
+    const pct = u.total ? (u.done / u.total) * 100 : 0;
+    $("#update-fill").style.width = `${pct}%`;
+    $("#update-status").textContent = u.total
+      ? `${u.message} — ${(u.done / 1e6).toFixed(0)} of ${(u.total / 1e6).toFixed(0)} MB`
+      : u.message;
+    if (u.state === "error") {
+      $("#btn-update-install").disabled = false;
+      toast(u.message);
+      return;
+    }
+    if (u.state === "restarting") {
+      $("#update-status").textContent = u.message;
+      return;
+    }
+    if (u.state === "idle") { $("#btn-update-install").disabled = false; return; }
+  } catch {}
+  setTimeout(pollUpdate, 700);
+}
 
 /* ── health light ─────────────────────────────────────────── */
 async function pollHealth() {

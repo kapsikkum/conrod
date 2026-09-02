@@ -88,7 +88,10 @@ jobs:
         run: |
           cd dist
           7z a -tzip "Conrod-${{ steps.version.outputs.value }}-win64.zip" Conrod/
-          ls -la
+          # The in-app updater refuses to install an asset whose hash does not
+          # match this file, so it has to ship with every release.
+          sha256sum Conrod-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,7 +102,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Conrod-*.zip
+          files: |
+            dist/Conrod-*.zip
+            dist/SHA256SUMS.txt
           generate_release_notes: true
           body: |
             ## Conrod ${{ steps.version.outputs.value }}

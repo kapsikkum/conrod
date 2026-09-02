@@ -27,6 +27,11 @@ jobs:
           for m in mods: importlib.import_module('conrod.'+m)
           print('ok')
           "
+      # A syntax error in the UI script only shows up as a blank window with a
+      # message in a console nobody is looking at, so check it here.
+      - name: Web assets parse
+        run: node --check conrod/web/app.js
+
       - name: Offline unit tests
         run: python -m unittest discover -s tests -v
 

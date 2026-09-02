@@ -171,6 +171,23 @@
         <div class="bar"><div class="fill" id="fix-fill"></div></div>
         <p class="muted mono" id="fix-status"></p>
       </div>
+
+      <div class="version-box">
+        <div class="version-row">
+          <div>
+            <div class="version-now">Version <b id="version-current">—</b></div>
+            <p class="muted" id="version-note">Checking for updates…</p>
+          </div>
+          <div class="version-actions">
+            <button id="btn-update-check" class="ghost">Check again</button>
+            <button id="btn-update-install" class="primary" hidden>Update</button>
+          </div>
+        </div>
+        <div id="update-progress" class="progress-box" hidden>
+          <div class="bar"><div class="fill" id="update-fill"></div></div>
+          <p class="muted mono" id="update-status"></p>
+        </div>
+      </div>
     </div>
   </section>
 

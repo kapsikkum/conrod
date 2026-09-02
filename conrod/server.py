@@ -8,6 +8,7 @@ database the pipeline writes, so review can start while a run is still going.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -186,6 +187,82 @@ def health() -> dict:
     with _health_lock:
         _health.update({"at": time.time(), "value": value})
     return value
+
+
+_update: dict = {"state": "idle", "message": "", "release": None,
+                 "done": 0, "total": 0}
+_update_lock = threading.Lock()
+
+
+@app.get("/api/update/check")
+def update_check() -> dict:
+    """Is there a newer release on GitHub?"""
+    from . import __version__, update as updater
+
+    try:
+        release = updater.check()
+    except Exception as exc:
+        return {"ok": False, "current": __version__,
+                "error": f"could not reach GitHub: {exc}"}
+    return {
+        "ok": True, "current": __version__, "latest": release.version,
+        "newer": release.newer, "url": release.url, "tag": release.tag,
+        "size": release.size, "notes": release.notes[:1200],
+        "installable": bool(release.asset) and bool(getattr(sys, "frozen", False)),
+        "from_source": not getattr(sys, "frozen", False),
+    }
+
+
+@app.post("/api/update/install")
+def update_install() -> dict:
+    """Download the newest release and swap the app over to it.
+
+    Only ever runs because someone pressed the button. The download is
+    verified against the checksum published with the release before anything
+    is unpacked, and a frozen build is required -- see update.py.
+    """
+    from . import update as updater
+
+    # Refuse before downloading 300 MB, not after: install() checks this too,
+    # but by then the bandwidth is spent.
+    if not getattr(sys, "frozen", False):
+        raise HTTPException(
+            400, "running from source — update with 'git pull' instead")
+
+    with _update_lock:
+        if _update["state"] in ("downloading", "installing"):
+            raise HTTPException(409, "an update is already in progress")
+        _update.update({"state": "downloading", "message": "checking GitHub",
+                        "done": 0, "total": 0})
+
+    def worker() -> None:
+        try:
+            release = updater.check()
+            if not release.newer:
+                _update.update({"state": "idle", "message": "already up to date"})
+                return
+            _update["release"] = release.version
+
+            def progress(done: int, total: int) -> None:
+                _update.update({"done": done, "total": total,
+                                "message": f"downloading {release.version}"})
+
+            archive = updater.download(release, DATA_ROOT / "updates", progress)
+            _update.update({"state": "installing", "message": "unpacking"})
+            note(f"update: installing {release.version}")
+            _update["message"] = updater.install(archive)
+            _update["state"] = "restarting"
+        except Exception as exc:
+            _update.update({"state": "error", "message": str(exc)})
+            note(f"update failed: {exc}", "error")
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/api/update/status")
+def update_status() -> dict:
+    return dict(_update)
 
 
 class FixRequest(BaseModel):
