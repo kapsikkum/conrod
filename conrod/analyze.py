@@ -87,7 +87,8 @@ class VehicleAnalysis:
 
 
 def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
-            kind: str = "car", client: httpx.Client | None = None) -> VehicleAnalysis:
+            kind: str = "car", client: httpx.Client | None = None,
+            native: Image.Image | None = None) -> VehicleAnalysis:
     """Read everything readable off one vehicle crop."""
     analysis = VehicleAnalysis(kind=kind, is_bike=is_bike)
 
@@ -96,7 +97,8 @@ def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
     #    cannot resolve the characters, so this needs its own detector.
     roundel_numbers: list[tuple[str, float]] = []
     if settings.read_plates:
-        reading, roundel_numbers = plates.scan_regions(crop, settings)
+        reading, roundel_numbers = plates.scan_regions(crop, settings,
+                                                       native=native)
         if reading.text:
             analysis.plate = reading.text
             analysis.plate_state = reading.state

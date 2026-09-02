@@ -112,6 +112,23 @@ class Settings:
     plate_model: str = "yolo-v9-t-640-license-plate-end2end"
     plate_conf: float = 0.35
     plate_ocr_edge: int = 700
+    plate_pad_x: float = 0.06
+    # How much to include above and below the plate. There is no single right
+    # answer: measured over the Bathurst set, 0.18 reads four plates and 0.05
+    # reads none -- but on an NSW historic plate it is exactly the other way
+    # round. Each candidate is therefore read at several paddings and the
+    # best-validated result wins; these are the ones tried.
+    plate_pad_y: float = 0.18
+    plate_pad_y_tries: tuple = (0.18, 0.05)
+    # Search the full-resolution vehicle for a small plate, in overlapping
+    # tiles, rather than only the downscaled analysis crop. Finds plates that
+    # are otherwise lost, and costs roughly a second per vehicle.
+    plate_native_search: bool = True
+    plate_native_lower: float = 0.55   # bottom fraction of the vehicle to scan
+    # 1280 measured best: same plates found as 768 for two thirds of the cost,
+    # because each tile is one inference regardless of its size.
+    plate_tile_edge: int = 1280
+    plate_tile_overlap: float = 0.25
     plate_min_len: int = 2
     plate_max_len: int = 8
     max_plates_per_vehicle: int = 2

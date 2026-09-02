@@ -200,7 +200,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                             break
                         try:
                             work.put((det_id, det.crop_path, det.is_bike,
-                                      det.cls), timeout=1.0)
+                                      det.cls, str(source), det.box),
+                                     timeout=1.0)
                             break
                         except queue.Full:
                             continue
@@ -286,6 +287,23 @@ def _mmss(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def _native_region(frame_path: str, box, settings: Settings):
+    """The vehicle at full resolution, for the plate search.
+
+    Read here rather than passed through the queue: the queue is 64 deep and
+    one of these is about 11 MB, which would be most of a gigabyte in flight.
+    """
+    if not settings.plate_native_search or not settings.read_plates:
+        return None
+    try:
+        with Image.open(frame_path) as frame:
+            frame.load()
+            x1, y1, x2, y2 = (int(v) for v in box)
+            return frame.crop((x1, y1, x2, y2))
+    except Exception:
+        return None
+
+
 def _safely(fn, *args) -> None:
     """Call a callback that must never take the caller down with it."""
     try:
@@ -310,12 +328,13 @@ def _analysis_worker(work, settings: Settings, counters: dict,
             item = work.get()
             if item is None:
                 break
-            det_id, crop_path, is_bike, kind = item
+            det_id, crop_path, is_bike, kind, frame_path, box = item
             try:
+                native = _native_region(frame_path, box, settings)
                 with Image.open(crop_path) as crop:
                     crop.load()
                     analysis = analyze(crop, settings, is_bike=is_bike, kind=kind,
-                                       client=client)
+                                       client=client, native=native)
                 store.set_analysis(conn, det_id, analysis)
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
