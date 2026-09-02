@@ -469,3 +469,12 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
   padding: 7px 14px; font-size: 13px; cursor: pointer; white-space: nowrap;
 }
 .filebtn:hover { border-color: var(--accent); }
+
+.grouptag {
+  display: inline-block; vertical-align: middle;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .02em;
+  padding: 2px 7px; border-radius: 999px;
+  background: var(--surface-3); color: var(--text-dim);
+  border: 1px solid var(--line);
+}
+.grouptag.disputed { color: var(--warn, #e0a03a); border-color: currentColor; }

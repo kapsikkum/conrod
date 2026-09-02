@@ -609,6 +609,21 @@ function card(item) {
   };
 
   const title = el("div", { className: "title", textContent: item.title || item.cls });
+  if (item.group_size > 1) {
+    // Say how many crops the group had and how much of it agreed, so a name
+    // eight frames settled on reads differently from a four-way tie.
+    const pct = Math.round((item.group_agreement || 0) * 100);
+    const badge = el("span", {
+      className: "grouptag" + (item.disputed?.length ? " disputed" : ""),
+      textContent: item.disputed?.length
+        ? `${item.group_size} seen · no agreement`
+        : `${item.group_size} seen · ${pct}% agree`,
+      title: item.disputed?.length
+        ? `The readers disagreed: ${item.disputed.join(", ")}`
+        : `Agreed across ${item.group_size} frames of this vehicle`,
+    });
+    title.append(" ", badge);
+  }
   const who = el("div", { className: "who", textContent: item.who || "" });
   const kw = el("div", { className: "kw",
                          textContent: (item.keywords || []).join(" · ") });

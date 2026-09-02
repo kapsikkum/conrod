@@ -76,6 +76,10 @@ _MIGRATIONS = [
     ("detections", "plate_state", "TEXT"),
     ("detections", "plate_conf", "REAL"),
     ("detections", "attributes", "TEXT"),
+    ("detections", "signature", "TEXT"),
+    ("detections", "group_key", "INTEGER"),
+    ("detections", "group_size", "INTEGER"),
+    ("detections", "group_agreement", "REAL"),
 ]
 
 

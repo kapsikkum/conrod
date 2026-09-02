@@ -7,16 +7,16 @@ database the pipeline writes, so review can start while a run is still going.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
-
-from PIL import Image
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
 
 from . import keywords as keywords_mod
@@ -492,7 +492,8 @@ def job_summary(job_id: int) -> dict:
 DETECTION_QUERY = """
 SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.plate, d.plate_state, d.plate_conf, d.attributes,
-       d.reviewed, d.rejected, i.path AS image_path, i.id AS image_id
+       d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
+       i.path AS image_path, i.id AS image_id
   FROM detections d
   JOIN images i ON i.id = d.image_id
  WHERE i.job_id = :job_id
@@ -552,12 +553,21 @@ def detections(
     items = []
     for row in rows:
         item = dict(row)
-        analysis = VehicleAnalysis.from_json(item.pop("attributes", None))
+        raw_attributes = item.pop("attributes", None)
+        analysis = VehicleAnalysis.from_json(raw_attributes)
         item["filename"] = Path(item["image_path"]).name
         item["who"] = number_map.describe(item["number"]) if item["number"] else ""
         item["crop_url"] = f"/api/crop/{item['id']}"
         item["frame_url"] = f"/api/frame/{item['image_id']}"
         item["attributes"] = analysis.to_dict() if hasattr(analysis, "to_dict") else {}
+        # Read straight from the stored JSON: the disputed list is written by
+        # grouping and is not a field of VehicleAnalysis, so round-tripping
+        # through it would drop the list silently.
+        try:
+            item["disputed"] = (json.loads(raw_attributes or "{}")
+                                .get("group_disputed") or [])
+        except (TypeError, ValueError):
+            item["disputed"] = []
         item["title"] = analysis.title
         item["keywords"] = keywords_mod.for_vehicle(analysis, settings, number_map)
         items.append(item)
@@ -581,6 +591,18 @@ class DetectionUpdate(BaseModel):
     attributes: dict | None = None
     rejected: bool | None = None
     reviewed: bool = True
+
+
+@app.post("/api/jobs/{job_id}/regroup")
+def regroup(job_id: int) -> dict:
+    """Re-run grouping after corrections in review.
+
+    Works from the stored crops, so it does not re-read a single photo.
+    """
+    from . import grouping
+
+    with store.session() as conn:
+        return grouping.consolidate(conn, job_id, _state["settings"])
 
 
 @app.post("/api/detections/{det_id}")

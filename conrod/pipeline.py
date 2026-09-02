@@ -21,6 +21,7 @@ from PIL import Image
 from . import culling
 from . import detect as detect_mod
 from . import keywords as keywords_mod
+from . import grouping
 from . import store, vlm
 from .analyze import VehicleAnalysis, analyze
 from .config import CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES, RAW_SUFFIXES, Settings
@@ -233,6 +234,18 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                         break       # nothing left to tell
         for worker in pool:
             worker.join(timeout=300)
+
+        if settings.group_vehicles:
+            on_progress({"stage": "grouping", "done": 0, "total": 0,
+                         "message": "grouping vehicles that look the same"})
+            try:
+                stats = grouping.consolidate(conn, job_id, settings)
+                on_progress({"stage": "grouping", "done": stats["vehicles"],
+                             "total": stats["vehicles"],
+                             "message": f"{stats['vehicles']} vehicles in "
+                                        f"{stats['groups']} groups"})
+            except Exception as exc:
+                errors.append(f"grouping: {exc}")
 
         store.set_job_status(conn, job_id, "analysed")
         conn.commit()

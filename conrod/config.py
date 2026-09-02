@@ -158,6 +158,10 @@ class Settings:
     # --- culling ---
     # Keywording happens after the cull. Analysing rejects is GPU time spent on
     # frames that will never be delivered.
+    # Group crops that look like the same vehicle and settle on one identity.
+    # The vision model answers each crop alone, so one car can come back as
+    # four different models across a panning burst.
+    group_vehicles: bool = True
     respect_culling: bool = True
     skip_rejected: bool = True
     min_rating: int = 0            # 0 = any; 1-5 = that many stars or better
