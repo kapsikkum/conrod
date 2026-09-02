@@ -61,7 +61,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller pywebview
+          pip install pyinstaller
 
       - name: Sanity check before building
         run: python -c "import conrod, conrod.server, conrod.pipeline; print(conrod.__version__)"

@@ -1,6 +1,11 @@
 # Vehicle detection (also used once to export the model to ONNX)
 ultralytics>=8.3
 
+# Plate and roundel detection: a 7.5 MB YOLOv9 ONNX model, MIT licensed, no
+# torch. Missing this does not break the build — the import is lazy — it just
+# silently removes plate reading, which is how 0.1.0 shipped without it.
+open-image-models>=0.6
+
 # Fast first-pass OCR: PaddleOCR models running on onnxruntime,
 # so there is no PaddlePaddle dependency and no compiler needed.
 rapidocr-onnxruntime>=1.2
@@ -14,3 +19,6 @@ httpx>=0.27
 
 pillow>=10
 numpy>=1.26
+
+# Native window. Without it the app still runs, in a browser.
+pywebview>=6.0

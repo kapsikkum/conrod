@@ -95,7 +95,10 @@ def _check_plates(settings: Settings) -> tuple[str, str]:
 
 
 def _check_exiftool() -> tuple[str, str]:
-    exe = find_exiftool()
+    try:
+        exe = find_exiftool()
+    except RuntimeError:
+        return SKIP, "not on PATH (a separate install, not shipped)"
     if not exe:
         return SKIP, "not on PATH (a separate install, not shipped)"
     return OK, str(exe)

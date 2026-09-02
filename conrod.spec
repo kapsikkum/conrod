@@ -41,6 +41,10 @@ hiddenimports = [
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
 ]
 hiddenimports += collect_submodules("rapidocr_onnxruntime")
+# Imported lazily inside a function, and its absence is silent: the app runs
+# and simply never reads a plate. Named explicitly so it cannot go missing.
+hiddenimports += ["open_image_models"]
+hiddenimports += collect_submodules("open_image_models")
 
 # Excluded to keep the build down: these arrive via torch/ultralytics but the
 # app never plots anything or trains.

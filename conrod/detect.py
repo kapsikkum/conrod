@@ -19,6 +19,7 @@ Two findings from real trackside frames shape this module:
 
 from __future__ import annotations
 
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,11 +63,15 @@ def load_model(settings: Settings):
 
         weights = MODEL_DIR / settings.detect_model
         if not weights.exists():
-            # Ultralytics downloads into the CWD by default, so fetch and move.
+            # Ultralytics downloads into the CWD by default, so fetch and
+            # move. shutil.move rather than Path.replace: os.replace cannot
+            # cross drives, and running the app from D: with a profile on C:
+            # is entirely normal — it raised WinError 17 on first run.
             YOLO(settings.detect_model)
             stray = Path(settings.detect_model)
             if stray.exists():
-                stray.replace(weights)
+                weights.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(stray), str(weights))
         _model = YOLO(str(weights))
         return _model
 
