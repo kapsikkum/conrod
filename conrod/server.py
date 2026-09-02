@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,22 @@ _resume_gate.set()
 # Recently detected frames, keyed by detection id, so a vehicle result arriving
 # from the analysis pool can be matched back to the frame it came from.
 _frames: dict[int, dict] = {}
+
+# What the scan has been doing, for the panel in the app. exiftool, the
+# detector and the vision model all write to stdout, which a windowed build
+# does not have, so without this the long stages are a black box.
+_journal: deque = deque(maxlen=400)
+_journal_lock = threading.Lock()
+
+
+def note(text: str, level: str = "info") -> None:
+    if not text:
+        return
+    with _journal_lock:
+        if _journal and _journal[-1]["text"] == text:
+            _journal[-1]["repeat"] = _journal[-1].get("repeat", 1) + 1
+            return
+        _journal.append({"at": time.time(), "level": level, "text": text})
 
 
 def _show(record: dict) -> None:
@@ -300,6 +317,9 @@ def start_scan(body: ScanRequest) -> dict:
             _run["total"] = event.get("total", _run["total"])
         if event.get("message"):
             _run["message"] = event["message"]
+            if stage not in ("frame", "vehicle"):
+                note(f"{stage}: {event['message']}",
+                     "warn" if stage == "warn" else "info")
         _run["stage"] = stage
 
         # The live view follows the frame whose vehicles are being *read*, not
@@ -369,6 +389,7 @@ def start_scan(body: ScanRequest) -> dict:
         except Exception as exc:
             _run["error"] = f"{type(exc).__name__}: {exc}"
             _run["stage"] = "error"
+            note(_run["error"], "error")
         finally:
             _run["active"] = False
 
@@ -409,6 +430,14 @@ def resume_scan() -> dict:
     _resume_gate.set()
     _run["paused"] = False
     return {"ok": True, "paused": False}
+
+
+@app.get("/api/log")
+def read_log(after: float = 0.0) -> dict:
+    """What the scan has been doing. Everything the console would have shown."""
+    with _journal_lock:
+        lines = [e for e in _journal if e["at"] > after]
+    return {"lines": lines, "at": lines[-1]["at"] if lines else after}
 
 
 @app.get("/api/scan/frame")

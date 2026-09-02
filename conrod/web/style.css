@@ -478,3 +478,24 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
   border: 1px solid var(--line);
 }
 .grouptag.disputed { color: var(--warn, #e0a03a); border-color: currentColor; }
+
+.activity {
+  grid-column: 1 / -1;
+  margin-top: 14px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--surface);
+  overflow: hidden;
+}
+.activity-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border-bottom: 1px solid var(--line-soft);
+  font-size: 12px; font-weight: 600; color: var(--text-dim);
+  letter-spacing: .04em; text-transform: uppercase;
+}
+.activity-body {
+  max-height: 220px; overflow-y: auto; padding: 8px 12px;
+  font-size: 11.5px; line-height: 1.65;
+}
+.logline { color: var(--text-dim); white-space: pre-wrap; }
+.logline.warn { color: var(--warn, #e0a03a); }
+.logline.error { color: var(--bad, #e0605a); }
+button.small { padding: 4px 10px; font-size: 12px; }

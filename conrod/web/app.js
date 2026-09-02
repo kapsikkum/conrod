@@ -38,6 +38,8 @@ function toast(message) {
 
 const state = {
   screen: "home",
+  logAt: 0,
+  logTimer: null,
   jobId: null,
   view: "review",
   number: null,
@@ -437,6 +439,43 @@ $("#btn-pause").onclick = async () => {
 };
 
 $("#btn-scan-review").onclick = () => show("review");
+
+/* ── activity log ─────────────────────────────────────────── */
+/* exiftool, the detector and the vision model all write to a console the
+   packaged app does not have. This is where that output goes instead. */
+$("#btn-activity").onclick = () => {
+  const panel = $("#activity");
+  panel.hidden = !panel.hidden;
+  $("#btn-activity").textContent = panel.hidden ? "Show activity" : "Hide activity";
+  if (!panel.hidden) pollLog();
+};
+$("#btn-activity-close").onclick = () => {
+  $("#activity").hidden = true;
+  $("#btn-activity").textContent = "Show activity";
+};
+
+async function pollLog() {
+  if ($("#activity").hidden) return;
+  try {
+    const data = await api(`/api/log?after=${state.logAt || 0}`);
+    if (data.lines?.length) {
+      state.logAt = data.at;
+      const body = $("#activity-body");
+      const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
+      for (const line of data.lines) {
+        const when = new Date(line.at * 1000).toLocaleTimeString();
+        body.append(el("div", {
+          className: `logline ${line.level}`,
+          textContent: `${when}  ${line.text}` + (line.repeat > 1 ? `  (x${line.repeat})` : ""),
+        }));
+      }
+      while (body.childElementCount > 400) body.firstElementChild.remove();
+      if (atBottom) body.scrollTop = body.scrollHeight;
+    }
+  } catch {}
+  clearTimeout(state.logTimer);
+  state.logTimer = setTimeout(pollLog, 1000);
+}
 
 function pollScan() {
   clearInterval(state.scanTimer);
