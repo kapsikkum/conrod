@@ -741,9 +741,21 @@ button.small { padding: 4px 10px; font-size: 12px; }
 /* The verdict as a colour, matching the label written into the catalogue:
    green kept, yellow borderline, red culled. The grid then reads like a
    filmstrip rather than like a list of filenames. */
-.card.rated-good { border-left: 3px solid var(--good); }
-.card.rated-fair { border-left: 3px solid var(--warn2); }
-.card.rated-poor { border-left: 3px solid var(--bad); }
+/* Paired with a .strip variant on purpose. `.vehicle .strip .card` sets the
+   whole border and is the more specific selector, so a bare `.card.rated-*`
+   lost to it -- and the grouped grid is exactly where the cards live, so the
+   verdict colour was invisible everywhere it mattered. */
+.card.rated-good, .vehicle .strip .card.rated-good { border-left: 3px solid var(--good); }
+.card.rated-fair, .vehicle .strip .card.rated-fair { border-left: 3px solid var(--warn2); }
+.card.rated-poor, .vehicle .strip .card.rated-poor { border-left: 3px solid var(--bad); }
 .card .focus.panning {
   color: var(--scan); border-color: #1c4a3c; margin-left: 4px;
 }
+
+/* A frame the cull dropped stays fully legible. It is a red rating, not a
+   deletion, and the entire point is that it can be looked at and argued
+   with -- fading it to 40% made the automatic calls the hardest to review. */
+.card.culled, .vehicle .strip .card.culled {
+  opacity: 1; border-left: 3px solid var(--bad);
+}
+.card.culled .thumb { opacity: .82; }

@@ -259,5 +259,86 @@ class Readings(unittest.TestCase):
         self.assertFalse(out)
 
 
+class TheCountsDecideTheCar(unittest.TestCase):
+    """Tidying up names must not change which vehicle it is.
+
+    Measured on eight real frames of a white Jaguar XJ-S, plate 39432J:
+
+        4 x Jaguar XJS
+        2 x Nissan Fairlady Z
+        1 x Opel GTE
+        1 x Nissan 240Z
+
+    The tidy-up answered "Nissan Fairlady Z" and it was taken -- the
+    second-place reading beating four frames with two -- and that name was
+    written into the photographs. Every part of it had been observed
+    somewhere, so the existing "was it read?" check passed it happily.
+    """
+
+    SPREAD = ([{"make": "Jaguar", "model": "XJS"}] * 4
+              + [{"make": "Nissan", "model": "Fairlady Z"}] * 2
+              + [{"make": "Opel", "model": "GTE"}]
+              + [{"make": "Nissan", "model": "240Z"}])
+
+    def _answer(self, payload, members=None):
+        from unittest import mock
+
+        class Resp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self): return {"response": payload}
+
+        readings = normalise.readings_of(members or self.SPREAD)
+        with mock.patch("httpx.Client.post", return_value=Resp()):
+            return normalise.canonical(readings, Settings())
+
+    def test_the_marque_the_most_frames_saw_wins(self) -> None:
+        out = self._answer('{"make":"Nissan","model":"Fairlady Z"}')
+        self.assertEqual(out.make, "Jaguar")
+        self.assertEqual(out.model, "XJS")
+
+    def test_what_was_overruled_is_recorded(self) -> None:
+        out = self._answer('{"make":"Nissan","model":"Fairlady Z"}')
+        self.assertTrue(any("Nissan" in r for r in out.rejected))
+
+    def test_it_still_arbitrates_within_the_leading_marque(self) -> None:
+        """The guard must not turn the whole step off.
+
+        Choosing between two of one marque's nameplates is exactly what this
+        call is for, and the guard has nothing to say about it.
+
+        (Two spellings of the *same* nameplate never get this far: "XJS" and
+        "XJ-S" fold into one reading before the model is asked, so there is
+        nothing left to reconcile and no call is made at all.)
+        """
+        members = ([{"make": "Jaguar", "model": "XJS"}] * 3
+                   + [{"make": "Jaguar", "model": "E-Type"}] * 2)
+        out = self._answer('{"make":"Jaguar","model":"XJS"}', members)
+        self.assertEqual(out.make, "Jaguar")
+        self.assertEqual(out.model, "XJS")
+        self.assertEqual(out.rejected, [])
+
+    def test_two_spellings_of_one_nameplate_never_reach_the_model(self) -> None:
+        readings = normalise.readings_of(
+            [{"make": "Jaguar", "model": "XJS"}] * 3
+            + [{"make": "Jaguar", "model": "XJ-S"}] * 2)
+        self.assertEqual(len(readings), 1)
+        self.assertEqual(readings[0].count, 5)
+
+    def test_a_tie_lets_the_model_arbitrate(self) -> None:
+        """A tie is the one case where the frames genuinely cannot decide."""
+        members = ([{"make": "Jaguar", "model": "XJS"}] * 2
+                   + [{"make": "Nissan", "model": "Fairlady Z"}] * 2)
+        readings = normalise.readings_of(members)
+        self.assertIsNone(normalise._plurality_make(readings))
+
+    def test_a_nameplate_counts_towards_its_marque(self) -> None:
+        """"Commodore" with no make is still a Holden frame."""
+        members = ([{"make": None, "model": "Commodore"}] * 3
+                   + [{"make": "Ford", "model": "Falcon"}] * 1)
+        readings = normalise.readings_of(members)
+        self.assertEqual(normalise._plurality_make(readings), "Holden")
+
+
 if __name__ == "__main__":
     unittest.main()

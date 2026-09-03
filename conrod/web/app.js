@@ -1097,7 +1097,13 @@ function band(value) {
 
 function card(item) {
   const attrs = item.attributes || {};
-  const node = el("div", { className: "card" + (item.rejected ? " rejected" : "") });
+  // A frame Conrod culled is not the same as one a person threw out. The cull
+  // is a rating now -- red bar, reason underneath, fully legible -- because
+  // its whole purpose is to be looked at and disagreed with. Ghosting it at
+  // 40% opacity made the automatic decisions the hardest ones to review.
+  const cutByHand = item.rejected && !item.cull_reason;
+  const node = el("div", { className: "card" + (cutByHand ? " rejected" : "")
+                                              + (item.cull_reason ? " culled" : "") });
   node.dataset.id = item.id;
 
   // Ask for a thumbnail, not the 2048px crop the readers work from.
@@ -1416,7 +1422,15 @@ $("#btn-dry").onclick = async () => {
 };
 
 $("#btn-write").onclick = async () => {
-  if (!confirm("Write keywords into XMP sidecars (RAW) and into the files themselves (JPEG)?")) return;
+  // Say everything that is about to be written. It is no longer only
+  // keywords: the cull's verdict goes out as a star rating and a colour
+  // label, and a dialog that does not mention them is asking for consent to
+  // something else.
+  if (!confirm(
+    "Write to XMP sidecars (RAW) and into the files themselves (JPEG)?\n\n"
+    + "  • keywords and caption\n"
+    + "  • a star rating and a colour label from the cull\n\n"
+    + "A rating or label you have already set is never overwritten.")) return;
   const button = $("#btn-write");
   button.disabled = true; button.textContent = "Writing…";
   try {

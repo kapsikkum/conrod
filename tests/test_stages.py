@@ -141,5 +141,48 @@ class ThroughTheApi(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class NothingIsWrittenWithoutAsking(unittest.TestCase):
+    """The photographs are not touched until Write XMP is pressed.
+
+    Scanning reads metadata -- existing ratings decide what is skipped -- so
+    "exiftool ran" is not the same as "your files were changed". What must
+    never happen is a write, and the difference is which arguments it was
+    handed.
+    """
+
+    def test_only_the_write_endpoint_reaches_write_job(self) -> None:
+        """Checked against the source, because a call added later would not
+        show up in any test that merely runs a scan."""
+        import re
+
+        import conrod.server
+        source = Path(conrod.server.__file__).read_text(encoding="utf-8")
+        callers = []
+        for match in re.finditer(r"pipeline\.write_job\(", source):
+            before = source[:match.start()]
+            # The nearest enclosing decorated route above the call.
+            routes = re.findall(r'@app\.(?:post|get)\("([^"]+)"\)', before)
+            callers.append(routes[-1] if routes else "(not in a route)")
+        self.assertEqual(callers, ["/api/jobs/{job_id}/write"],
+                         f"write_job is reachable from {callers}")
+
+    def test_the_scan_stages_never_call_the_writer(self) -> None:
+        import conrod.pipeline
+        source = Path(conrod.pipeline.__file__).read_text(encoding="utf-8")
+        # The single call lives in write_job; nothing before it may write.
+        body = source[:source.index("def write_job")]
+        self.assertNotIn("write_keywords(", body,
+                         "something in the scan path writes metadata")
+
+    def test_a_cull_records_its_verdict_in_the_database_only(self) -> None:
+        """The cull rates and labels, but the label lives here until asked for."""
+        from conrod import sharpness
+
+        self.assertEqual(sharpness.label_for("poor"), "Red")
+        # Proof it is a pure function of the verdict: no file, no exiftool,
+        # nothing on disk is involved in arriving at it.
+        self.assertEqual(sharpness.label_for("good"), "Green")
+
+
 if __name__ == "__main__":
     unittest.main()

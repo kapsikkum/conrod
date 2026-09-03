@@ -798,6 +798,25 @@ _watcher: watch.Watcher | None = None
 _watch_wake = threading.Event()
 
 
+def _stage_for_album(job_id: int) -> str:
+    """How far a watched album is being taken, so new frames match the rest."""
+    try:
+        conn = store.connect()
+        try:
+            row = conn.execute("SELECT status FROM jobs WHERE id=?",
+                               (job_id,)).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return "all"
+    status = (row["status"] if row else "") or ""
+    if status == "indexed":
+        return "index"
+    if status == "culled":
+        return "cull"
+    return "all"
+
+
 def _known_frames(job_id: int) -> set[str]:
     """Every frame the album already holds, however its path is spelled."""
     conn = store.connect()
@@ -830,9 +849,15 @@ def _watch_loop(generation: int) -> None:
             # The pipeline lists the folder itself and skips what is already
             # done, so handing it the folder is enough -- and means a watched
             # scan and a resumed one are the same code path.
+            # Continue the album the way it is being worked. An album that
+            # has only been indexed must not have new frames quietly run
+            # through the vision model because a watch picked them up --
+            # staging the work was a deliberate choice and a watch does not
+            # get to undo it.
             start_scan(ScanRequest(path=str(_watch["folder"]),
                                    recursive=bool(_watch["recursive"]),
-                                   resume_job=_watch["job_id"]))
+                                   resume_job=_watch["job_id"],
+                                   stage=_stage_for_album(_watch["job_id"])))
         except Exception as exc:         # a watch must not die on one bad pass
             _watch["message"] = f"{type(exc).__name__}: {exc}"
             note(f"watch: {_watch['message']}", "warn")

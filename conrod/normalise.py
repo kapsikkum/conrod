@@ -93,6 +93,12 @@ class Reading:
     model: str = ""
     count: int = 1
 
+    # Whether ``make`` is a marque the reader actually reported, or a guess
+    # made by splitting a string on its first space. "Commodore VC" splits
+    # into make "Commodore", which is a nameplate and not a marque at all --
+    # so a guessed make can never be counted as a vote for one.
+    stated: bool = True
+
     @property
     def text(self) -> str:
         return " ".join(b for b in (self.make, self.model) if b)
@@ -103,7 +109,8 @@ def readings_from(texts: "list[str]") -> "list[Reading]":
     out = []
     for text in texts:
         bits = str(text).split(" ", 1)
-        out.append(Reading(make=bits[0], model=bits[1] if len(bits) > 1 else ""))
+        out.append(Reading(make=bits[0], model=bits[1] if len(bits) > 1 else "",
+                           stated=False))
     return out
 
 
@@ -172,6 +179,38 @@ def _key(reading: str) -> str:
 
 def _observed(readings: "list[Reading]") -> str:
     return " | ".join(r.text for r in readings).lower()
+
+
+def _plurality_make(readings) -> str | None:
+    """The make the most frames named, when one of them clearly leads.
+
+    Counted per make rather than per full reading, because the model name is
+    the part that degrades: one car read as "Jaguar XJS" four times and
+    "Jaguar XJ-S" twice has six frames agreeing about the marque and no
+    single reading with a majority.
+
+    None when it is a tie, which is a real answer -- a tie is exactly the
+    case where nothing should be allowed to claim it won.
+    """
+    tally: Counter = Counter()
+    spelling: dict[str, str] = {}
+    for reading in readings:
+        if not getattr(reading, "stated", True):
+            # Split out of a bare string, so the "make" is whatever word came
+            # first. Counting those overruled a correct "Holden" with
+            # "Commodore" -- a nameplate promoted to a marque by a space.
+            continue
+        make = (reading.make or marques.correct_make(None, reading.model) or "").strip()
+        if not make:
+            continue
+        tally[make.lower()] += reading.count
+        spelling.setdefault(make.lower(), make)
+    if not tally:
+        return None
+    ranked = tally.most_common()
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    return spelling[ranked[0][0]]
 
 
 def _acceptable_make(make: str | None, readings: list[str]) -> str | None:
@@ -288,6 +327,27 @@ def canonical(readings, settings: Settings, *,
     model = parsed.get("model")
     make = make.strip() if isinstance(make, str) else None
     model = model.strip() if isinstance(model, str) else None
+
+    # The tidy-up settles spelling. It does not get to decide which car this
+    # is, and left unguarded it did exactly that: eight frames of a Jaguar
+    # XJ-S read as four Jaguars, two Nissan Fairlady Zs, a Nissan 240Z and an
+    # Opel, and the answer that went into the photographs was "Nissan Fairlady
+    # Z" -- the second-place reading, beating four frames with two. Every
+    # component name it chose had been observed, so nothing caught it.
+    #
+    # The frames are the evidence and the count is what makes them evidence.
+    # Where one marque leads, the answer has to be that marque.
+    leader = _plurality_make(readings)
+    if leader and make and _key(make) != _key(leader):
+        top = readings[0]
+        answer = Canonical(
+            make=leader,
+            model=(top.model if _key(top.make or "") == _key(leader) else None),
+            rejected=[f"{make} {model}".strip()],
+        )
+        if cache is not None:
+            cache[key] = answer
+        return answer
 
     rejected: list[str] = []
     kept_make = _acceptable_make(make, readings)

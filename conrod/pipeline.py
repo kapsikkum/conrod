@@ -439,8 +439,16 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
                     break
                 except queue.Full:
                     continue
-            on_progress({"stage": "identify", "done": done, "total": total,
-                         "message": f"{counters['identified']} named"})
+            # Progress is how many have been *read*, not how many have been
+            # handed over. The queue is 64 deep, so a small album is fully
+            # queued in milliseconds: reporting the hand-over sent the bar
+            # straight to 100% and then showed "0 named" for the nine minutes
+            # the work actually took.
+            with counter_lock:
+                seen = counters["analysed"]
+                named = counters["identified"]
+            on_progress({"stage": "identify", "done": seen, "total": total,
+                         "message": f"{named} named"})
 
         for _ in pool:
             while True:
@@ -450,6 +458,19 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
                 except queue.Full:
                     if not any(w.is_alive() for w in pool):
                         break
+
+        # Everything is queued and the workers are still going. Keep
+        # reporting until they stop, or the last frame of the album appears
+        # to take as long as all of them put together.
+        while any(w.is_alive() for w in pool):
+            for worker in pool:
+                worker.join(timeout=1.0)
+                break
+            with counter_lock:
+                seen = counters["analysed"]
+                named = counters["identified"]
+            on_progress({"stage": "identify", "done": min(seen, total),
+                         "total": total, "message": f"{named} named"})
         for worker in pool:
             worker.join(timeout=300)
 
@@ -601,6 +622,20 @@ def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
     """
     if not getattr(settings, "group_by_burst", True):
         return
+
+    # Bursts are a property of the files, not of the run, so a second pass
+    # over an album that already has them is an exiftool walk of the whole
+    # shoot for an answer that cannot have changed. Adding an album and then
+    # culling it is two passes by definition, and on 1,800 frames the second
+    # one is minutes of nothing.
+    have = conn.execute(
+        "SELECT COUNT(*) FROM images WHERE job_id=? AND burst_key IS NOT NULL",
+        (job_id,)).fetchone()[0]
+    if have and have >= len(list(files)):
+        on_progress({"stage": "cameras",
+                     "message": f"capture times already read for {have} frames"})
+        return
+
     on_progress({"stage": "cameras", "message": "reading camera and capture times"})
     try:
         with ExifTool() as tool:
