@@ -8,6 +8,23 @@ and Capture One will see it.
 
 Named for Conrod Straight at Mount Panorama, which is also what the mark is.
 
+## What it looks like
+
+A scan in progress. Each frame is shown as it is read, with the vehicles it
+found boxed on it, so a long run is not a blank progress bar.
+
+![Scanning a folder of frames](docs/screenshots/scan.png)
+
+The review grid. One card per vehicle rather than per frame, with the paint
+colour sampled from the crop shown beside the name the vision model gave it —
+the word on its own is often useless, and a square of the actual colour makes
+a wrong one obvious at a glance.
+
+![Reviewing what was found](docs/screenshots/review.png)
+
+Registration plates are blurred in these screenshots; the app itself reads and
+stores them normally.
+
 ## How it works
 
 ```
@@ -149,17 +166,52 @@ are the two things that change the number meaningfully.
 
 ## Accuracy, honestly
 
-On the fifteen-frame Bathurst set, make and model were specific and usually
-right (Lexus IS 300h, Mercedes B-Class, MINI Cooper S, Subaru WRX STI), and
-competition numbers on liveried cars were read correctly. Known weaknesses:
+Measured on thirteen crops from a Bathurst shoot, with the ground truth read
+off the photographs rather than assumed. Eleven were sharp enough to identify;
+three were deliberately included because they are not.
 
-- **Colour is inconsistent.** The same black Mini came back "black" in one
-  frame and "green" in the next.
-- **The model invents team names.** A Mini produced "Nosso" out of garbled OCR.
-  Conrod now withholds any team name that no read text supports, and marks it
-  in the review UI rather than writing it.
+`qwen2.5vl:7b` named **eleven of eleven** sharp crops correctly — Mazda RX-8,
+BF Falcon, FG Falcon ute, Jaguar XJ-S, MINI Cooper S, Subaru WRX STI, BMW X5,
+BMW R1200R — and got the **make** right on all three crops too blurry to
+identify, while guessing the model.
+
+### Which vision model
+
+Every model that fits in 8 GB of VRAM, same crops, same prompt:
+
+| model | sharp crops correct | per crop | download |
+|---|---|---|---|
+| **qwen2.5vl:7b** | **11 / 11** | 2.7 s | 6.0 GB |
+| gemma3:4b | 4 / 11 | 5.6 s | 3.3 GB |
+| minicpm-v:8b | 3 / 11 | 6.4 s | 5.5 GB |
+| qwen3-vl:8b | worse | 2.6 s | 6.1 GB |
+
+It is not close, so `qwen2.5vl:7b` is the default and the Setup screen asks for
+that one. minicpm called both a Jaguar XJ-S and a Mazda RX-8 a "Holden
+Commodore"; gemma3 called a BMW X5 a "Subaru Forester". Larger models would
+likely do better still, but `qwen2.5vl:32b` is 21 GB and would run on the CPU.
+
+Note that qwen3-vl is newer and *worse* at this, and that it returns its answer
+in a `thinking` field that a normal reader sees as empty — worth knowing before
+assuming a newer model is an upgrade.
+
+### Known weaknesses
+
+- **Small and distant vehicles get a plausible wrong model name.** A pack shot
+  where the cars are a hundred pixels wide returns "Ford Focus RS" for what is
+  actually a Falcon. The *make* survives; the model name does not.
+- **A confidently wrong badge.** A Kawasaki Ninja H2 came back as a "Yamaha
+  Ninja H2" — the nameplate right, the marque wrong. Model names belonging to
+  exactly one marque now correct the make, but a bike identified as the wrong
+  bike entirely is not recoverable this way.
+- **The word for a colour is unreliable.** The same black MINI came back
+  "black" in one frame and "green" in the next. The review grid now shows a
+  square of the paint sampled from the crop itself, so a wrong word is obvious
+  without opening the frame.
+- **The model invents team names.** A MINI produced "Nosso" out of garbled OCR.
+  Conrod withholds any team name that no read text supports.
 - **It invents competition numbers on road cars.** A highway patrol wagon came
-  back as "#220". Numbers from the vision model are now discarded when it has
+  back as "#220". Numbers from the vision model are discarded when it has
   itself said the vehicle is not a competition entry and nothing corroborates.
 - **Plates need resolution.** A plate read perfectly on a car filling the frame
   and on a ute at trackside distance, but a motorcycle's blurred rear plate at
