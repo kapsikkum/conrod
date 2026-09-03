@@ -90,6 +90,7 @@ class Group:
     cls: str | None = None
     make: str | None = None
     plates: set = field(default_factory=set)
+    bursts: set = field(default_factory=set)
 
 
 def cluster(rows: list[tuple], *, max_bits: int = 14,
@@ -137,6 +138,7 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
         cls = row[4] if len(row) > 4 else None
         make = row[5] if len(row) > 5 else None
         plate = _tidy_plate(row[6]) if len(row) > 6 else None
+        burst = row[7] if len(row) > 7 else None
         if not sig:
             continue
         for group in groups:
@@ -150,11 +152,20 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
             # other signals kept getting wrong: a purple Falcon shot side-on
             # in sun and from behind in shade, read as the same plate both
             # times and as two different colours.
+            # A burst is one unbroken run of the shutter at one subject, so
+            # two of its frames are the same vehicle unless something
+            # measured says otherwise. That makes it the strongest signal
+            # here after an identical plate, and it has to be read before the
+            # plate veto rather than after: one frame of this Jaguar read
+            # ZE766 where eighteen read 39432J, and that single misread was
+            # enough to declare six frames a different car.
+            same_burst = burst is not None and burst in group.bursts
+
             verdict = _plate_verdict(plate, group.plates)
-            if verdict is False:
+            if verdict is False and not same_burst:
                 continue
             if verdict is True:
-                _join(group, det_id, frame_index, make, plate, assignment)
+                _join(group, det_id, frame_index, make, plate, assignment, burst)
                 break
 
             # A plate one confusable character away from one this group has
@@ -167,7 +178,13 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
 
             if cls and group.cls and cls != group.cls:
                 continue
-            if not near and not _same_make(make, group.make):
+            # The make gate is the vision model's opinion, and a burst is a
+            # fact about when the shutter fired. Measured on one pass of a
+            # silver Jaguar: thirty-one frames, one car, split into four
+            # groups called Jaguar XJ-S, Jaguar XJS, Holden Monaro and Holden
+            # HJ Torana -- because the frames it misread were refused entry
+            # to the group that would have outvoted them.
+            if not near and not same_burst and not _same_make(make, group.make):
                 continue
             if not _colour_matches(sig, group.signature, min_colour):
                 continue
@@ -175,27 +192,31 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
                 continue
             shape_agrees = _shape_distance(sig, group.signature) <= max_bits
             nearby = abs(frame_index - group.last_frame) <= frame_window
-            if shape_agrees or nearby or near:
-                _join(group, det_id, frame_index, make, plate, assignment)
+            if shape_agrees or nearby or near or same_burst:
+                _join(group, det_id, frame_index, make, plate, assignment, burst)
                 break
         else:
             groups.append(Group(key=len(groups) + 1, members=[det_id],
                                 signature=sig, last_frame=frame_index,
                                 frames={frame_index}, swatch=swatch,
                                 cls=cls, make=make,
-                                plates={plate} if plate else set()))
+                                plates={plate} if plate else set(),
+                                bursts={burst} if burst is not None else set()))
             assignment[det_id] = groups[-1].key
     return assignment
 
 
 def _join(group: "Group", det_id: int, frame_index: int, make: str | None,
-          plate: str | None, assignment: dict[int, int]) -> None:
+          plate: str | None, assignment: dict[int, int],
+          burst: int | None = None) -> None:
     group.members.append(det_id)
     group.last_frame = max(group.last_frame, frame_index)
     group.frames.add(frame_index)
     group.make = group.make or make
     if plate:
         group.plates.add(plate)
+    if burst is not None:
+        group.bursts.add(burst)
     assignment[det_id] = group.key
 
 
@@ -337,6 +358,10 @@ class Consensus:
     agreement: float = 0.0     # how much of the group backed the winning name
     size: int = 0
     disputed: list[str] = field(default_factory=list)
+    # True when the name came from looking at the pictures again rather than
+    # from the per-frame readings, which is worth saying: it is a different
+    # kind of answer and the review screen should not present it as a vote.
+    second_look: bool = False
 
 
 def _median_hex(values: list[str]) -> str | None:
@@ -465,6 +490,25 @@ def consensus(members: list[dict]) -> Consensus:
     return out
 
 
+# How many frames of a burst are worth showing at once. Beyond a handful the
+# answer stops improving and the call gets slow, and the frames after the
+# best few are the ones the sharpness ranking put last for a reason.
+SECOND_LOOK_FRAMES = 3
+
+
+def _second_look(ids: list[int], crops: dict, settings) -> "object":
+    """Ask the vision model about the sharpest frames of one vehicle."""
+    from . import vlm
+    from pathlib import Path
+
+    ranked = sorted((crops[i] for i in ids if i in crops),
+                    key=lambda pair: pair[1], reverse=True)
+    paths = [Path(path) for path, _ in ranked[:SECOND_LOOK_FRAMES] if path]
+    if not paths:
+        return vlm.VehicleDescription()
+    return vlm.identify_burst(paths, settings)
+
+
 def consolidate(conn, job_id: int, settings=None) -> dict:
     """Group a finished job's vehicles and settle on one identity each.
 
@@ -477,7 +521,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
 
     rows = conn.execute(
         """SELECT d.id, d.crop_path, d.attributes, d.signature, d.colour_hex,
-                  d.cls, d.plate, i.id AS image_id
+                  d.cls, d.plate, d.sharpness, i.id AS image_id, i.burst_key
              FROM detections d JOIN images i ON i.id = d.image_id
             WHERE i.job_id = ? AND d.rejected = 0
             ORDER BY i.id, d.id""",
@@ -488,6 +532,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
 
     signatures: list[tuple[int, str, int]] = []
     attributes: dict[int, dict] = {}
+    crops: dict[int, tuple] = {}
     for row in rows:
         sig = row["signature"]
         if not sig:
@@ -507,8 +552,10 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                 parsed[field_name] = parsed[f"own_{field_name}"]
         parsed["colour_hex"] = row["colour_hex"]
         attributes[row["id"]] = parsed
+        crops[row["id"]] = (row["crop_path"], row["sharpness"] or 0.0)
         signatures.append((row["id"], sig, row["image_id"], row["colour_hex"],
-                           row["cls"], parsed.get("make"), row["plate"]))
+                           row["cls"], parsed.get("make"), row["plate"],
+                           row["burst_key"]))
 
     assignment = cluster(signatures)
     members: dict[int, list[int]] = {}
@@ -520,6 +567,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
     # checked back against what was read before any of it is believed.
     tidy_names = bool(settings and getattr(settings, "normalise_names", False)
                       and getattr(settings, "use_vlm", False))
+    look_again = bool(tidy_names and getattr(settings, "burst_second_look", True))
     name_cache: dict = {}
 
     for key, ids in members.items():
@@ -536,6 +584,18 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                 agreed.model = tidied.model
             elif tidied.model:
                 agreed.model = tidied.model
+
+            # Still no model means the frames disagreed about which vehicle
+            # this is, and no amount of rereading the words will settle it.
+            # Show the model the pictures instead -- the sharpest of them,
+            # because a badge smeared by a panning blur is what caused the
+            # disagreement in the first place. See vlm.identify_burst.
+            if look_again and not agreed.model and len(ids) > 1:
+                seen = _second_look(ids, crops, settings)
+                if seen.make or seen.model:
+                    agreed.make = seen.make or agreed.make
+                    agreed.model = seen.model or agreed.model
+                    agreed.second_look = True
         for det_id in ids:
             current = attributes.get(det_id, {})
             # What this frame's reader said is a measurement and is never
@@ -570,6 +630,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
             if agreed.livery_text:
                 current["livery_text"] = agreed.livery_text
             current["group_disputed"] = agreed.disputed
+            current["group_second_look"] = agreed.second_look
             conn.execute(
                 # group_colour_hex, never colour_hex. The per-frame sample
                 # is a measurement and must survive: writing the group median

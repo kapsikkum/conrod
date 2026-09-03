@@ -198,6 +198,91 @@ class MisreadPlates(unittest.TestCase):
         self.assertFalse(_near_plate("43111J", "73112J"))   # two apart
 
 
+class BurstsGroup(unittest.TestCase):
+    """A burst is one run of the shutter at one subject.
+
+    That is a much better statement than "their file ids are close together",
+    which is all the frame window ever knew. It counted a second shooter's
+    frames as adjacent because the two cameras interleave in one folder, and
+    counted a burst as distant when the cull had taken six frames out of the
+    middle of it.
+    """
+
+    SIG = "ffff0000:" + ",".join(["0.03"] * 36)
+    OTHER = "0000ffff:" + ",".join(["0.03"] * 36)
+
+    def test_a_burst_holds_together_across_a_gap_in_file_ids(self):
+        from conrod.grouping import cluster
+
+        # Frames 1 and 40: far apart in the folder, one burst in time.
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", None, None, 7),
+                (2, self.OTHER, 40, "#2c426c", "car", None, None, 7)]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+    def test_different_bursts_are_not_forced_together(self):
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", None, None, 7),
+                (2, self.OTHER, 40, "#2c426c", "car", None, None, 9)]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_a_burst_does_not_override_the_paint(self):
+        """Two cars can be in one burst. Colour still has to agree."""
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", None, None, 7),
+                (2, self.SIG, 2, "#c0392b", "car", None, None, 7)]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_frames_with_no_burst_behave_as_before(self):
+        """A folder with no EXIF still groups on the old signals."""
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", None, None, None),
+                (2, self.SIG, 2, "#2c426c", "car", None, None, None)]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+
+class SecondLook(unittest.TestCase):
+    """Which frames get shown to the model when the readings disagree."""
+
+    def test_the_sharpest_frames_are_the_ones_sent(self):
+        """The disagreement is usually caused by the blurred frames.
+
+        Sending them again is asking the same question of the same bad
+        evidence. Sharpness ranking is what makes the second look worth
+        making at all.
+        """
+        from unittest.mock import patch
+        from conrod import grouping
+
+        crops = {1: ("blurred.jpg", 0.11), 2: ("sharp.jpg", 0.94),
+                 3: ("soft.jpg", 0.48), 4: ("sharpest.jpg", 0.98)}
+        sent = {}
+
+        def spy(paths, settings, **kw):
+            sent["paths"] = [p.name for p in paths]
+            class Seen:
+                make, model = "Ford", "Falcon FG"
+            return Seen()
+
+        with patch("conrod.vlm.identify_burst", spy):
+            grouping._second_look([1, 2, 3, 4], crops, None)
+        self.assertEqual(sent["paths"], ["sharpest.jpg", "sharp.jpg", "soft.jpg"])
+        self.assertNotIn("blurred.jpg", sent["paths"])
+
+    def test_no_crops_means_no_call(self):
+        from unittest.mock import patch
+        from conrod import grouping
+
+        def explode(*a, **k):
+            raise AssertionError("asked the model about nothing")
+
+        with patch("conrod.vlm.identify_burst", explode):
+            out = grouping._second_look([1, 2], {}, None)
+        self.assertFalse(out.make)
+
+
 class Accumulation(unittest.TestCase):
     """What one frame saw and another could not."""
 
