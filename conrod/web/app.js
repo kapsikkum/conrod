@@ -83,13 +83,25 @@ async function loadHome() {
   $("#job-cards").replaceChildren(...jobs.map((job) => {
     const card = el("div", { className: "job-card" });
     const shot = el("div", { className: "shot" });
-    // Use the job's first crop as the cover, the way a contact sheet would.
+    // Use the album's first crop as the cover, the way a contact sheet would.
     shot.style.backgroundImage = `url(/api/jobs/${job.id}/cover)`;
-    shot.append(el("span", {
-      className: "badge",
-      textContent: `${job.detection_count || 0} vehicles`,
-    }));
     const left = job.unfinished_count || 0;
+    const found = job.detection_count || 0;
+
+    // There is no cover until something has been found, and an album part way
+    // through a long shoot has nothing to show for a while. An empty black
+    // rectangle reads as a broken card rather than as work in hand, so say
+    // which it is.
+    if (!found) {
+      shot.append(el("div", {
+        className: "state",
+        textContent: left ? "In progress…" : "No vehicles found",
+      }));
+    } else {
+      shot.append(el("span", {
+        className: "badge", textContent: `${found} vehicles`,
+      }));
+    }
     card.append(
       shot,
       el("div", { className: "name", textContent: job.label || job.root }),
@@ -119,10 +131,10 @@ async function loadHome() {
     }
     const menu = el("div", { className: "job-menu" });
     const rename = el("button", { className: "iconbtn", textContent: "Rename",
-                                  title: "Rename this scan" });
+                                  title: "Rename this album" });
     rename.onclick = async (e) => {
       e.stopPropagation();
-      const name = prompt("Name for this scan", job.label || "");
+      const name = prompt("Name for this album", job.label || "");
       if (name === null) return;
       await api(`/api/jobs/${job.id}`, {
         method: "POST", body: JSON.stringify({ label: name }),
@@ -130,16 +142,16 @@ async function loadHome() {
       loadHome();
     };
     const remove = el("button", { className: "iconbtn danger", textContent: "Delete",
-                                  title: "Forget this scan" });
+                                  title: "Forget this album" });
     remove.onclick = async (e) => {
       e.stopPropagation();
       const what = job.label || job.root;
-      if (!confirm(`Forget the scan "${what}"?
+      if (!confirm(`Forget the album "${what}"?
 
 Its results and cached crops go. Your photos and any XMP already written are not touched.`)) return;
       await api(`/api/jobs/${job.id}`, { method: "DELETE" });
       if (state.jobId === job.id) state.jobId = null;
-      toast("Scan deleted");
+      toast("Album deleted");
       loadHome();
     };
     menu.append(rename, remove);
@@ -158,7 +170,7 @@ Its results and cached crops go. Your photos and any XMP already written are not
   $("#rail-time").textContent = totals.images.toLocaleString();
   $("#rail-grid").replaceChildren(
     railStat(totals.vehicles.toLocaleString(), "Vehicles found"),
-    railStat(String(totals.jobs), "Jobs")
+    railStat(String(totals.jobs), "Albums")
   );
 }
 
@@ -742,7 +754,7 @@ async function refreshReview() {
   const jobs = await api("/api/jobs");
   if (!jobs.length) {
     $("#empty").hidden = false;
-    $("#empty").textContent = "No scans yet. Run one from the Scan tab.";
+    $("#empty").textContent = "No albums yet. Run a scan from the Scan tab.";
     $("#grid").replaceChildren();
     return;
   }

@@ -192,6 +192,12 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   background: rgba(0,0,0,.62); backdrop-filter: blur(4px);
   border-radius: 6px; padding: 3px 8px; font-size: 11px; font-weight: 600;
 }
+/* Centred in the cover, where the photograph would be. */
+.job-card .shot .state {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  color: var(--text-mute); font-size: 13px; letter-spacing: .02em;
+}
+
 .job-card .name { margin: 10px 2px 1px; font-weight: 600; font-size: 15px; }
 .job-card .sub  { margin: 0 2px; color: var(--text-mute); font-size: 12.5px; }
 

@@ -53,9 +53,9 @@
             <button class="primary" data-goto="scan">+ New scan</button>
           </div>
         </div>
-        <div class="section-label"><span>Jobs</span><span id="job-count"></span></div>
+        <div class="section-label"><span>Albums</span><span id="job-count"></span></div>
         <div class="cards" id="job-cards"></div>
-        <div class="empty" id="home-empty" hidden>No scans yet.</div>
+        <div class="empty" id="home-empty" hidden>No albums yet.</div>
       </div>
 
       <aside class="rail">
@@ -83,7 +83,7 @@
         <button id="btn-pick" class="ghost">Browse…</button>
         <button id="btn-count" class="ghost">Count frames</button>
       </div>
-      <div class="field-row"><input id="scan-label" placeholder="Name for this job (optional)"></div>
+      <div class="field-row"><input id="scan-label" placeholder="Name for this album (optional)"></div>
       <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
 
       <div class="field-row entry-row">
@@ -196,7 +196,7 @@
   <section class="screen split" id="screen-review" hidden>
     <div style="display:flex;flex-direction:column;flex:1;min-width:0">
       <div class="toolbar">
-        <select id="job-select" aria-label="Job"></select>
+        <select id="job-select" aria-label="Album"></select>
         <div class="tabs sub" id="view-tabs">
           <button data-view="review" class="active">Needs review</button>
           <button data-view="number">By number</button>
