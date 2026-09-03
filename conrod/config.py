@@ -187,6 +187,16 @@ class Settings:
     # re-sorted on a new threshold without re-reading a single file.
     sharp_at: float = 0.52
     blurred_below: float = 0.25
+
+    # Cut the frames that are gone before they are identified rather than
+    # after. Sharpness costs about sixteen milliseconds a crop and the vision
+    # model costs seconds, so this is most of an hour back on a big shoot --
+    # and none of it is spent naming a car nobody can see.
+    #
+    # Culled detections are rejected, not deleted: the crop and its score are
+    # kept, and the Rejected view can put back anything that should not have
+    # gone.
+    cull_blurred: bool = True
     identify_make_model: bool = True
     identify_colour: bool = True
     identify_team: bool = True

@@ -20,6 +20,7 @@ from PIL import Image
 
 from . import bursts
 from . import colour as colour_mod
+from . import framing
 from . import culling
 from . import detect as detect_mod
 from . import keywords as keywords_mod
@@ -163,6 +164,7 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                              (job_id,)).fetchall()}
 
         total_detections = 0
+        culled = 0
         processed = 0
         for index, path in enumerate(files, start=1):
             if wait_if_paused:
@@ -202,11 +204,37 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                     )
                     total_detections += 1
                     x1, y1, x2, y2 = det.box
-                    boxes.append({
+                    box = {
                         "id": det_id, "kind": det.cls, "conf": round(det.conf, 3),
                         "x": x1 / frame_w, "y": y1 / frame_h,
                         "w": (x2 - x1) / frame_w, "h": (y2 - y1) / frame_h,
-                    })
+                    }
+                    boxes.append(box)
+
+                    # Judge the crop before spending anything on it.
+                    # Sharpness is about sixteen milliseconds and the frame
+                    # edge is arithmetic; the vision model is seconds, and no
+                    # amount of it will name a car that is not there to be
+                    # seen or is half outside the picture.
+                    focus = _focus_of(det.crop_path, settings)
+                    edges = framing.assess(det.box, frame_w, frame_h)
+                    if focus:
+                        rating = focus.score * edges.factor
+                        verdict = sharpness_mod.rating_for(
+                            rating, settings.sharp_at, settings.blurred_below)
+                        store.set_quality(
+                            conn, det_id, sharpness=focus.score,
+                            sharpness_verdict=focus.verdict, clipped=edges.sides,
+                            rating=rating, rating_verdict=verdict)
+                        box["focus"] = focus.verdict
+                        box["rating"] = verdict
+                        if verdict == "poor" and settings.cull_blurred:
+                            store.cull_detection(conn, det_id,
+                                                 _cull_reason(focus, edges))
+                            culled += 1
+                            box["culled"] = True
+                            continue
+
                     # Bounded put with a stop check rather than a blocking
                     # one, so a wedged analysis pool cannot hang the scan.
                     while True:
@@ -232,9 +260,12 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                 errors.append(f"{path.name}: {exc}")
             if index % 10 == 0 or index == len(files):
                 conn.commit()
+            note = (f"{total_detections} vehicles, "
+                    f"{counters['identified']} identified")
+            if culled:
+                note += f", {culled} culled"
             on_progress({"stage": "detect", "done": index, "total": len(files),
-                         "message": f"{total_detections} vehicles, "
-                                    f"{counters['identified']} identified"})
+                         "message": note})
 
         conn.commit()
         for _ in pool:
@@ -338,6 +369,33 @@ def _safely(fn, *args) -> None:
         pass
 
 
+def _cull_reason(focus, edges) -> str:
+    """Say which fault cut it, because the two are fixed differently.
+
+    "Too blurred" on a pin-sharp frame that ran off the edge would send
+    someone hunting a focus problem that was never there.
+    """
+    if edges.cut_off and focus.verdict != "blurred":
+        return framing.describe(edges)
+    if edges.cut_off:
+        return f"blurred, and {framing.describe(edges)}"
+    return "too blurred to identify"
+
+
+def _focus_of(crop_path, settings):
+    """Subject sharpness for one crop, or nothing if it cannot be judged.
+
+    Never worth failing a detection over: an unreadable crop is a detection
+    with no score, not a scan that stops.
+    """
+    try:
+        with Image.open(crop_path) as crop:
+            crop.load()
+            return sharpness_mod.rate(crop, settings)
+    except Exception:
+        return None
+
+
 def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
     """Work out which camera took each frame and which burst it belongs to.
 
@@ -399,16 +457,7 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                         swatch = colour_mod.dominant(crop)
                     except Exception:
                         swatch = None
-                    # Measured on the crop, which is the whole point: a
-                    # panning shot is mostly blur on purpose and a
-                    # whole-frame measure calls the best pictures the worst.
-                    try:
-                        focus = sharpness_mod.rate(crop, settings)
-                    except Exception:
-                        focus = sharpness_mod.Sharpness()
-                store.set_analysis(conn, det_id, analysis, colour_hex=swatch,
-                                   sharpness=focus.score if focus else None,
-                                   sharpness_verdict=focus.verdict if focus else None)
+                store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
             except Exception as exc:

@@ -93,6 +93,17 @@ _MIGRATIONS = [
     # so a panning shot is not marked down for the blur that makes it good.
     ("detections", "sharpness", "REAL"),
     ("detections", "sharpness_verdict", "TEXT"),
+    # Why a detection was cut before it was ever identified. Rejected with no
+    # reason given is indistinguishable from rejected by a person, and the
+    # difference matters when you are deciding whether to trust it.
+    ("detections", "cull_reason", "TEXT"),
+    # How many frame edges the subject runs off, and the rating that comes
+    # out of combining that with focus. Sharpness stays a pure focus measure
+    # -- a car cut in half at the edge is often perfectly sharp, and folding
+    # the two together would make neither number mean anything.
+    ("detections", "clipped", "INTEGER"),
+    ("detections", "rating", "REAL"),
+    ("detections", "rating_verdict", "TEXT"),
 ]
 
 
@@ -294,6 +305,30 @@ def set_frame_origin(conn: sqlite3.Connection, job_id: int,
 
 def _path_key(path) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
+
+
+def set_quality(conn: sqlite3.Connection, det_id: int, *,
+                sharpness: float, sharpness_verdict: str,
+                clipped: int, rating: float, rating_verdict: str) -> None:
+    """Everything known about the picture, as opposed to what is in it."""
+    conn.execute(
+        """UPDATE detections
+              SET sharpness=?, sharpness_verdict=?, clipped=?,
+                  rating=?, rating_verdict=?
+            WHERE id=?""",
+        (sharpness, sharpness_verdict, clipped, rating, rating_verdict, det_id))
+
+
+def cull_detection(conn: sqlite3.Connection, det_id: int, reason: str) -> None:
+    """Cut a detection before it is identified, and say why.
+
+    Rejected rather than deleted: the crop and its score stay, so the
+    Rejected view can show what was cut and put anything back that should not
+    have been.
+    """
+    conn.execute(
+        "UPDATE detections SET rejected=1, cull_reason=? WHERE id=?",
+        (reason, det_id))
 
 
 def unread_detections(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:

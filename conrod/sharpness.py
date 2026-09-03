@@ -147,6 +147,20 @@ def verdict_for(score: float, sharp_at: float, blurred_below: float) -> str:
     return "soft"
 
 
+def rating_for(score: float, sharp_at: float, blurred_below: float) -> str:
+    """The same bands, named for a picture rather than for its focus.
+
+    A vehicle cut in half by the frame edge is frequently pin sharp, so the
+    combined rating cannot borrow the focus words without lying about why a
+    frame scored badly.
+    """
+    if score >= sharp_at:
+        return "good"
+    if score < blurred_below:
+        return "poor"
+    return "fair"
+
+
 def rate(image: Image.Image, settings=None) -> Sharpness:
     """Measure a crop and label it against the configured thresholds."""
     result = measure(image)
