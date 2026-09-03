@@ -59,6 +59,12 @@ VEHICLE_CLASSES = {
 }
 BIKE_CLASSES = {3}
 
+# The same set by the name the database stores. Identification asks a
+# different question about a rider than about a car, and the standalone
+# identify pass has only the stored class name to go on -- deriving it here
+# keeps it from drifting away from the ids above.
+BIKE_CLASS_NAMES = {VEHICLE_CLASSES[i] for i in BIKE_CLASSES}
+
 
 def find_exiftool() -> str:
     """Locate exiftool, preferring a copy shipped beside the application."""

@@ -96,10 +96,12 @@ async function loadHome() {
     // rectangle reads as a broken card rather than as work in hand, so say
     // which it is.
     if (!found) {
-      shot.append(el("div", {
-        className: "state",
-        textContent: left ? "In progress…" : "No vehicles found",
-      }));
+      // Say which of several different nothings this is. "No vehicles
+      // found" on an album that has not been looked at yet is a lie.
+      const said = job.status === "indexed" ? "Indexed — ready to cull"
+                 : job.status === "culled"  ? "Culled — ready to identify"
+                 : left ? "In progress…" : "No vehicles found";
+      shot.append(el("div", { className: "state", textContent: said }));
     } else {
       shot.append(el("span", {
         className: "badge", textContent: `${found} vehicles`,
@@ -112,7 +114,38 @@ async function loadHome() {
                   textContent: left ? `${job.image_count} images · ${left} not done`
                                     : `${job.image_count} images` })
     );
-    if (left) {
+    // What this album is waiting for. An indexed album has frames and no
+    // vehicles; a culled one has vehicles and no names. Offering the next
+    // step by name beats a single "Resume" that means something different
+    // depending on how far the album got.
+    const steps = el("div", { className: "steps" });
+    const step = (label, stage, hint) => {
+      const button = el("button", { className: "step", textContent: label,
+                                    title: hint });
+      button.onclick = (e) => { e.stopPropagation(); runStage(job, stage); };
+      steps.append(button);
+    };
+    if (job.status === "indexed") {
+      step("Cull", "cull",
+           "Detect the vehicles and rate them. No vision model, about a second a frame.");
+    } else if (job.status === "culled") {
+      step("Identify", "identify",
+           "Name what survived the cull. This is the slow one.");
+    }
+    if (found) {
+      const write = el("button", { className: "step", textContent: "Write XMP",
+                                   title: "Write keywords to the sidecars" });
+      write.onclick = (e) => {
+        e.stopPropagation();
+        state.jobId = job.id;
+        show("review");
+        toast("Review the album, then Write XMP");
+      };
+      steps.append(write);
+    }
+    if (steps.children.length) card.append(steps);
+
+    if (left && job.status !== "indexed") {
       // A big shoot that was stopped, paused or interrupted picks up where it
       // left off rather than starting again.
       const resume = el("button", { className: "resume", textContent: `Resume ${left}` });
@@ -430,7 +463,11 @@ function estimate(frames) {
   return `${hours.toFixed(1)} hours`;
 }
 
-$("#btn-scan").onclick = async () => {
+/* Adding a folder and committing a night of GPU time to it are two different
+   decisions, and they used to be one button. "Add album" indexes: it finds
+   the frames, reads their EXIF and extracts the previews, which is minutes.
+   Culling and identifying are then chosen per album, from the album itself. */
+async function startScan(stage) {
   const path = $("#scan-path").value.trim();
   if (!path) { toast("Choose a folder first"); return; }
   try {
@@ -438,7 +475,7 @@ $("#btn-scan").onclick = async () => {
       method: "POST",
       body: JSON.stringify({
         path, label: $("#scan-label").value.trim() || null,
-        recursive: $("#scan-recursive").checked,
+        recursive: $("#scan-recursive").checked, stage,
       }),
     });
     state.watchWanted = $("#scan-watch").checked
@@ -452,7 +489,29 @@ $("#btn-scan").onclick = async () => {
   } catch (err) {
     toast(err.message);
   }
-};
+}
+
+$("#btn-add").onclick = () => startScan("index");
+$("#btn-scan").onclick = () => startScan("all");
+
+/* Running one stage over an album that already exists. The folder is the
+   album's own, so a card never has to be told where its frames are. */
+async function runStage(job, stage) {
+  try {
+    await api("/api/scan", {
+      method: "POST",
+      body: JSON.stringify({ path: job.root, label: job.label, recursive: true,
+                             resume_job: job.id, stage }),
+    });
+    show("scan");
+    $("#scan-setup-pane").hidden = true;
+    $("#scanner").hidden = false;
+    $("#btn-scan-review").hidden = true;
+    $("#btn-stop").hidden = false;
+    $("#btn-pause").hidden = false;
+    pollScan();
+  } catch (err) { toast(err.message); }
+}
 
 $("#scan-entries").onchange = async (e) => {
   const file = e.target.files?.[0];
@@ -1012,6 +1071,9 @@ function vehicleBlock(members) {
     }));
   }
   head.append(facts);
+  // Only a group of several frames repeats itself, and only then is it worth
+  // stripping the name off each card. See the .multi rules in style.css.
+  section.classList.toggle("multi", members.length > 1);
   section.append(head, el("div", { className: "strip" }, ...members.map(card)));
   return section;
 }
@@ -1137,6 +1199,65 @@ function card(item) {
   const teamTag = el("span", { className: "tag warn", textContent: "team unverified",
     hidden: !(attrs.team && !attrs.team_corroborated) });
 
+  // What the card was missing. A vehicle has a name, an owner of that name
+  // and a measure of how much either is worth, and none of it was on the
+  // card -- so a frame the readers were confident about and one they had
+  // guessed at looked identical, and the only way to tell was to open it.
+  const chips = el("div", { className: "chips" });
+
+  if (attrs.team) {
+    chips.append(el("span", {
+      className: "tag team", textContent: attrs.team,
+      title: attrs.team_corroborated
+        ? "Read off the car and confirmed by OCR"
+        : "The model named this team but no read text backs it up",
+    }));
+  }
+
+  // How much the identification is worth. A group that agreed across frames
+  // is evidence; one frame's own confidence is the model's opinion of
+  // itself, which is a much weaker thing -- so they are labelled apart
+  // rather than blended into one number that means neither.
+  if (item.group_size > 1 && item.group_agreement != null) {
+    const pct = Math.round(item.group_agreement * 100);
+    const idChip = el("span", { className: "tag conf", textContent: `id ${pct}%`,
+      title: `${pct}% of ${item.group_size} frames of this vehicle agreed on this name` });
+    idChip.dataset.band = band(item.group_agreement);
+    chips.append(idChip);
+  } else if (attrs.vlm_conf) {
+    const pct = Math.round(attrs.vlm_conf * 100);
+    const idChip = el("span", { className: "tag conf", textContent: `id ${pct}%`,
+      title: "The vision model's confidence in this name, from one frame. "
+           + "It is often confident and wrong; a name agreed across a burst is worth more." });
+    idChip.dataset.band = band(attrs.vlm_conf);
+    chips.append(idChip);
+  }
+
+  if (item.second_look) {
+    chips.append(el("span", { className: "tag", textContent: "burst read",
+      title: "Named by showing the model the sharpest frames of this vehicle together" }));
+  }
+  if (attrs.body_type) {
+    chips.append(el("span", { className: "tag soft", textContent: attrs.body_type }));
+  }
+  if (item.plate_state) {
+    chips.append(el("span", { className: "tag soft", textContent: item.plate_state }));
+  }
+  // Which body shot it. With a second shooter present this is the difference
+  // between one car photographed twice and two cars.
+  if (item.camera) {
+    chips.append(el("span", { className: "tag soft", textContent: shortCamera(item.camera),
+                              title: item.camera }));
+  }
+  const extras = (attrs.sponsors || []).filter((s) => s && s !== attrs.team);
+  if (extras.length) {
+    chips.append(el("span", {
+      className: "tag soft", textContent: extras.slice(0, 2).join(" · ")
+        + (extras.length > 2 ? ` +${extras.length - 2}` : ""),
+      title: extras.join(", "),
+    }));
+  }
+
   const save = async (patch) => {
     const saved = await api(`/api/detections/${item.id}`, {
       method: "POST", body: JSON.stringify({ ...patch, reviewed: true }),
@@ -1172,7 +1293,7 @@ function card(item) {
     el("div", { className: "file", textContent: item.filename, title: item.image_path }),
     el("div", { className: "row" }, num, plate, conf, src,
        el("div", { className: "actions" }, rejectBtn)),
-    teamTag, who, kw));
+    chips, teamTag, who, kw));
   return node;
 }
 

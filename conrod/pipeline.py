@@ -28,7 +28,8 @@ from . import grouping
 from . import sharpness as sharpness_mod
 from . import store, vlm
 from .analyze import VehicleAnalysis, analyze
-from .config import CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES, RAW_SUFFIXES, Settings
+from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
+                     RAW_SUFFIXES, Settings)
 from .exif import ExifTool, extract_previews
 from .mapping import NumberMap
 from .writer import write_keywords
@@ -64,13 +65,31 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         recursive: bool = True, on_progress: Progress = _noop,
         should_stop: Callable[[], bool] | None = None,
         wait_if_paused: Callable[[], None] | None = None,
-        resume_job: int | None = None) -> JobSummary:
+        resume_job: int | None = None,
+        stop_after: str | None = None) -> JobSummary:
     """Scan, detect and analyse a folder. Does not write metadata.
 
     ``resume_job`` continues a job that was stopped or interrupted: frames it
     already got through are skipped, so a 6,000-frame shoot that died an hour
     in does not start again from nothing.
+
+    ``stop_after`` runs part of the work and stops, so adding an album does
+    not commit anyone to hours of GPU time:
+
+      "index"  find the frames, read their EXIF, extract previews. Minutes,
+               and enough to browse the album and see what is in it.
+      "cull"   also detect the vehicles and rate them, dropping the ones too
+               blurred or too far outside the frame to be worth naming. No
+               vision model runs, so this is roughly a second a frame.
+      None     everything, with identification overlapping detection. This
+               is the fast path and stays the default.
+
+    Identification of an album culled this way is a separate call --
+    ``identify`` below -- which works from the stored crops.
     """
+    if stop_after not in (None, "index", "cull"):
+        raise ValueError(f"unknown stage {stop_after!r}")
+    analyse = stop_after is None
     # Progress reporting is a side channel: a failure in the UI's callback
     # must never take down a scan that is hours into a shoot.
     raw_progress = on_progress
@@ -107,7 +126,7 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                 f"All {found} frames were filtered out by the culling rules."
             )
 
-    if settings.use_vlm:
+    if settings.use_vlm and analyse:
         vlm.check_available(settings)
 
     conn = store.connect()
@@ -139,6 +158,17 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
         previews = _prepare_previews(files, on_progress, settings)
 
+        if stop_after == "index":
+            # The album exists, its frames are known and every one of them has
+            # a preview to show. Nothing has looked for a vehicle yet, which
+            # is the point: adding a folder should cost minutes, not a night.
+            store.set_job_status(conn, job_id, "indexed")
+            conn.commit()
+            on_progress({"stage": "indexed", "done": len(files),
+                         "total": len(files),
+                         "message": f"{len(files)} frames ready to cull"})
+            return JobSummary(job_id, len(files), 0, 0)
+
         work: "queue.Queue" = queue.Queue(maxsize=64)
         errors: list[str] = []
         counters = {"analysed": 0, "identified": 0}
@@ -155,7 +185,7 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                 daemon=True,
             )
             for _ in range(max(1, settings.analysis_workers))
-        ]
+        ] if analyse else []
         for worker in pool:
             worker.start()
 
@@ -235,6 +265,12 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                             box["culled"] = True
                             continue
 
+                    # A cull-only pass stops here: the crop is written, rated
+                    # and kept, and naming it is a separate decision made
+                    # later against a much smaller set of frames.
+                    if not analyse:
+                        continue
+
                     # Bounded put with a stop check rather than a blocking
                     # one, so a wedged analysis pool cannot hang the scan.
                     while True:
@@ -279,6 +315,16 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         for worker in pool:
             worker.join(timeout=300)
 
+        if not analyse:
+            # Detected, rated and culled. Grouping is deliberately not run:
+            # it settles on a name, and nothing has proposed one yet.
+            store.set_job_status(conn, job_id, "culled")
+            conn.commit()
+            kept = total_detections - culled
+            on_progress({"stage": "culled", "done": processed, "total": len(files),
+                         "message": f"{kept} vehicles kept, {culled} culled"})
+            return JobSummary(job_id, processed, total_detections, 0)
+
         if settings.group_vehicles:
             on_progress({"stage": "grouping", "done": 0, "total": 0,
                          "message": "grouping vehicles that look the same"})
@@ -300,6 +346,119 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
         return JobSummary(job_id, processed, total_detections,
                           counters["identified"])
+    finally:
+        conn.close()
+
+
+def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
+             should_stop: Callable[[], bool] | None = None,
+             wait_if_paused: Callable[[], None] | None = None) -> JobSummary:
+    """Name the vehicles of an album that has already been detected and culled.
+
+    The counterpart to ``run(stop_after="cull")``. It works entirely from the
+    stored crops and boxes, so it re-reads no photographs, and it only looks
+    at detections that survived the cull and have not been named yet -- which
+    is what makes culling first worth doing. On a real shoot that is a third
+    fewer calls to the vision model, each of them seconds long.
+
+    Safe to run twice: the second pass finds nothing left to do.
+    """
+    raw_progress = on_progress
+
+    def on_progress(event: dict) -> None:      # noqa: F811 - deliberate shadow
+        _safely(raw_progress, event)
+
+    if settings.use_vlm:
+        vlm.check_available(settings)
+
+    conn = store.connect()
+    try:
+        store.set_job_status(conn, job_id, "scanning")
+        pending = conn.execute(
+            """SELECT d.id, d.crop_path, d.cls, d.x1, d.y1, d.x2, d.y2,
+                      COALESCE(i.preview_path, i.path) AS frame
+                 FROM detections d JOIN images i ON i.id = d.image_id
+                WHERE i.job_id = ? AND d.rejected = 0 AND d.crop_path IS NOT NULL
+                  AND (d.attributes IS NULL OR d.attributes = '')
+                ORDER BY d.id""",
+            (job_id,),
+        ).fetchall()
+        total = len(pending)
+        on_progress({"stage": "identify", "done": 0, "total": total,
+                     "message": f"{total} vehicles to identify"})
+        if not total:
+            store.set_job_status(conn, job_id, "analysed")
+            conn.commit()
+            return JobSummary(job_id, 0, 0, 0)
+
+        work: "queue.Queue" = queue.Queue(maxsize=64)
+        errors: list[str] = []
+        counters = {"analysed": 0, "identified": 0}
+        counter_lock = threading.Lock()
+        pool = [
+            threading.Thread(
+                target=_analysis_worker,
+                args=(work, settings, counters, counter_lock, errors, on_progress),
+                daemon=True,
+            )
+            for _ in range(max(1, settings.analysis_workers))
+        ]
+        for worker in pool:
+            worker.start()
+
+        for done, row in enumerate(pending, start=1):
+            if wait_if_paused:
+                wait_if_paused()
+            if should_stop and should_stop():
+                on_progress({"stage": "stopped", "done": done, "total": total,
+                             "message": "stopped by request"})
+                break
+            box = (row["x1"], row["y1"], row["x2"], row["y2"])
+            # A bike is judged by the detector's class, which is what the
+            # detect loop passed too -- the reader asks a different question
+            # about a rider than about a car.
+            is_bike = (row["cls"] or "").lower() in BIKE_CLASS_NAMES
+            while True:
+                if should_stop and should_stop():
+                    break
+                try:
+                    work.put((row["id"], Path(row["crop_path"]), is_bike,
+                              row["cls"], row["frame"], box), timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+            on_progress({"stage": "identify", "done": done, "total": total,
+                         "message": f"{counters['identified']} named"})
+
+        for _ in pool:
+            while True:
+                try:
+                    work.put(None, timeout=1.0)
+                    break
+                except queue.Full:
+                    if not any(w.is_alive() for w in pool):
+                        break
+        for worker in pool:
+            worker.join(timeout=300)
+
+        if settings.group_vehicles:
+            on_progress({"stage": "grouping", "done": 0, "total": 0,
+                         "message": "grouping vehicles that look the same"})
+            try:
+                stats = grouping.consolidate(conn, job_id, settings)
+                on_progress({"stage": "grouping", "done": stats["vehicles"],
+                             "total": stats["vehicles"],
+                             "message": f"{stats['vehicles']} vehicles in "
+                                        f"{stats['groups']} groups"})
+            except Exception as exc:
+                errors.append(f"grouping: {exc}")
+
+        store.set_job_status(conn, job_id, "analysed")
+        conn.commit()
+        if errors:
+            on_progress({"stage": "warn", "done": 0, "total": 0,
+                         "message": f"{len(errors)} failed; first: {errors[0]}"})
+        return JobSummary(job_id, 0, total, counters["identified"])
     finally:
         conn.close()
 

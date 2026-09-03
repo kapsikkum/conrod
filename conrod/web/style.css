@@ -344,9 +344,14 @@ aside {
 }
 .vehicle .strip .card { border: 1px solid var(--line-soft); }
 .vehicle .strip .card .thumb { aspect-ratio: 4 / 3; }
-.vehicle .strip .card .title { display: none; }   /* the header says it once */
+/* Only worth hiding when the header is genuinely saying it for several
+   frames. A group of one repeats nothing, so this stripped the only copy of
+   the name and keywords off the card and left an anonymous box: a thumbnail,
+   a filename and a plate. Every card looks like that before grouping has
+   run, which is most of a long scan. */
+.vehicle.multi .strip .card .title { display: none; }
+.vehicle.multi .strip .card .kw { display: none; }
 .vehicle .strip .card .body { padding: 8px 9px 9px; gap: 5px; }
-.vehicle .strip .card .kw { display: none; }      /* accumulated in the header */
 .vehicle .strip .card input.num { width: 3.8em; font-size: 15px; }
 .vehicle .strip .card input.plate { width: 6.6em; font-size: 12px; }
 
@@ -710,3 +715,25 @@ button.small { padding: 4px 10px; font-size: 12px; }
   border-radius: 6px; background: #131a29;
   color: var(--text-dim); font-size: 13px;
 }
+
+/* The facts that make a card identifiable at a glance: who the car belongs
+   to, how much the name is worth, which body shot it. Before this the card
+   carried a filename and a plate, and a confident read looked exactly like
+   a guess. */
+.card .chips {
+  display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+}
+.card .chips:empty { display: none; }
+.tag.team { color: var(--accent); border-color: #24365a; max-width: 100%;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.soft { color: var(--text-mute); }
+
+/* The next step for an album, offered by name. A single "Resume" meant
+   something different depending on how far the album had got. */
+.job-card .steps { display: flex; gap: 6px; margin: 8px 2px 0; flex-wrap: wrap; }
+.job-card .step {
+  font-size: 12px; padding: 5px 10px; border-radius: 7px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  color: var(--text-dim);
+}
+.job-card .step:hover { background: var(--surface-3); color: var(--text); }

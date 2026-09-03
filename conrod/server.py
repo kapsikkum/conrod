@@ -555,6 +555,10 @@ class ScanRequest(BaseModel):
     label: str | None = None
     recursive: bool = True
     resume_job: int | None = None
+    # Which part of the work to do. Adding an album indexes it and stops;
+    # culling and identifying are then separate decisions, because the
+    # expensive one should not be the automatic one.
+    stage: str = "all"          # all | index | cull | identify
 
 
 @app.post("/api/scan")
@@ -562,8 +566,15 @@ def start_scan(body: ScanRequest) -> dict:
     with _run_lock:
         if _run["active"]:
             raise HTTPException(409, "a scan is already running")
+        if body.stage not in ("all", "index", "cull", "identify"):
+            raise HTTPException(400, f"unknown stage {body.stage!r}")
         root = Path(body.path)
-        if not root.is_dir():
+        if body.stage == "identify":
+            # Nothing is read off disk, so the folder need not still exist --
+            # the card may have been unplugged weeks ago.
+            if body.resume_job is None:
+                raise HTTPException(400, "identify continues an album, so it needs one")
+        elif not root.is_dir():
             raise HTTPException(400, "not a folder")
         _frames.clear()
         _rate.clear()
@@ -638,13 +649,24 @@ def start_scan(body: ScanRequest) -> dict:
 
     def worker() -> None:
         try:
-            summary = pipeline.run(
-                root, _state["settings"], label=body.label,
-                recursive=body.recursive, on_progress=progress,
-                should_stop=lambda: _run["stop"],
-                wait_if_paused=_resume_gate.wait,
-                resume_job=body.resume_job,
-            )
+            if body.stage == "identify":
+                # Naming an album that was detected and culled earlier. It
+                # works from the stored crops, so there is no folder to walk
+                # and no photograph to re-read.
+                summary = pipeline.identify(
+                    body.resume_job, _state["settings"], on_progress=progress,
+                    should_stop=lambda: _run["stop"],
+                    wait_if_paused=_resume_gate.wait,
+                )
+            else:
+                summary = pipeline.run(
+                    root, _state["settings"], label=body.label,
+                    recursive=body.recursive, on_progress=progress,
+                    should_stop=lambda: _run["stop"],
+                    wait_if_paused=_resume_gate.wait,
+                    resume_job=body.resume_job,
+                    stop_after=None if body.stage == "all" else body.stage,
+                )
             _run["job_id"] = summary.job_id
             _run["stage"] = "done"
             _run["message"] = (f"{summary.images} frames, "
