@@ -44,7 +44,24 @@ class FakeBrowser:
     close = terminate
 
 
-class TheWindow(unittest.TestCase):
+class NoRealCleanup(unittest.TestCase):
+    """Keep the orphan-window sweep out of these tests.
+
+    A window that dies within five seconds of opening is normally Chromium
+    handing the URL to an existing profile, so AppWindow sweeps up the stale
+    browser. A stand-in window closes in microseconds, which trips that every
+    time and shells out to PowerShell -- slow enough on a CI runner to fail
+    the timeouts, and it would be reaching for real browsers besides.
+    """
+
+    def setUp(self) -> None:
+        sweep = mock.patch.object(desktop, "_close_orphan_windows",
+                                  return_value=False)
+        self.sweep = sweep.start()
+        self.addCleanup(sweep.stop)
+
+
+class TheWindow(NoRealCleanup):
     def test_it_can_be_opened_again_after_being_closed(self) -> None:
         """The whole point. The old code had no way to do this."""
         windows = [FakeBrowser(), FakeBrowser()]
@@ -91,7 +108,7 @@ class TheWindow(unittest.TestCase):
         cleanup.assert_not_called()
 
 
-class StayingAlive(unittest.TestCase):
+class StayingAlive(NoRealCleanup):
     """_run_windowed: the loop that decides whether closing means quitting."""
 
     def _tray(self):
