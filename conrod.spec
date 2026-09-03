@@ -17,7 +17,8 @@
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (collect_data_files, collect_dynamic_libs,
+                                     collect_submodules)
 
 block_cipher = None
 here = Path(SPECPATH)
@@ -50,6 +51,30 @@ hiddenimports += collect_submodules("open_image_models")
 hiddenimports += collect_submodules("fast_plate_ocr")
 datas += collect_data_files("fast_plate_ocr", include_py_files=False)
 
+# torchvision ships its operators in a compiled extension, and ultralytics
+# calls into it for NMS on the inference path. PyInstaller's own hook found it
+# under torchvision 0.28 and silently did not under 0.29: the build logged
+# "Hidden import torchvision._C not found!" as a warning, produced an exe, and
+# that exe raised "operator torchvision::nms does not exist" the first time it
+# ran a detection.
+#
+# collect_dynamic_libs is not enough on its own -- on Windows it returns the
+# .dll files and skips the .pyd, which is the one that matters -- so the
+# extension modules are gathered by hand and the build stops here if the
+# important one is absent, rather than shipping an exe that cannot detect.
+import torchvision as _torchvision
+
+_tv_dir = Path(_torchvision.__file__).parent
+binaries = collect_dynamic_libs("torchvision")
+binaries += [(str(pyd), "torchvision") for pyd in _tv_dir.glob("*.pyd")]
+if not any(Path(src).stem == "_C" for src, _ in binaries):
+    raise SystemExit(
+        f"conrod.spec: torchvision's compiled extension (_C.pyd) is not in "
+        f"{_tv_dir}. The build would start and then fail on the first "
+        f"detection. Check the installed torchvision against requirements.txt."
+    )
+hiddenimports += ["torchvision", "torchvision._C", "torchvision.ops"]
+
 # Excluded to keep the build down: these arrive via torch/ultralytics but the
 # app never plots anything or trains.
 #
@@ -72,7 +97,7 @@ excludes = [
 a = Analysis(
     ["main.py"],
     pathex=[str(here)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

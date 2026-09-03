@@ -1,6 +1,16 @@
 # Vehicle detection (also used once to export the model to ONNX)
 ultralytics>=8.3
 
+# Pinned, and not casually. ultralytics pulls torch in transitively, so an
+# unpinned build takes whatever shipped that week: v0.2.0 resolved torch
+# 2.14 / torchvision 0.29, PyInstaller could not find torchvision._C in that
+# layout, and the frozen app died with "operator torchvision::nms does not
+# exist" the first time it looked at a photograph. These two are the versions
+# the packaged build is actually tested against. Move them together, and only
+# after a frozen build passes --selftest.
+torch==2.13.0
+torchvision==0.28.0
+
 # Plate and roundel detection: a 7.5 MB YOLOv9 ONNX model, MIT licensed, no
 # torch. Missing this does not break the build — the import is lazy — it just
 # silently removes plate reading, which is how 0.1.0 shipped without it.

@@ -63,6 +63,25 @@ def _check_store() -> tuple[str, str]:
     return OK, "schema opens and queries"
 
 
+def _check_torchvision_ops() -> tuple[str, str]:
+    """torchvision's compiled operators, which ultralytics needs for NMS.
+
+    Split out from the detector check because it fails in a way that reads
+    like a model problem and is not one. v0.2.0 built against torchvision
+    0.29, PyInstaller left _C.pyd out of the bundle with only a warning, and
+    every detection died on "operator torchvision::nms does not exist".
+    """
+    import torch
+    import torchvision
+
+    if not hasattr(torch.ops.torchvision, "nms"):
+        raise RuntimeError(
+            "torchvision's operators are not registered -- _C is missing from "
+            "the bundle, so no detection can run"
+        )
+    return OK, f"torchvision {torchvision.__version__} nms registered"
+
+
 def _check_detector(settings: Settings) -> tuple[str, str]:
     """The one that catches a torch dependency pruned out of the bundle."""
     from . import detect
@@ -138,6 +157,7 @@ def run() -> int:
     checks = [
         ("web assets", _check_web_assets),
         ("job store", _check_store),
+        ("torchvision ops", _check_torchvision_ops),
         ("vehicle detector", lambda: _check_detector(settings)),
         ("text reader", lambda: _check_ocr(settings)),
         ("plate detector", lambda: _check_plates(settings)),
