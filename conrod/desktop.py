@@ -112,6 +112,90 @@ def _open_app_window(url: str) -> subprocess.Popen | None:
     return None
 
 
+# A window that closes this soon after opening did not get closed by anyone.
+# Chromium hands the URL to whichever process already holds the profile and
+# exits, so the launcher we were waiting on returns almost immediately.
+HANDOFF_SECONDS = 5.0
+
+
+def _close_orphan_windows() -> bool:
+    """Close a browser left holding our profile after Conrod died.
+
+    Kill Conrod any way other than closing its window -- Task Manager, a
+    crash, a lost session -- and the browser it started stays open. The
+    profile directory is then in use, so the next launch hands its URL to
+    that stale window and exits within the second, and Conrod appears to do
+    nothing at all when opened. Nothing but Conrod ever uses this profile, so
+    a browser holding it while no Conrod is running is by definition ours to
+    close.
+
+    Returns whether anything was actually closed, because the only reason to
+    ask is to decide whether reopening is worth a try.
+    """
+    if sys.platform != "win32":
+        return False
+    profile = str(DATA_ROOT / "window")
+    script = (
+        "$p = [regex]::Escape($env:CONROD_PROFILE); "
+        # Narrow on the executable as well as the profile path. Matching the
+        # path alone catches anything that merely mentions it -- a shell, an
+        # editor, the search itself -- and this stops processes.
+        "$browsers = 'msedge.exe','chrome.exe','brave.exe','vivaldi.exe',"
+        "'opera.exe','thorium.exe'; "
+        "$found = Get-CimInstance Win32_Process | Where-Object { "
+        "  $_.ProcessId -ne $PID -and $browsers -contains $_.Name -and "
+        "  $_.CommandLine -and $_.CommandLine -match $p }; "
+        "$found | ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "  -ErrorAction SilentlyContinue }; "
+        "if ($found) { 'closed' }"
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            env={**os.environ, "CONROD_PROFILE": profile},
+            capture_output=True, text=True, timeout=25,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if "closed" not in done.stdout:
+        return False
+    # The processes are gone but the profile's lock is released a moment
+    # later, and reopening into a half-released profile hands off again.
+    time.sleep(1.5)
+    return True
+
+
+def _show_window(url: str) -> bool:
+    """Open the window and block until the person closes it.
+
+    False means no window could be opened at all, and the caller should fall
+    back to the default browser.
+    """
+    window = _open_app_window(url)
+    if window is None:
+        return False
+
+    for attempt in range(2):
+        server.set_quit_hook(window.terminate)
+        opened = time.monotonic()
+        try:
+            window.wait()          # the app lives as long as its window
+        except KeyboardInterrupt:
+            window.terminate()
+            return True
+        if time.monotonic() - opened >= HANDOFF_SECONDS or attempt:
+            return True
+        # Gone in under five seconds: not closed, handed off. Clear the stale
+        # window out of the way and open ours properly, once.
+        if not _close_orphan_windows():
+            return True
+        retry = _open_app_window(url)
+        if retry is None:
+            return True
+        window = retry
+    return True
+
+
 INSTANCE_FILE = DATA_ROOT / "instance.json"
 
 
@@ -216,12 +300,11 @@ def launch(settings: Settings | None = None, number_map: NumberMap | None = None
                 pass
             return 0
 
-        window = None if force_browser else _open_app_window(url)
-        if window is not None:
-            try:
-                window.wait()      # the app lives as long as its window
-            except KeyboardInterrupt:
-                window.terminate()
+        # Installing an update means replacing the folder this executable is
+        # running from, which Windows refuses while it is open. Closing the
+        # window ends the wait inside _show_window and the process exits
+        # normally -- see server.set_quit_hook.
+        if not force_browser and _show_window(url):
             return 0
 
         if not force_browser:
