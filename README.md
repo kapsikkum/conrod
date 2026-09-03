@@ -231,5 +231,42 @@ build must make source available on the same terms. The plate detector
 Push a tag and CI builds the Windows app and attaches it to a GitHub Release:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.2.1 && git push origin v0.2.1
 ```
+
+## File compatibility
+
+Developed and tested against Canon bodies, because that is what the frames it
+was built on came from.
+
+| Format | | Status |
+|---|---|---|
+| `.cr3` | Canon RAW | **Supported** — tested throughout |
+| `.cr2` | Canon RAW | **Supported** — tested throughout |
+| `.jpg` / `.jpeg` | | **Supported** — written in place, no sidecar |
+| `.crw` | Canon (pre-2004) | Accepted, never tested |
+| `.dng` | Adobe | Accepted, never tested |
+| `.arw` | Sony | Accepted, never tested |
+| `.raf` | Fujifilm | Accepted, never tested |
+| `.orf` | Olympus / OM | Accepted, never tested |
+| `.rw2` | Panasonic | Accepted, never tested |
+| `.nef` | Nikon | **Not supported** |
+
+"Accepted, never tested" means Conrod will pick the file up and try, and the
+result is genuinely unknown — two parts of the preview stage are Canon-shaped
+and may not hold elsewhere. It prefers the `JpgFromRaw` tag, which is where
+Canon keeps the full-resolution camera JPEG; a body that does not write that
+tag falls back to a preview that may be far too small to detect anything in.
+And orientation is read from the RAW rather than the embedded preview, because
+Canon previews carry no orientation tag — a body that does things differently
+would hand portrait frames to the detector sideways.
+
+Nikon `.nef` is called unsupported rather than untested because not one file
+has been through it, and Nikon's preview tags are known to differ from Canon's.
+Conrod will still pick a `.nef` up if it finds one — it is not blocked, it is
+just not claimed to work.
+
+If you shoot Nikon and want it supported, open an issue. It is a matter of
+finding the right preview tag and confirming orientation rather than a
+redesign, and a handful of sample frames is enough to settle it properly.
+
