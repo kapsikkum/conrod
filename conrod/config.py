@@ -156,6 +156,10 @@ class Settings:
     vlm_host: str = "http://127.0.0.1:11434"
     vlm_timeout: float = 180.0
     vlm_input_edge: int = 1568
+    # After grouping, reconcile a group's disagreeing readings into one
+    # canonical name with a text-only call. One call per vehicle, not per
+    # frame, and it can only choose among names that were actually read.
+    normalise_names: bool = True
     identify_make_model: bool = True
     identify_colour: bool = True
     identify_team: bool = True
