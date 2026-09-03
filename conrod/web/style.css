@@ -447,31 +447,56 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
   font-size: 13px; letter-spacing: .02em;
 }
 
-.scanner { display: flex; gap: 22px; padding: 24px 28px; align-items: flex-start; }
+/* The same two columns as the home screen: work on the left, the controls
+   anchored in a rail on the right. It used to be a wide panel with the
+   buttons floating loose beside it, which read as a different application. */
+.scanner { display: flex; gap: 0; flex: 1; min-height: 100%; align-items: stretch; }
+.scan-main { flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0; }
 
-.scan-card {
-  flex: 1; min-width: 0; max-width: 1000px;
+/* One tile per photograph actually in flight. The analysis pool works
+   several crops at once from different frames, so a single big preview was
+   showing whichever worker reported last -- it flickered between unrelated
+   cars and settled on none of them. */
+.frames {
+  display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+.frame {
   background: #0e0e11; border: 1px solid var(--line-soft);
   border-radius: var(--radius-lg); overflow: hidden;
+  animation: frame-in .22s ease-out;
 }
-.scan-head {
+@keyframes frame-in { from { opacity: 0; transform: translateY(6px); } }
+
+.frame-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 20px; border-bottom: 1px solid var(--line-soft);
-  background: #0b0b0e;
+  gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line-soft);
+  background: #0b0b0e; font-size: 11.5px;
 }
-.scan-head .phase { color: var(--scan); font-weight: 700; letter-spacing: .1em; }
-
-.scan-stage { position: relative; background: #08080a; line-height: 0; }
-.scan-stage img { width: 100%; display: block; max-height: 58vh; object-fit: contain; }
-
-/* the sweeping read-head, only while a frame is being detected */
-.sweep {
-  position: absolute; top: 0; bottom: 0; width: 2px;
-  background: var(--scan); box-shadow: 0 0 22px 5px rgba(46,230,168,.5);
-  opacity: 0; pointer-events: none;
+.frame-head .name {
+  color: var(--text-dim); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.scanner.busy .sweep { opacity: 1; animation: scan-sweep 1.9s linear infinite; }
-@keyframes scan-sweep { from { left: 0%; } to { left: 100%; } }
+.frame-head .phase {
+  color: var(--scan); font-weight: 700; letter-spacing: .08em;
+  font-size: 10.5px; flex: none;
+}
+
+.frame-stage { position: relative; background: #08080a; line-height: 0; }
+.frame-stage img {
+  width: 100%; display: block; aspect-ratio: 3 / 2; object-fit: contain;
+}
+
+/* Replaces the read-head that swept the full width of the screen. At six
+   tiles that was six lines crawling at once, which is a lot of movement for
+   an app you leave running. This breathes instead: the working tile glows at
+   its edge and settles when the frame is done. */
+.frame.working { animation: frame-pulse 2.2s ease-in-out infinite; }
+@keyframes frame-pulse {
+  0%, 100% { border-color: var(--line-soft); }
+  50%      { border-color: rgba(46,230,168,.6); }
+}
 
 /* Geometry is set by fitOverlay() in app.js so the boxes track the
    letterboxed photo rather than the panel around it. */
@@ -481,32 +506,44 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
   position: absolute; border: 2px solid var(--scan);
   box-shadow: 0 0 0 1px rgba(0,0,0,.35);
 }
+/* Inside the box, not above it. Above works until a vehicle is detected
+   near the top of the frame, and then the label is drawn off the photograph
+   -- which is most of a panning shot, where the car sits high. */
 .overlay .box-label {
-  position: absolute; top: -26px; left: -2px;
+  position: absolute; top: 0; left: 0;
   background: var(--scan); color: #04120c;
-  font-weight: 700; padding: 3px 9px; border-radius: 3px;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  font-weight: 700; padding: 1px 5px; border-radius: 0 0 3px 0;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 10.5px;
   white-space: nowrap;
 }
 .overlay .box.pending { border-style: dashed; opacity: .75; }
 
-.scan-log {
-  padding: 16px 20px; min-height: 132px;
+.frame-log {
+  padding: 9px 12px; min-height: 54px; font-size: 11.5px;
   background: #0b0b0e; border-top: 1px solid var(--line-soft);
 }
-.scan-log div { color: var(--text-dim); margin-bottom: 5px; }
-.scan-log div::before { content: "> "; color: var(--scan); }
-.scan-log div.done { color: var(--scan); }
-.scan-log div.done::before { content: "✓ "; }
-.scan-log .caret {
-  display: inline-block; width: 8px; height: 15px;
-  background: var(--scan); vertical-align: -3px; animation: blink 1s steps(2) infinite;
-}
-@keyframes blink { 50% { opacity: 0; } }
+.frame-log div { color: var(--text-dim); margin-bottom: 3px; }
+.frame-log div::before { content: "> "; color: var(--scan); }
+.frame-log div.done { color: var(--scan); }
+.frame-log div.done::before { content: "✓ "; }
 
-.scan-side { width: 250px; flex: none; }
-.scan-side p { margin: 10px 0 0; }
-.scan-side button { width: 100%; margin-top: 16px; }
+/* Sharpness sits on the picture, not in the text below it: it is a property
+   of the photograph and reads faster where the photograph is. */
+.card { position: relative; }
+.card .focus {
+  position: absolute; top: 8px; right: 8px;
+  font-size: 10px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; padding: 2px 6px; border-radius: 5px;
+  background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+}
+.card .focus.sharp   { color: var(--good); }
+.card .focus.soft    { color: var(--warn2); }
+.card .focus.blurred { color: var(--bad); }
+
+.rail .bar { margin-bottom: 12px; }
+.rail-card .scan-note { margin: 10px 0 0; font-size: 12px; }
+.rail-card button { width: 100%; margin-top: 10px; }
+.rail-card button:first-child { margin-top: 0; }
 
 .job-card { position: relative; }
 .job-card .resume {

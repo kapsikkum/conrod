@@ -602,7 +602,6 @@ function pollScan() {
       $("#btn-stop").hidden = true;
       $("#btn-pause").hidden = true;
       $("#btn-scan-review").hidden = false;
-      document.querySelector(".scanner").classList.remove("busy");
       if (data.error) toast(data.error);
       else toast(data.message || "Scan complete");
       if (data.job_id) state.jobId = data.job_id;
@@ -616,9 +615,6 @@ function renderScan(data) {
   pause.textContent = data.paused ? "Resume" : "Pause";
   pause.classList.toggle("accent", !!data.paused);
 
-  const scanner = document.querySelector(".scanner");
-  scanner.classList.toggle("busy", data.active && data.stage !== "analyse");
-
   const pct = data.total ? (data.done / data.total) * 100 : 0;
   $("#scan-fill").style.width = `${pct}%`;
   $("#scan-counter").textContent = `${data.done} / ${data.total || "?"}`;
@@ -629,66 +625,94 @@ function renderScan(data) {
     : (data.active ? "estimating…" : "");
   $("#scan-found").textContent = data.message || "";
 
-  const current = data.current;
-  if (!current) return;
-  $("#scan-file").textContent = current.name || "";
-  $("#scan-phase").textContent = data.active ? (current.phase || "SCANNING") : "DONE";
-
-  // Only refetch the image when the frame actually changed.
-  const img = $("#scan-img");
-  if (data.frame_token !== state.frameToken) {
-    state.frameToken = data.frame_token;
-    state.shownToken = null;
-    img.onload = () => {
-      state.shownToken = data.frame_token;
-      fitOverlay();
-    };
-    img.src = `/api/scan/frame?t=${data.frame_token}`;
-  }
-
-  const overlay = $("#scan-overlay");
-
-  // Boxes belong to one specific frame. The image is fetched over HTTP and
-  // arrives a moment later, so drawing them straight away paints this
-  // frame's boxes on top of the previous frame's photo -- which is what made
-  // the live view look like it was glitching. Wait for the image to land.
-  if (state.shownToken !== data.frame_token) {
-    overlay.replaceChildren();
+  const live = data.live || (data.current ? [data.current] : []);
+  $("#scan-inflight").textContent = live.length ? `${live.length}` : "";
+  $("#scan-waiting").hidden = live.length > 0;
+  if (!live.length) {
+    $("#scan-frames").replaceChildren();
     return;
   }
-  fitOverlay();
 
-  overlay.replaceChildren(...(current.boxes || []).map((box) => {
-    const node = el("div", { className: "box" + (box.number ? "" : " pending") });
-    node.style.left = `${box.x * 100}%`;
-    node.style.top = `${box.y * 100}%`;
-    node.style.width = `${box.w * 100}%`;
-    node.style.height = `${box.h * 100}%`;
-    const label = box.number
-      ? `#${box.number} · ${((box.read_conf || 0) * 100).toFixed(1)}%`
-      : `${box.kind} · ${((box.conf || 0) * 100).toFixed(1)}%`;
-    node.append(el("div", { className: "box-label", textContent: label }));
+  // Tiles are reused by token rather than rebuilt each poll. Replacing them
+  // wholesale restarted every <img> load twice a second, so the photographs
+  // never finished arriving and the panel strobed.
+  const board = $("#scan-frames");
+  const existing = new Map(
+    [...board.children].map((node) => [node.dataset.token, node]));
+
+  board.replaceChildren(...live.map((frame) => {
+    const token = String(frame.token ?? data.frame_token);
+    const node = existing.get(token) || frameTile(frame, token);
+    updateTile(node, frame, data.active);
     return node;
   }));
-
-  const log = $("#scan-log");
-  log.replaceChildren(...(current.log || []).map((line) =>
-    el("div", { textContent: line })));
-  if (data.active) log.append(el("span", { className: "caret" }));
 }
 
-// The photo is letterboxed inside the stage by object-fit: contain, but the
-// overlay was pinned to the stage. Box coordinates are fractions of the
-// *photo*, so on any frame whose aspect did not match the stage the boxes
+function frameTile(frame, token) {
+  const node = el("div", { className: "frame" });
+  node.dataset.token = token;
+
+  const head = el("div", { className: "frame-head" },
+    el("span", { className: "name mono", textContent: frame.name || "" }),
+    el("span", { className: "phase mono", textContent: "" }));
+
+  const img = el("img", { alt: "", decoding: "async" });
+  const overlay = el("div", { className: "overlay" });
+  // Boxes belong to one specific photograph. It arrives over HTTP a moment
+  // after the boxes do, so drawing them straight away paints this frame's
+  // boxes over the previous frame's picture -- which is what made the live
+  // view look like it was glitching.
+  img.onload = () => { node.dataset.loaded = "1"; fitTile(node); };
+  img.src = `/api/scan/frame?t=${token}`;
+
+  const stage = el("div", { className: "frame-stage" }, img, overlay);
+  node.append(head, stage, el("div", { className: "frame-log mono" }));
+  return node;
+}
+
+function updateTile(node, frame, active) {
+  node.querySelector(".name").textContent = frame.name || "";
+  node.querySelector(".phase").textContent =
+    active ? (frame.phase || "SCANNING") : "DONE";
+  node.classList.toggle("working", !!active && frame.phase !== "DONE");
+
+  const overlay = node.querySelector(".overlay");
+  if (node.dataset.loaded !== "1") {
+    overlay.replaceChildren();
+  } else {
+    fitTile(node);
+    overlay.replaceChildren(...(frame.boxes || []).map((box) => {
+      const mark = el("div", { className: "box" + (box.number ? "" : " pending") });
+      mark.style.left = `${box.x * 100}%`;
+      mark.style.top = `${box.y * 100}%`;
+      mark.style.width = `${box.w * 100}%`;
+      mark.style.height = `${box.h * 100}%`;
+      const label = box.number
+        ? `#${box.number} · ${((box.read_conf || 0) * 100).toFixed(0)}%`
+        : `${box.kind} · ${((box.conf || 0) * 100).toFixed(0)}%`;
+      mark.append(el("div", { className: "box-label", textContent: label }));
+      return mark;
+    }));
+  }
+
+  const log = node.querySelector(".frame-log");
+  log.replaceChildren(...(frame.log || []).slice(-3).map((line) =>
+    el("div", { textContent: line })));
+}
+
+// The photo is letterboxed inside the tile by object-fit: contain, but the
+// overlay is pinned to the tile. Box coordinates are fractions of the
+// *photo*, so on any frame whose aspect does not match the tile the boxes
 // drifted sideways and ran off the edge. Size the overlay to the pixels the
 // image actually occupies.
-function fitOverlay() {
-  const img = $("#scan-img");
-  const overlay = $("#scan-overlay");
+function fitTile(node) {
+  const img = node.querySelector("img");
+  const overlay = node.querySelector(".overlay");
   const nw = img.naturalWidth, nh = img.naturalHeight;
   if (!nw || !nh) return;
 
   const boxW = img.clientWidth, boxH = img.clientHeight;
+  if (!boxW || !boxH) return;
   const scale = Math.min(boxW / nw, boxH / nh);
   const drawnW = nw * scale, drawnH = nh * scale;
 
@@ -696,11 +720,11 @@ function fitOverlay() {
   overlay.style.top = `${img.offsetTop + (boxH - drawnH) / 2}px`;
   overlay.style.width = `${drawnW}px`;
   overlay.style.height = `${drawnH}px`;
-  overlay.style.right = "auto";
-  overlay.style.bottom = "auto";
 }
 
-window.addEventListener("resize", fitOverlay);
+window.addEventListener("resize", () => {
+  document.querySelectorAll(".frame").forEach(fitTile);
+});
 
 function formatSeconds(seconds) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -844,9 +868,49 @@ function vehicleBlock(members) {
         : `${pct}% agreed across ${members.length} frames`,
     }));
   }
+
+  // Which body shot it, and how many runs of the shutter it appears in. With
+  // a second shooter present these are the difference between "one car, two
+  // angles" and "two cars that look alike".
+  const cameras = [...new Set(members.map((m) => m.camera).filter(Boolean))];
+  const runs = [...new Set(members.map((m) => m.burst_key).filter((b) => b != null))];
+  if (cameras.length) {
+    facts.append(el("span", {
+      className: "fact soft",
+      textContent: cameras.length === 1 ? shortCamera(cameras[0])
+                                        : `${cameras.length} cameras`,
+      title: cameras.join(" · "),
+    }));
+  }
+  if (runs.length > 1) {
+    facts.append(el("span", {
+      className: "fact soft", textContent: `${runs.length} bursts`,
+      title: "Seen in more than one run of the shutter",
+    }));
+  }
+
+  // The name came from looking at the pictures again rather than from a vote
+  // on what each frame's reader said. Worth saying: it is a different kind of
+  // answer, and presenting it as a majority would be a lie about its basis.
+  if (lead.second_look) {
+    facts.append(el("span", {
+      className: "fact soft", textContent: "read from the burst",
+      title: "The frames disagreed, so the sharpest of them were read together",
+    }));
+  }
   head.append(facts);
   section.append(head, el("div", { className: "strip" }, ...members.map(card)));
   return section;
+}
+
+function shortCamera(name) {
+  // "Canon EOS R5 123456789" is too long for a chip and the serial is the
+  // part that does not read as a camera. Keep the model, mark the body.
+  const bits = String(name).split(" ");
+  const tail = bits[bits.length - 1];
+  return /^\d{4,}$/.test(tail)
+    ? `${bits.slice(0, -1).join(" ")} · ${tail.slice(-4)}`
+    : String(name);
 }
 
 function band(value) {
@@ -908,6 +972,18 @@ function card(item) {
     });
     title.append(" ", badge);
   }
+  // Sharpness is measured on the crop, so a panning shot is judged on its
+  // subject rather than on the background blur that makes it a good picture.
+  if (item.sharpness_verdict && item.sharpness_verdict !== "unknown") {
+    const focus = el("span", {
+      className: "focus " + item.sharpness_verdict,
+      textContent: item.sharpness_verdict,
+      title: `Subject sharpness ${(item.sharpness || 0).toFixed(2)}`
+             + " — measured on the vehicle, not the whole frame",
+    });
+    node.append(focus);
+  }
+
   const who = el("div", { className: "who", textContent: item.who || "" });
   const kw = el("div", { className: "kw",
                          textContent: (item.keywords || []).join(" · ") });

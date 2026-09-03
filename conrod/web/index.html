@@ -110,28 +110,29 @@
 
     <!-- live scanning view -->
     <div class="scanner" id="scanner" hidden>
-      <div class="scan-card">
-        <div class="scan-head">
-          <span class="mono" id="scan-file">—</span>
-          <span class="mono phase" id="scan-phase">SCANNING</span>
+      <div class="scan-main">
+        <div class="section-label">
+          <span>In flight</span><span class="mono" id="scan-inflight"></span>
         </div>
-        <div class="scan-stage" id="scan-stage">
-          <img id="scan-img" alt="">
-          <div class="sweep" id="scan-sweep"></div>
-          <div class="overlay" id="scan-overlay"></div>
+        <div class="frames" id="scan-frames"></div>
+        <div class="empty" id="scan-waiting">Reading the folder…</div>
+      </div>
+
+      <aside class="rail">
+        <div class="rail-card">
+          <h4>Scanning</h4>
+          <div class="bar"><div class="fill" id="scan-fill"></div></div>
+          <div class="big-stat mono" id="scan-counter">0 / 0</div>
+          <div class="big-label" id="scan-eta">estimating…</div>
+          <p class="muted mono scan-note" id="scan-found"></p>
         </div>
-        <div class="scan-log mono" id="scan-log"></div>
-      </div>
-      <div class="scan-side">
-        <div class="bar"><div class="fill" id="scan-fill"></div></div>
-        <p class="mono" id="scan-counter">0 / 0</p>
-        <p class="muted mono" id="scan-eta"></p>
-        <p class="muted mono" id="scan-found"></p>
-        <button id="btn-pause" class="ghost">Pause</button>
-        <button id="btn-stop" class="ghost danger">Stop scan</button>
-        <button id="btn-scan-review" class="primary" hidden>Review results</button>
-        <button id="btn-activity" class="ghost small">Show activity</button>
-      </div>
+        <div class="rail-card">
+          <button id="btn-pause" class="ghost">Pause</button>
+          <button id="btn-stop" class="ghost danger">Stop scan</button>
+          <button id="btn-scan-review" class="primary" hidden>Review results</button>
+          <button id="btn-activity" class="ghost small">Show activity</button>
+        </div>
+      </aside>
 
       <div class="activity" id="activity" hidden>
         <div class="activity-head">

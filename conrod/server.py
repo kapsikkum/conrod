@@ -12,7 +12,7 @@ import os
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
@@ -74,15 +74,64 @@ def note(text: str, level: str = "info") -> None:
         _journal.append({"at": time.time(), "level": level, "text": text})
 
 
+# The frames on screen right now, newest last, keyed by preview path. The
+# analysis pool works several crops at once and they belong to different
+# photographs, so a single "current frame" was whichever worker happened to
+# report last -- the view flickered between unrelated cars and settled on
+# none of them. Showing what is actually in flight is both calmer and more
+# honest about what the machine is doing.
+_live: "OrderedDict[str, dict]" = OrderedDict()
+_live_lock = threading.Lock()
+
+# How many frames the view holds. More than the pool has in flight is just
+# stale photographs kept on screen to look busy.
+LIVE_FRAMES = 6
+
+
 def _show(record: dict) -> None:
-    """Put a frame on the live scan view."""
-    if _run.get("preview") != record.get("preview"):
-        _run["preview"] = record.get("preview")
-        _run["frame_token"] = _run.get("frame_token", 0) + 1
-    _run["current"] = {
-        "name": record.get("name"), "boxes": record.get("boxes", []),
-        "phase": record.get("phase", "SCANNING"), "log": record.get("log", []),
-    }
+    """Put a frame on the live scan view, or update it if already there."""
+    preview = record.get("preview")
+    with _live_lock:
+        existing = _live.get(preview)
+        if existing is None:
+            _run["frame_token"] = _run.get("frame_token", 0) + 1
+            token = _run["frame_token"]
+        else:
+            token = existing["token"]
+            _live.move_to_end(preview)
+
+        _live[preview] = {
+            "token": token, "preview": preview,
+            "name": record.get("name"), "boxes": record.get("boxes", []),
+            "phase": record.get("phase", "SCANNING"),
+            "log": record.get("log", []), "at": time.time(),
+        }
+        while len(_live) > LIVE_FRAMES:
+            _live.popitem(last=False)
+
+        # Kept for anything still reading the old single-frame shape.
+        newest = next(reversed(_live.values()))
+        _run["preview"] = newest["preview"]
+        _run["current"] = newest
+
+
+def _live_frames() -> list[dict]:
+    """Newest first, which is the order they are drawn in."""
+    with _live_lock:
+        return [dict(entry) for entry in reversed(_live.values())]
+
+
+def _preview_for(token: int) -> str | None:
+    with _live_lock:
+        for entry in _live.values():
+            if entry["token"] == token:
+                return entry["preview"]
+    return None
+
+
+def _clear_live() -> None:
+    with _live_lock:
+        _live.clear()
 
 _fix: dict[str, Any] = {"active": False, "name": "", "status": "", "percent": 0.0}
 
@@ -482,6 +531,7 @@ def start_scan(body: ScanRequest) -> dict:
             raise HTTPException(400, "not a folder")
         _frames.clear()
         _rate.clear()
+        _clear_live()
         _resume_gate.set()
         _run.update({"active": True, "job_id": body.resume_job,
                      "stage": "starting", "done": 0, "total": 0, "message": "",
@@ -638,6 +688,7 @@ def _estimate_eta() -> int | None:
 def scan_status() -> dict:
     elapsed = time.time() - _run["started"] if _run["started"] else 0
     out = dict(_run)
+    out["live"] = _live_frames()
     out["elapsed"] = round(elapsed, 1)
     out["eta"] = None
     if _run["active"] and _run["total"]:
@@ -679,13 +730,13 @@ def read_log(after: float = 0.0) -> dict:
 
 
 @app.get("/api/scan/frame")
-def scan_frame():
-    """The preview of the frame currently being scanned.
+def scan_frame(t: int = 0):
+    """The preview of a frame currently being scanned.
 
     Served by token rather than path so the browser refetches when the frame
     changes but caches within a frame, and so no arbitrary path can be read.
     """
-    preview = _run.get("preview")
+    preview = _preview_for(t) if t else _run.get("preview")
     if not preview:
         raise HTTPException(404, "no frame in flight")
     path = Path(preview)
@@ -805,8 +856,8 @@ DETECTION_QUERY = """
 SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.plate, d.plate_state, d.plate_conf, d.attributes,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
-       d.colour_hex, d.group_colour_hex,
-       i.path AS image_path, i.id AS image_id
+       d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
+       i.path AS image_path, i.id AS image_id, i.camera, i.burst_key
   FROM detections d
   JOIN images i ON i.id = d.image_id
  WHERE i.job_id = :job_id
@@ -895,6 +946,15 @@ def detections(
         item["colour_hex"] = (item.pop("group_colour_hex", None)
                               or item.get("colour_hex"))
         item["colour_word"] = analysis.colour
+        # Measured on the crop, so a panning shot is judged on its subject
+        # rather than on the blur that makes it worth keeping.
+        item["sharpness"] = item.get("sharpness")
+        item["sharpness_verdict"] = item.get("sharpness_verdict") or ""
+        try:
+            item["second_look"] = bool(json.loads(raw_attributes or "{}")
+                                       .get("group_second_look"))
+        except (TypeError, ValueError):
+            item["second_look"] = False
         item["keywords"] = keywords_mod.for_vehicle(analysis, settings, number_map)
         items.append(item)
     return {"total": total, "items": items}

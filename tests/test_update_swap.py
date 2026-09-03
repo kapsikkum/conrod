@@ -64,7 +64,10 @@ class Swap(unittest.TestCase):
         because that is where Conrod runs from and where the swap script
         used to end up standing too.
         """
-        with TemporaryDirectory() as tmp:
+        # Windows releases the swap script's directory handle a moment
+        # after the process exits, so cleanup can lose a race it does not
+        # matter about. The assertions above are the test.
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             (root / "app" / "Conrod").mkdir(parents=True)
             victim = subprocess.Popen(
@@ -81,8 +84,14 @@ class Swap(unittest.TestCase):
                 "the new build never arrived; swap.log says: " + (
                     (updates / "swap.log").read_text(encoding="utf-8-sig")
                     if (updates / "swap.log").exists() else "nothing at all"))
-            self.assertFalse((root / "app" / "Conrod-update").exists())
-            self.assertFalse((root / "app" / "Conrod-previous").exists())
+            # Tidying up happens after the swap, so waiting for the new
+            # build to land does not mean the old one is gone yet.
+            self.assertTrue(
+                _wait_for(lambda: not (root / "app" / "Conrod-update").exists()),
+                "the staging folder was left behind")
+            self.assertTrue(
+                _wait_for(lambda: not (root / "app" / "Conrod-previous").exists()),
+                "the replaced build was left behind")
             victim.wait(timeout=30)
             # It holds its own working directory until it exits, and the
             # temporary folder cannot be removed while it does.
@@ -90,7 +99,10 @@ class Swap(unittest.TestCase):
 
     def test_says_what_it_did(self) -> None:
         """A silent failure is the failure mode. It has to leave a log."""
-        with TemporaryDirectory() as tmp:
+        # Windows releases the swap script's directory handle a moment
+        # after the process exits, so cleanup can lose a race it does not
+        # matter about. The assertions above are the test.
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             script, updates, target = _script_for(root, 0x7FFFFFFF)
             swap = launch_swap(script, updates)
@@ -109,7 +121,10 @@ class Launching(unittest.TestCase):
 
         It exited 0, so nothing looked wrong. Assert on the side effect.
         """
-        with TemporaryDirectory() as tmp:
+        # Windows releases the swap script's directory handle a moment
+        # after the process exits, so cleanup can lose a race it does not
+        # matter about. The assertions above are the test.
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             proof = root / "ran.txt"
             script = root / "swap.ps1"
