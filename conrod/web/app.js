@@ -1249,6 +1249,30 @@ $("#bulk-clear").onclick = () => {
   updateBulkBar();
 };
 
+/* Grouping again after the fact. It works from the stored crops, so it costs
+   no photo reads -- which makes it the way an album already scanned picks up
+   an improvement to grouping without a rescan. The endpoint existed from the
+   start and nothing in the interface ever called it. */
+$("#btn-regroup").onclick = async () => {
+  const button = $("#btn-regroup");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Grouping…";
+  try {
+    const out = await api(`/api/jobs/${state.jobId}/regroup`, { method: "POST" });
+    // Redraw first, then report. Toasting before the refresh meant a failure
+    // anywhere in redrawing the grid replaced the result with its own error,
+    // so a regroup that worked looked like one that had not.
+    try { await refreshReview(); } catch {}
+    toast(`${out.vehicles} vehicles in ${out.groups} groups`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+};
+
 $("#btn-dry").onclick = async () => {
   const r = await api(`/api/jobs/${state.jobId}/write`, {
     method: "POST", body: JSON.stringify({ dry_run: true }) });
