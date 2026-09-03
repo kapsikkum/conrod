@@ -104,6 +104,11 @@ _MIGRATIONS = [
     ("detections", "clipped", "INTEGER"),
     ("detections", "rating", "REAL"),
     ("detections", "rating_verdict", "TEXT"),
+    # A star rating given by hand, which outranks the measured one
+    # everywhere: sorting, and what Write XMP puts in the file. Kept in its
+    # own column rather than written over `rating` so that re-culling an
+    # album cannot quietly erase the photographer's own pass.
+    ("detections", "stars", "INTEGER"),
 
     # Where the sharpness is, rather than how much of it there is. A held pan
     # has a sharp subject against a smeared background, and judged on the

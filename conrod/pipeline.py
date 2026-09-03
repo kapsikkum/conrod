@@ -736,7 +736,8 @@ def _analysis_worker(work, settings: Settings, counters: dict,
 WRITE_QUERY = """
 SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
        d.rejected AS rejected, d.rating AS rating,
-       d.rating_verdict AS rating_verdict, d.panning AS panning
+       d.rating_verdict AS rating_verdict, d.panning AS panning,
+       d.stars AS stars
   FROM images i
   JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
@@ -753,7 +754,8 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
         for row in conn.execute(WRITE_QUERY, (job_id,)).fetchall():
             entry = by_image.setdefault(
                 row["image_id"], {"path": Path(row["path"]), "analyses": [],
-                                  "best": None, "panning": False})
+                                  "best": None, "panning": False,
+                                  "by_hand": None})
             # Keywords come only from vehicles that survived and were read.
             if not row["rejected"] and row["attributes"]:
                 entry["analyses"].append(
@@ -764,6 +766,13 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
             if row["rating"] is not None:
                 if entry["best"] is None or row["rating"] > entry["best"]:
                     entry["best"] = row["rating"]
+            # A rating given by hand in review is the answer, not a proposal.
+            # Same rule -- the frame takes its best vehicle -- but a starred
+            # vehicle beats any measured one, so a frame the photographer
+            # picked out cannot be written down by the sharpness measure.
+            if row["stars"] is not None:
+                if entry["by_hand"] is None or row["stars"] > entry["by_hand"]:
+                    entry["by_hand"] = row["stars"]
             entry["panning"] = entry["panning"] or bool(row["panning"])
 
         written = failed = skipped = 0
@@ -777,6 +786,13 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
                         entry["best"], settings.sharp_at, settings.blurred_below)
                     rating = sharpness_mod.stars_for(entry["best"])
                     label = sharpness_mod.label_for(verdict)
+                if entry["by_hand"] is not None:
+                    rating = entry["by_hand"]
+                    # The colour follows the stars they gave, so a frame
+                    # starred in review does not stay red in the catalogue.
+                    label = sharpness_mod.label_for(
+                        "good" if rating >= 3 else
+                        "fair" if rating == 2 else "poor")
                 if not words and rating is None:
                     skipped += 1
                     continue

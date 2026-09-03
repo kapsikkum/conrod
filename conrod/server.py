@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import keywords as keywords_mod
 from . import pipeline, setup_check, store, watch
@@ -1169,7 +1169,7 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.plate, d.plate_state, d.plate_conf, d.attributes,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
        d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
-       d.cull_reason, d.clipped, d.rating, d.rating_verdict,
+       d.cull_reason, d.clipped, d.rating, d.rating_verdict, d.stars,
        d.panning, d.background, d.sharp_end, d.uncertain,
        i.path AS image_path, i.id AS image_id, i.camera, i.burst_key
   FROM detections d
@@ -1178,12 +1178,42 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
 """
 
 
+# A rating given by hand outranks the measured one here too, so a frame
+# the photographer starred sorts where they put it rather than where the
+# sharpness measure thought it belonged. Both are on the same 1-5 scale.
+# NULLs last in both directions: an unrated frame is not a bad one, and
+# burying it under the rejects is how it never gets looked at.
+def _rank_sql() -> str:
+    """Stars, in SQL, from the same bands the rest of the app uses.
+
+    Written out rather than imported because the sort happens in SQLite.
+    Generated from STAR_BANDS so that retuning the bands cannot leave the
+    sort ordering by numbers nothing else agrees with.
+    """
+    arms = " ".join(f"WHEN d.rating >= {floor} THEN {stars}"
+                    for floor, stars in sharpness_mod.STAR_BANDS)
+    return ("COALESCE(d.stars, CASE WHEN d.rating IS NULL THEN NULL "
+            f"{arms} END)")
+
+
+_RANK = _rank_sql()
+
+ORDERINGS = {
+    # The default: least confident first, because that is what review is for.
+    "review": "d.number_conf ASC, d.id ASC",
+    "best": f"({_RANK}) IS NULL, ({_RANK}) DESC, d.rating DESC, d.id ASC",
+    "worst": f"({_RANK}) IS NULL, ({_RANK}) ASC, d.rating ASC, d.id ASC",
+    "frame": "i.id ASC, d.id ASC",
+}
+
+
 @app.get("/api/jobs/{job_id}/detections")
 def detections(
     job_id: int,
     view: str = Query("review", pattern="^(review|all|number|plate|rejected)$"),
     number: str | None = None,
     search: str | None = None,
+    sort: str = Query("review", pattern="^(review|best|worst|frame)$"),
     limit: int = 120,
     offset: int = 0,
 ) -> dict:
@@ -1217,7 +1247,7 @@ def detections(
     sql = DETECTION_QUERY
     if clauses:
         sql += " AND " + " AND ".join(clauses)
-    sql += " ORDER BY d.number_conf ASC, d.id ASC LIMIT :limit OFFSET :offset"
+    sql += f" ORDER BY {ORDERINGS[sort]} LIMIT :limit OFFSET :offset"
 
     with store.session() as conn:
         conn.create_function("_needs_review", 5, _needs_review)
@@ -1276,10 +1306,13 @@ def detections(
         item["background"] = item.get("background")
         item["uncertain"] = bool(item.get("uncertain"))
         # The stars the catalogue will get, so the card and the sidecar
-        # cannot disagree about how good the frame is.
+        # cannot disagree about how good the frame is. A rating given by
+        # hand wins: the measurement is a proposal, the photographer's is
+        # the answer.
         rating_value = item.get("rating")
-        item["stars"] = (None if rating_value is None
-                         else sharpness_mod.stars_for(rating_value))
+        item["by_hand"] = item.get("stars") is not None
+        item["stars"] = item.get("stars") or (
+            None if rating_value is None else sharpness_mod.stars_for(rating_value))
         try:
             item["second_look"] = bool(json.loads(raw_attributes or "{}")
                                        .get("group_second_look"))
@@ -1315,6 +1348,8 @@ class DetectionUpdate(BaseModel):
     attributes: dict | None = None
     rejected: bool | None = None
     reviewed: bool = True
+    # 1-5 by hand, or 0 to hand the frame back to the measured rating.
+    stars: int | None = Field(default=None, ge=0, le=5)
 
 
 @app.post("/api/jobs/{job_id}/regroup")
@@ -1364,18 +1399,30 @@ def update_detection(det_id: int, body: DetectionUpdate) -> dict:
                         analysis.team_corroborated = True
 
         rejected = row["rejected"] if body.rejected is None else int(body.rejected)
+        # 0 means "forget what I said", not "zero stars" -- every catalogue
+        # reads 0 as unrated, and there has to be a way back to the measured
+        # rating after a mis-keyed number.
+        stars = row["stars"]
+        if body.stars is not None:
+            stars = body.stars or None
         conn.execute(
             """UPDATE detections
                   SET number=?, number_source=?, number_conf=?,
-                      plate=?, attributes=?, rejected=?, reviewed=?
+                      plate=?, attributes=?, rejected=?, reviewed=?, stars=?
                 WHERE id=?""",
             (number, source, confidence, plate, analysis.to_json(),
-             rejected, int(body.reviewed), det_id),
+             rejected, int(body.reviewed), stars, det_id),
         )
 
     number_map: NumberMap = _state["number_map"]
     return {
         "ok": True, "id": det_id, "number": number, "plate": plate,
+        # The stars the card should now show, which after clearing a hand
+        # rating is the measured one -- not the empty column. Returning the
+        # column left the pill reading "-" on a frame the cull had rated.
+        "stars": stars or (None if row["rating"] is None
+                           else sharpness_mod.stars_for(row["rating"])),
+        "by_hand": stars is not None,
         "who": number_map.describe(number) if number else "",
         "title": analysis.title,
         "keywords": keywords_mod.for_vehicle(analysis, settings, number_map),

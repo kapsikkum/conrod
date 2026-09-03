@@ -285,7 +285,14 @@
           <button data-view="rejected">Rejected</button>
         </div>
         <input id="search" placeholder="Search make, team, plate…" spellcheck="false">
+        <select id="sort" aria-label="Sort" title="Order the grid">
+          <option value="review">Needs review first</option>
+          <option value="best">Best rated first</option>
+          <option value="worst">Worst rated first</option>
+          <option value="frame">Shooting order</option>
+        </select>
         <div class="spacer"></div>
+        <button id="btn-keys" class="ghost" title="Keyboard shortcuts">⌨</button>
         <button id="btn-regroup" class="ghost"
                 title="Group this album's vehicles again from the stored crops. No photo is re-read.">Regroup</button>
         <button id="btn-dry" class="ghost">Preview keywords</button>

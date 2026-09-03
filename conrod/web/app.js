@@ -28,12 +28,12 @@ async function api(path, options) {
 }
 
 let toastTimer;
-function toast(message) {
+function toast(message, ms = 3000) {
   const node = $("#toast");
   node.textContent = message;
   node.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.classList.remove("show"), 3000);
+  toastTimer = setTimeout(() => node.classList.remove("show"), ms);
 }
 
 const state = {
@@ -41,6 +41,8 @@ const state = {
   album: null,
   sheetOffset: 0,
   lastStage: null,
+  sort: "review",
+  cursor: null,
   logAt: 0,
   logTimer: null,
   healthTimer: null,
@@ -989,6 +991,7 @@ async function loadGrid(append = false) {
 
   const params = new URLSearchParams({
     view: state.view, limit: state.limit, offset: state.offset,
+    sort: state.sort,
   });
   if (state.view === "number" && state.number) params.set("number", state.number);
   if (state.search) params.set("search", state.search);
@@ -1254,6 +1257,9 @@ function card(item) {
   const node = el("div", { className: "card" + (cutByHand ? " rejected" : "")
                                               + (item.cull_reason ? " culled" : "") });
   node.dataset.id = item.id;
+  // Clicking anywhere on a card moves the keyboard's attention to it, so
+  // the mouse and the shortcuts are working on the same vehicle.
+  node.addEventListener("mousedown", () => setCursor(node, { scroll: false }));
 
   // Ask for a thumbnail, not the 2048px crop the readers work from.
   const thumb = el("img", { className: "thumb", src: `${item.crop_url}?w=420`,
@@ -1307,7 +1313,10 @@ function card(item) {
   // apart in the database and in the tooltip, because they are different
   // faults with different fixes -- a frame cut in half is often pin sharp.
   const verdict = item.rating_verdict || item.sharpness_verdict;
-  if (verdict && verdict !== "unknown") {
+  // Shown when the cull rated it, and also when it has no measured verdict
+  // at all but somebody starred it by hand — otherwise their rating would
+  // be invisible on the one card they cared enough to rate.
+  if ((verdict && verdict !== "unknown") || item.stars) {
     const why = [`subject sharpness ${(item.sharpness || 0).toFixed(2)}`];
     if (item.background >= 0) why.push(`background ${item.background.toFixed(2)}`);
     if (item.clipped) {
@@ -1318,13 +1327,15 @@ function card(item) {
       why.push(`sharpest towards the ${item.sharp_end}`);
     }
     node.append(el("span", {
-      className: "focus " + verdict,
-      textContent: item.stars ? "★".repeat(item.stars) : verdict,
-      title: `${why.join(" · ")} — measured on the vehicle, not the whole frame`,
+      className: "focus stars " + (verdict || "") + (item.by_hand ? " by-hand" : ""),
+      textContent: item.stars ? "★".repeat(item.stars) : (verdict || "—"),
+      title: item.by_hand
+        ? `${item.stars} stars, given by you — this is what Write XMP will use`
+        : `${why.join(" · ")} — measured on the vehicle, not the whole frame`,
     }));
     // The card takes the colour it will carry into the catalogue, so the
     // grid can be read at a glance the way a filmstrip is.
-    node.classList.add(`rated-${verdict}`);
+    if (verdict) node.classList.add(`rated-${verdict}`);
   }
 
   // A held pan: subject sharp, background smeared on purpose. Never culled
@@ -1449,13 +1460,16 @@ function card(item) {
   num.onblur = () => { if (num.value.trim() !== (item.number || "")) save({ number: num.value.trim() }); };
   plate.onblur = () => { if (plate.value.trim() !== (item.plate || "")) save({ plate: plate.value.trim() }); };
 
-  const rejectBtn = el("button", { className: "ghost danger", textContent: "✕",
-                                   title: "Not a competitor / unreadable" });
+  // Labelled, not a bare glyph, and it takes effect on the click — there is
+  // nothing to confirm and nothing is written to the photograph either way.
+  // U, or clicking it again, puts the vehicle back.
+  const rejectBtn = el("button", { className: "ghost danger cut",
+                                   textContent: "Reject",
+                                   title: "Reject this vehicle (X). Click again to undo." });
   rejectBtn.onclick = async () => {
     const now = !node.classList.contains("rejected");
-    await reject(item.id, now);
-    node.classList.toggle("rejected", now);
-    loadSummary();
+    setCursor(node, { scroll: false });
+    await cutCard(node, now);
   };
 
   node.append(thumb, el("div", { className: "body" },
@@ -1471,6 +1485,120 @@ async function reject(id, rejected) {
   await api(`/api/detections/${id}`, {
     method: "POST", body: JSON.stringify({ rejected, reviewed: true }) });
 }
+
+/* ── culling by hand ──────────────────────────────────────────
+   The assisted cull measures sharpness and framing and is right most of the
+   time. This is for the rest of it, and for the judgements no measurement
+   makes — the one where the light is doing something, the one where the
+   driver is looking at you. Going through a shoot at one card a second
+   needs hands on the keyboard, not a mouse trip to a small ✕ each time. */
+
+const KEYS = [
+  ["J  /  →", "next vehicle"],
+  ["K  /  ←", "previous"],
+  ["X  /  Del", "reject — instantly, no confirming"],
+  ["U", "put a rejected one back"],
+  ["1 – 5", "give it that many stars"],
+  ["0", "clear the stars, back to the measured rating"],
+  ["Enter", "keep it and move on"],
+  ["?", "this list"],
+];
+
+function cards() { return $$("#grid .card"); }
+
+function setCursor(node, { scroll = true } = {}) {
+  $$("#grid .card.current").forEach((c) => c.classList.remove("current"));
+  if (!node) { state.cursor = null; return; }
+  node.classList.add("current");
+  state.cursor = node;
+  if (scroll) node.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function moveCursor(step) {
+  const all = cards();
+  if (!all.length) return;
+  const at = state.cursor ? all.indexOf(state.cursor) : -1;
+  const next = at < 0 ? (step > 0 ? 0 : all.length - 1)
+                      : Math.min(all.length - 1, Math.max(0, at + step));
+  setCursor(all[next]);
+}
+
+async function setStars(node, stars) {
+  const id = Number(node.dataset.id);
+  if (!id) return;
+  const saved = await api(`/api/detections/${id}`, {
+    method: "POST", body: JSON.stringify({ stars, reviewed: true }) });
+  node.dataset.stars = saved.stars || "";
+  const pill = node.querySelector(".stars");
+  if (pill) {
+    pill.textContent = saved.stars ? "★".repeat(saved.stars) : "—";
+    pill.classList.toggle("by-hand", !!saved.by_hand);
+    pill.title = saved.by_hand
+      ? `${saved.stars} stars, given by you — this is what Write XMP will use`
+      : "Rated by the cull";
+  }
+  toast(saved.by_hand ? `${saved.stars} stars`
+                      : "Back to the cull's rating");
+}
+
+async function cutCard(node, rejected) {
+  const id = Number(node.dataset.id);
+  if (!id) return;
+  await reject(id, rejected);
+  node.classList.toggle("rejected", rejected);
+  loadSummary();
+}
+
+document.addEventListener("keydown", async (e) => {
+  if (state.screen !== "review") return;
+  // Never steal a key from someone typing a competition number.
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  const key = e.key;
+  if (key === "?") { e.preventDefault(); showKeys(); return; }
+  if (key === "j" || key === "ArrowRight" || key === "ArrowDown") {
+    e.preventDefault(); moveCursor(1); return;
+  }
+  if (key === "k" || key === "ArrowLeft" || key === "ArrowUp") {
+    e.preventDefault(); moveCursor(-1); return;
+  }
+
+  const node = state.cursor || cards()[0];
+  if (!node) return;
+  if (!state.cursor) { setCursor(node); return; }
+
+  if (key === "x" || key === "X" || key === "Delete" || key === "Backspace") {
+    e.preventDefault();
+    await cutCard(node, true);
+    moveCursor(1);
+  } else if (key === "u" || key === "U") {
+    e.preventDefault();
+    await cutCard(node, false);
+  } else if (key === "Enter") {
+    e.preventDefault();
+    await api(`/api/detections/${node.dataset.id}`, {
+      method: "POST", body: JSON.stringify({ reviewed: true }) });
+    node.classList.add("saved");
+    moveCursor(1);
+  } else if (key >= "0" && key <= "5") {
+    e.preventDefault();
+    await setStars(node, Number(key));
+  }
+});
+
+function showKeys() {
+  toast(KEYS.map(([k, what]) => `${k} — ${what}`).join("\n"), 7000);
+}
+
+$("#btn-keys").onclick = showKeys;
+$("#sort").onchange = () => {
+  state.sort = $("#sort").value;
+  state.offset = 0;
+  setCursor(null);
+  loadGrid();
+};
 
 function focusNext(fromCard) {
   const cards = $$(".card");
