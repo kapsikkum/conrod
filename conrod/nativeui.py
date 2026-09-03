@@ -19,8 +19,14 @@ if sys.platform == "win32":
 
     ole32 = OleDLL("ole32")
     shell32 = WinDLL("shell32")
+    user32 = WinDLL("user32")
+    # ctypes returns c_int by default, which silently truncates a 64-bit
+    # window handle to its low 32 bits and hands the dialog an owner that
+    # does not exist.
+    user32.GetForegroundWindow.restype = HWND
+    user32.GetForegroundWindow.argtypes = []
 else:  # pragma: no cover - the app is Windows-only
-    ole32 = shell32 = None
+    ole32 = shell32 = user32 = None
 
 
 class _GUID(ctypes.Structure):
@@ -57,6 +63,29 @@ def _call(interface: c_void_p, slot: int, restype, argtypes, *args):
     return fn(interface, *args)
 
 
+
+def _owner_window() -> int | None:
+    """A window for the dialog to belong to, so it opens in front.
+
+    Shown with no owner, the picker opened *behind* the application. The
+    app's window belongs to the browser process, not to this one, and Windows
+    will not let a process that does not own the foreground raise a window
+    over the one that does -- so the dialog quietly went to the back of the
+    stack and looked like nothing had happened.
+
+    Giving it the foreground window as its owner fixes both halves: a dialog
+    is always drawn above the window that owns it, and the owner here is the
+    application window the user just clicked in.
+    """
+    if user32 is None:
+        return None
+    try:
+        hwnd = user32.GetForegroundWindow()
+    except Exception:
+        return None
+    return hwnd or None
+
+
 def pick_folder(title: str = "Choose a folder of frames") -> str | None:
     """Show the standard folder picker. None if the user cancelled.
 
@@ -87,7 +116,7 @@ def pick_folder(title: str = "Choose a folder of frames") -> str | None:
         _call(dialog, _SET_TITLE, ctypes.HRESULT, [LPCWSTR], title)
 
         # S_OK means a choice; anything else (including cancel) means none.
-        hresult = _call(dialog, _SHOW, ctypes.c_long, [HWND], None)
+        hresult = _call(dialog, _SHOW, ctypes.c_long, [HWND], _owner_window())
         if hresult != 0:
             return None
 
