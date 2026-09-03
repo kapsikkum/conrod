@@ -51,6 +51,7 @@ const state = {
   selected: new Set(),
   scanTimer: null,
   frameToken: -1,
+  shownToken: null,
 };
 
 /* ── navigation ───────────────────────────────────────────── */
@@ -631,12 +632,29 @@ function renderScan(data) {
   $("#scan-phase").textContent = data.active ? (current.phase || "SCANNING") : "DONE";
 
   // Only refetch the image when the frame actually changed.
+  const img = $("#scan-img");
   if (data.frame_token !== state.frameToken) {
     state.frameToken = data.frame_token;
-    $("#scan-img").src = `/api/scan/frame?t=${data.frame_token}`;
+    state.shownToken = null;
+    img.onload = () => {
+      state.shownToken = data.frame_token;
+      fitOverlay();
+    };
+    img.src = `/api/scan/frame?t=${data.frame_token}`;
   }
 
   const overlay = $("#scan-overlay");
+
+  // Boxes belong to one specific frame. The image is fetched over HTTP and
+  // arrives a moment later, so drawing them straight away paints this
+  // frame's boxes on top of the previous frame's photo -- which is what made
+  // the live view look like it was glitching. Wait for the image to land.
+  if (state.shownToken !== data.frame_token) {
+    overlay.replaceChildren();
+    return;
+  }
+  fitOverlay();
+
   overlay.replaceChildren(...(current.boxes || []).map((box) => {
     const node = el("div", { className: "box" + (box.number ? "" : " pending") });
     node.style.left = `${box.x * 100}%`;
@@ -655,6 +673,31 @@ function renderScan(data) {
     el("div", { textContent: line })));
   if (data.active) log.append(el("span", { className: "caret" }));
 }
+
+// The photo is letterboxed inside the stage by object-fit: contain, but the
+// overlay was pinned to the stage. Box coordinates are fractions of the
+// *photo*, so on any frame whose aspect did not match the stage the boxes
+// drifted sideways and ran off the edge. Size the overlay to the pixels the
+// image actually occupies.
+function fitOverlay() {
+  const img = $("#scan-img");
+  const overlay = $("#scan-overlay");
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  if (!nw || !nh) return;
+
+  const boxW = img.clientWidth, boxH = img.clientHeight;
+  const scale = Math.min(boxW / nw, boxH / nh);
+  const drawnW = nw * scale, drawnH = nh * scale;
+
+  overlay.style.left = `${img.offsetLeft + (boxW - drawnW) / 2}px`;
+  overlay.style.top = `${img.offsetTop + (boxH - drawnH) / 2}px`;
+  overlay.style.width = `${drawnW}px`;
+  overlay.style.height = `${drawnH}px`;
+  overlay.style.right = "auto";
+  overlay.style.bottom = "auto";
+}
+
+window.addEventListener("resize", fitOverlay);
 
 function formatSeconds(seconds) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -761,17 +804,37 @@ function card(item) {
   };
 
   const title = el("div", { className: "title", textContent: item.title || item.cls });
+  if (item.colour_hex) {
+    // The model's word for a colour is often wrong or useless -- two cars
+    // that look nothing alike both come back "gray". This square is measured
+    // off the crop, so a wrong word is obvious without opening the frame.
+    const swatch = el("span", { className: "swatch" });
+    swatch.style.background = item.colour_hex;
+    swatch.title = item.colour_word
+      ? `Sampled ${item.colour_hex} — the model called it "${item.colour_word}"`
+      : `Sampled ${item.colour_hex}`;
+    title.prepend(swatch, " ");
+  }
   if (item.group_size > 1) {
     // Say how many crops the group had and how much of it agreed, so a name
     // eight frames settled on reads differently from a four-way tie.
+    //
+    // Three outcomes, not two: the group agreed on a full name, it agreed on
+    // the make but not the model, or it agreed on nothing. The middle one
+    // still shows a make, so calling it "no agreement" read as a
+    // contradiction against the "blue Ford" printed next to it.
     const pct = Math.round((item.group_agreement || 0) * 100);
+    const disputed = item.disputed?.length ? item.disputed : null;
+    const makeOnly = disputed && item.make && !item.model;
     const badge = el("span", {
-      className: "grouptag" + (item.disputed?.length ? " disputed" : ""),
-      textContent: item.disputed?.length
-        ? `${item.group_size} seen · no agreement`
-        : `${item.group_size} seen · ${pct}% agree`,
-      title: item.disputed?.length
-        ? `The readers disagreed: ${item.disputed.join(", ")}`
+      className: "grouptag" + (disputed ? " disputed" : ""),
+      textContent: makeOnly
+        ? `${item.group_size} seen · ${pct}% say ${item.make}`
+        : disputed
+          ? `${item.group_size} seen · no agreement`
+          : `${item.group_size} seen · ${pct}% agree`,
+      title: disputed
+        ? `The readers disagreed: ${disputed.join(", ")}`
         : `Agreed across ${item.group_size} frames of this vehicle`,
     });
     title.append(" ", badge);

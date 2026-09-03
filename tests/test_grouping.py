@@ -79,3 +79,33 @@ class Consensus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Nameplates(unittest.TestCase):
+    """A make that contradicts the model name beside it."""
+
+    def test_the_nameplate_corrects_a_wrong_badge(self):
+        from conrod.marques import correct_make
+
+        # Measured: qwen2.5vl:7b called a Kawasaki Ninja H2 a Yamaha, while
+        # naming the model exactly right.
+        self.assertEqual(correct_make("Yamaha", "Ninja H2"), "Kawasaki")
+        self.assertEqual(correct_make("Holden", "Fiesta"), "Ford")
+
+    def test_an_agreeing_pair_is_left_alone(self):
+        from conrod.marques import correct_make
+
+        self.assertEqual(correct_make("Ford", "Falcon XR8"), "Ford")
+        self.assertEqual(correct_make("Mazda", "RX-8"), "Mazda")
+
+    def test_a_nameplate_everyone_sells_corrects_nothing(self):
+        from conrod.marques import correct_make
+
+        # "GT", "RS" and "Sport" are not anybody's exclusively.
+        self.assertEqual(correct_make("Ford", "GT"), "Ford")
+        self.assertEqual(correct_make("Holden", "RS Sport"), "Holden")
+
+    def test_a_missing_make_is_filled_in_from_the_nameplate(self):
+        from conrod.marques import correct_make
+
+        self.assertEqual(correct_make(None, "Commodore"), "Holden")

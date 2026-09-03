@@ -532,6 +532,21 @@ def start_scan(body: ScanRequest) -> dict:
             _run["error"] = f"{type(exc).__name__}: {exc}"
             _run["stage"] = "error"
             note(_run["error"], "error")
+            # The one-line message is what the activity panel shows, but a
+            # scan dying with "database is locked" and no traceback is close
+            # to undebuggable. Keep the stack somewhere it can be read.
+            try:
+                import traceback
+
+                from .config import LOG_PATH
+
+                LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    fh.write(f"\n--- scan failed {stamp} ---\n")
+                    traceback.print_exc(file=fh)
+            except Exception:
+                pass
         finally:
             _run["active"] = False
 
@@ -709,6 +724,7 @@ DETECTION_QUERY = """
 SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.plate, d.plate_state, d.plate_conf, d.attributes,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
+       d.colour_hex, d.group_colour_hex,
        i.path AS image_path, i.id AS image_id
   FROM detections d
   JOIN images i ON i.id = d.image_id
@@ -785,6 +801,19 @@ def detections(
         except (TypeError, ValueError):
             item["disputed"] = []
         item["title"] = analysis.title
+        # Sent separately as well as inside the title, so the review card can
+        # tell "the group agreed on Ford but not the model" apart from "the
+        # group agreed on nothing" without parsing the title back apart.
+        item["make"] = analysis.make
+        item["model"] = analysis.model
+        # The sampled paint, so the card can show a square of the actual
+        # colour next to the model's word for it. The two disagree often
+        # enough that the word alone is not much use.
+        # The group's agreed colour where there is one, otherwise this
+        # frame's own sample. Both are kept in the database.
+        item["colour_hex"] = (item.pop("group_colour_hex", None)
+                              or item.get("colour_hex"))
+        item["colour_word"] = analysis.colour
         item["keywords"] = keywords_mod.for_vehicle(analysis, settings, number_map)
         items.append(item)
     return {"total": total, "items": items}

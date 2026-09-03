@@ -82,45 +82,110 @@ class Group:
     members: list[int] = field(default_factory=list)
     signature: str = ""
     last_frame: int = 0
+    frames: set = field(default_factory=set)
+    swatch: str | None = None
+    cls: str | None = None
+    make: str | None = None
 
 
-def cluster(rows: list[tuple[int, str, int]], *, max_bits: int = 14,
-            min_colour: float = 0.62, frame_window: int = 6) -> dict[int, int]:
+def cluster(rows: list[tuple], *, max_bits: int = 14,
+            min_colour: float = 0.62, frame_window: int = 6,
+            max_swatch: int = 52) -> dict[int, int]:
     """Assign each detection to a group. Returns detection id -> group key.
 
-    Two signals, because neither is enough alone. Colour is stable across a
-    panning sequence but says nothing about which blue car this is. Shape is
-    discriminating but moves a lot as the car swings through the frame -- the
-    eight frames of one Falcon split into three groups on shape alone.
+    Rows are (detection id, signature, frame index) and optionally sampled
+    colour, detector class and make.
 
-    So: colour must match, and then either the shapes agree or the frames are
-    near neighbours in the shoot. A burst of consecutive frames showing the
-    same colour is nearly always one car going past.
+    The design follows what the signals are actually worth, measured on an
+    eight-frame burst of one car against crops of different cars:
 
-    Compares against one representative per group rather than all pairs: a
-    shoot has thousands of vehicles but dozens of distinct cars.
+      shape (dHash)     same car 2..32, different cars 9..40. The two ranges
+                        overlap almost entirely, so it cannot decide anything
+                        on its own.
+      colour histogram  scored ~1.00 for every pair, including a green ute
+                        against a blue hatchback. It is computed over the
+                        whole crop, so grass, track and sky swamp it.
+      make              right on essentially every crop the vision model can
+                        see at all, sharp or blurry.
+
+    So the reliable signals do the gatekeeping and the weak ones only break
+    ties. Four things must hold before two crops can be the same vehicle:
+
+      * different photographs -- a car cannot appear twice in one frame;
+      * the same detector class -- a motorcycle is not a car;
+      * the same make, where both crops named one;
+      * paint that actually matches.
+
+    Only then does shape or frame proximity decide. Without the class and
+    make gates, a motorbike and a silver SUV shot moments apart were merged
+    and the bike's name was written over the car.
     """
     groups: list[Group] = []
     assignment: dict[int, int] = {}
 
-    for det_id, sig, frame_index in rows:
+    for row in rows:
+        det_id, sig, frame_index = row[0], row[1], row[2]
+        swatch = row[3] if len(row) > 3 else None
+        cls = row[4] if len(row) > 4 else None
+        make = row[5] if len(row) > 5 else None
         if not sig:
             continue
         for group in groups:
+            if frame_index in group.frames:
+                continue
+            if cls and group.cls and cls != group.cls:
+                continue
+            if not _same_make(make, group.make):
+                continue
             if not _colour_matches(sig, group.signature, min_colour):
+                continue
+            if not _swatch_matches(swatch, group.swatch, max_swatch):
                 continue
             shape_agrees = _shape_distance(sig, group.signature) <= max_bits
             nearby = abs(frame_index - group.last_frame) <= frame_window
             if shape_agrees or nearby:
                 group.members.append(det_id)
                 group.last_frame = max(group.last_frame, frame_index)
+                group.frames.add(frame_index)
+                group.make = group.make or make
                 assignment[det_id] = group.key
                 break
         else:
             groups.append(Group(key=len(groups) + 1, members=[det_id],
-                                signature=sig, last_frame=frame_index))
+                                signature=sig, last_frame=frame_index,
+                                frames={frame_index}, swatch=swatch,
+                                cls=cls, make=make))
             assignment[det_id] = groups[-1].key
     return assignment
+
+
+def _same_make(a: str | None, b: str | None) -> bool:
+    """Two crops may be one vehicle unless they named different makes.
+
+    An absent make is not a mismatch -- a crop too small to read should still
+    be allowed to join on the other evidence. The model is voted apart from
+    the make on purpose: makes agree across a burst, model names do not, and
+    correcting the model name is what grouping is for.
+    """
+    if not a or not b:
+        return True
+    return a.strip().lower() == b.strip().lower()
+
+
+def _swatch_matches(a: str | None, b: str | None, limit: int) -> bool:
+    """Whether two sampled paint colours are close enough to be one car.
+
+    Absent on either side means "no opinion", not "no match": a crop the
+    sampler could not read should still be allowed to join on shape.
+    """
+    if not a or not b:
+        return True
+    try:
+        pa = [int(a[1 + i * 2:3 + i * 2], 16) for i in range(3)]
+        pb = [int(b[1 + i * 2:3 + i * 2], 16) for i in range(3)]
+    except (ValueError, IndexError):
+        return True
+    return sum((x - y) ** 2 for x, y in zip(pa, pb)) ** 0.5 <= limit
 
 
 # Below this level of agreement the group has no answer, only a disagreement.
@@ -138,9 +203,25 @@ class Consensus:
     colour: str | None = None
     race_number: str | None = None
     plate: str | None = None
+    colour_hex: str | None = None   # sampled paint, not the model's word
     agreement: float = 0.0     # how much of the group backed the winning name
     size: int = 0
     disputed: list[str] = field(default_factory=list)
+
+
+def _median_hex(values: list[str]) -> str | None:
+    """The channel-wise median of several #rrggbb strings."""
+    channels: list[list[int]] = [[], [], []]
+    for value in values:
+        try:
+            for i in range(3):
+                channels[i].append(int(value[1 + i * 2:3 + i * 2], 16))
+        except (ValueError, IndexError):
+            continue
+    if not channels[0]:
+        return None
+    middle = [sorted(c)[len(c) // 2] for c in channels]
+    return "#%02x%02x%02x" % tuple(middle)
 
 
 def _vote(values: list[str | None]) -> tuple[str | None, float]:
@@ -205,6 +286,13 @@ def consensus(members: list[dict]) -> Consensus:
 
     out.colour, _ = _vote([m.get("colour") for m in members])
 
+    # The swatch is measured per frame, so take the middle one rather than
+    # voting: a single frame where the crop caught mostly windscreen or kerb
+    # is then outvoted by the rest of the group instead of standing alone.
+    swatches = [m.get("colour_hex") for m in members if m.get("colour_hex")]
+    if swatches:
+        out.colour_hex = _median_hex(swatches)
+
     for field_name in ("plate", "race_number"):
         best, best_conf = None, 0.0
         conf_key = "plate_conf" if field_name == "plate" else "number_conf"
@@ -228,7 +316,8 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
     import json
 
     rows = conn.execute(
-        """SELECT d.id, d.crop_path, d.attributes, d.signature, i.id AS image_id
+        """SELECT d.id, d.crop_path, d.attributes, d.signature, d.colour_hex,
+                  d.cls, i.id AS image_id
              FROM detections d JOIN images i ON i.id = d.image_id
             WHERE i.job_id = ? AND d.rejected = 0
             ORDER BY i.id, d.id""",
@@ -250,8 +339,16 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                 continue
             conn.execute("UPDATE detections SET signature=? WHERE id=?",
                          (sig, row["id"]))
-        signatures.append((row["id"], sig, row["image_id"]))
-        attributes[row["id"]] = json.loads(row["attributes"] or "{}")
+        parsed = json.loads(row["attributes"] or "{}")
+        # Vote on what each frame's own reader said, not on a previous
+        # round's group answer, or a bad merge would reinforce itself.
+        for field_name in ("make", "model", "colour"):
+            if f"own_{field_name}" in parsed:
+                parsed[field_name] = parsed[f"own_{field_name}"]
+        parsed["colour_hex"] = row["colour_hex"]
+        attributes[row["id"]] = parsed
+        signatures.append((row["id"], sig, row["image_id"], row["colour_hex"],
+                           row["cls"], parsed.get("make")))
 
     assignment = cluster(signatures)
     members: dict[int, list[int]] = {}
@@ -262,11 +359,22 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
         agreed = consensus([attributes.get(i, {}) for i in ids])
         for det_id in ids:
             current = attributes.get(det_id, {})
-            # Only the identity is replaced. Plate and number stay as read on
-            # this frame unless the frame has none, in which case the group's
-            # best read is better than nothing.
-            current["make"] = agreed.make
-            current["model"] = agreed.model
+            # What this frame's reader said is a measurement and is never
+            # overwritten. The group's answer is stored alongside it, and
+            # everything downstream prefers the group's where there is one.
+            #
+            # This used to replace make and model in place. That made the
+            # damage permanent: once a motorbike and a silver SUV were
+            # wrongly grouped, the bike's name was written into the SUV's
+            # own record, and no amount of regrouping afterwards could get
+            # "Hyundai" back, because the evidence was gone.
+            current.setdefault("own_make", current.get("make"))
+            current.setdefault("own_model", current.get("model"))
+            current.setdefault("own_colour", current.get("colour"))
+            current["group_make"] = agreed.make
+            current["group_model"] = agreed.model
+            current["make"] = agreed.make or current.get("own_make")
+            current["model"] = agreed.model or current.get("own_model")
             if agreed.colour:
                 current["colour"] = agreed.colour
             if agreed.plate and not current.get("plate"):
@@ -276,11 +384,17 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                 current["race_number"] = agreed.race_number
             current["group_disputed"] = agreed.disputed
             conn.execute(
+                # group_colour_hex, never colour_hex. The per-frame sample
+                # is a measurement and must survive: writing the group median
+                # back over it destroyed the original, so a second regroup
+                # then averaged values that were already averages, and five
+                # different cars ended up sharing one colour to the byte.
                 """UPDATE detections
-                      SET attributes=?, group_key=?, group_size=?, group_agreement=?
+                      SET attributes=?, group_key=?, group_size=?,
+                          group_agreement=?, group_colour_hex=?
                     WHERE id=?""",
                 (json.dumps(current), key, agreed.size,
-                 round(agreed.agreement, 3), det_id),
+                 round(agreed.agreement, 3), agreed.colour_hex, det_id),
             )
     conn.commit()
     return {"groups": len(members), "vehicles": len(signatures)}
