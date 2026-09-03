@@ -200,6 +200,86 @@ def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = F
     )
 
 
+BURST_PROMPT = """These are {count} photographs of the SAME vehicle, taken
+seconds apart in one burst by a motorsport photographer. Different angles,
+different parts of the car legible in each.
+
+Earlier attempts to identify it one photograph at a time disagreed with each
+other. Use all of them together: a badge unreadable in one frame is often
+plain in the next, and a shape ambiguous head-on is obvious in profile.
+
+Answer for the vehicle, not for any one photograph. If the frames still do
+not show enough to name the model, give the make alone and leave the model
+null -- that is a useful answer. A confident guess is not.
+"""
+
+
+def identify_burst(images: "list[Image.Image | Path]", settings: Settings, *,
+                   client: httpx.Client | None = None) -> VehicleDescription:
+    """Ask about several views of one vehicle in a single call.
+
+    This is the question the per-crop reader cannot be asked. It sees one
+    frame, and one frame of a car going past at speed is often a three-quarter
+    view with the badge blurred and the nameplate off the edge -- so it
+    guesses, and guesses differently each time.
+
+    Which frames get sent matters as much as sending several. They are chosen
+    by measured subject sharpness upstream, so the model looks at the frames
+    where the car is actually resolved rather than the ones where a panning
+    blur has smeared the badge into the paint.
+    """
+    if not images:
+        return VehicleDescription()
+
+    encoded = []
+    for item in images:
+        try:
+            image = Image.open(item) if isinstance(item, Path) else item
+            encoded.append(_encode(image, settings.vlm_input_edge))
+        except Exception:
+            continue
+    if not encoded:
+        return VehicleDescription()
+
+    payload = {
+        "model": settings.vlm_model,
+        "prompt": BURST_PROMPT.format(count=len(encoded)),
+        "images": encoded,
+        "stream": False,
+        "format": SCHEMA,
+        "options": {"temperature": 0.0, "num_predict": 400},
+    }
+
+    owns_client = client is None
+    client = client or httpx.Client(timeout=settings.vlm_timeout)
+    try:
+        resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
+                           timeout=settings.vlm_timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        body = (data.get("response") or "").strip() or (data.get("thinking") or "")
+        parsed = json.loads(body)
+    except Exception:
+        return VehicleDescription()
+    finally:
+        if owns_client:
+            client.close()
+
+    make = marques.correct_make(_text(parsed.get("make")),
+                               _text(parsed.get("model")))
+    return VehicleDescription(
+        make=make,
+        model=_text(parsed.get("model")),
+        colour=_text(parsed.get("colour")),
+        body_type=_text(parsed.get("body_type")),
+        team=_text(parsed.get("team")),
+        sponsors=_text_list(parsed.get("sponsors")),
+        livery_text=_text_list(parsed.get("livery_text")),
+        is_competition=bool(parsed.get("is_competition") or False),
+        confidence=_number(parsed.get("confidence")),
+    )
+
+
 def _encode(image: Image.Image, long_edge: int) -> str:
     """Downscale and JPEG-encode a crop for the model."""
     img = image.convert("RGB")
