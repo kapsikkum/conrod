@@ -446,6 +446,7 @@ def start_scan(body: ScanRequest) -> dict:
         if not root.is_dir():
             raise HTTPException(400, "not a folder")
         _frames.clear()
+        _rate.clear()
         _resume_gate.set()
         _run.update({"active": True, "job_id": body.resume_job,
                      "stage": "starting", "done": 0, "total": 0, "message": "",
@@ -554,14 +555,59 @@ def start_scan(body: ScanRequest) -> dict:
     return {"ok": True}
 
 
+# Recent (time, frames done) samples, for the estimate below.
+_rate: deque = deque(maxlen=400)
+
+ETA_WINDOW = 240.0      # seconds of history the estimate is drawn from
+ETA_MIN_FRAMES = 6      # below this it is guessing, not estimating
+ETA_MIN_SECONDS = 25.0
+
+
+def _note_rate(done: int) -> None:
+    if not _rate or _rate[-1][1] != done:
+        _rate.append((time.time(), done))
+
+
+def _estimate_eta() -> int | None:
+    """Seconds remaining, or None while there is not enough to go on.
+
+    Measured over a rolling window rather than the whole run. Dividing by the
+    time since the scan started counts the minutes spent enumerating, culling
+    and extracting previews as though frames had been analysed during them,
+    and a fresh 6,000-frame scan announced "about 86.2 h left" off its first
+    four frames. A window also lets the estimate follow a shoot that speeds up
+    or slows down instead of being anchored to how it began.
+    """
+    samples = list(_rate)
+    if len(samples) < 2:
+        return None
+
+    now, done = samples[-1]
+    window = [s for s in samples if now - s[0] <= ETA_WINDOW]
+    if len(window) < 2:
+        return None
+
+    started_at, started_done = window[0]
+    frames = done - started_done
+    span = now - started_at
+    if frames < ETA_MIN_FRAMES or span < ETA_MIN_SECONDS:
+        return None
+
+    remaining = max(0, _run["total"] - done)
+    if not remaining:
+        return 0
+    return round(remaining * span / frames)
+
+
 @app.get("/api/scan")
 def scan_status() -> dict:
     elapsed = time.time() - _run["started"] if _run["started"] else 0
     out = dict(_run)
     out["elapsed"] = round(elapsed, 1)
-    if _run["active"] and _run["done"] and _run["total"]:
-        rate = _run["done"] / max(elapsed, 0.001)
-        out["eta"] = round((_run["total"] - _run["done"]) / max(rate, 0.001))
+    out["eta"] = None
+    if _run["active"] and _run["total"]:
+        _note_rate(_run["done"])
+        out["eta"] = _estimate_eta()
     return out
 
 

@@ -622,8 +622,11 @@ function renderScan(data) {
   const pct = data.total ? (data.done / data.total) * 100 : 0;
   $("#scan-fill").style.width = `${pct}%`;
   $("#scan-counter").textContent = `${data.done} / ${data.total || "?"}`;
+  // Null means the estimate is not trustworthy yet. Saying so beats both a
+  // blank line and a confident number derived from four frames.
   $("#scan-eta").textContent = data.eta != null
-    ? `about ${formatSeconds(data.eta)} left` : "";
+    ? `about ${formatSeconds(data.eta)} left`
+    : (data.active ? "estimating…" : "");
   $("#scan-found").textContent = data.message || "";
 
   const current = data.current;
@@ -702,7 +705,11 @@ window.addEventListener("resize", fitOverlay);
 function formatSeconds(seconds) {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
-  return `${(seconds / 3600).toFixed(1)} h`;
+  // Past a day, tenths of an hour are false precision on an estimate this
+  // rough -- "86.2 h left" read as a measurement rather than a guess.
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)} h`;
+  const days = seconds / 86400;
+  return days < 10 ? `${days.toFixed(1)} days` : `${Math.round(days)} days`;
 }
 
 /* ── review ───────────────────────────────────────────────── */
