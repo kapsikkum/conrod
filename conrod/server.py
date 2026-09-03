@@ -23,7 +23,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import keywords as keywords_mod
-from . import pipeline, setup_check, store
+from . import pipeline, setup_check, store, watch
 from .analyze import VehicleAnalysis
 from .config import DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES, Settings
 from .mapping import NumberMap
@@ -146,8 +146,31 @@ def configure(settings: Settings | None = None,
         # Settings -- there was no way to see what was loaded, and so no
         # obvious way to get rid of it.
         _state["map_path"] = settings.extra.get("map_path") or None
+        _restore_watch(settings)
     if number_map is not None:
         _state["number_map"] = number_map
+
+
+def _restore_watch(settings: Settings) -> None:
+    """Pick a folder watch back up after a restart.
+
+    This is the case worth persisting for: the copy is still running and
+    Conrod is the thing that stopped. A watch that only lasted as long as the
+    window would be off exactly when it was needed.
+    """
+    saved = settings.extra.get("watch") or {}
+    if not saved.get("path") or saved.get("job_id") is None:
+        return
+    try:
+        set_watch(WatchRequest(active=True, path=saved["path"],
+                               job_id=saved["job_id"],
+                               recursive=bool(saved.get("recursive", True)),
+                               interval=float(saved.get("interval",
+                                                        watch.DEFAULT_INTERVAL))))
+    except Exception:
+        # A folder that is no longer there -- the card came out -- must not
+        # stop the application from starting.
+        settings.extra.pop("watch", None)
 
 
 def current_settings() -> Settings:
@@ -734,6 +757,118 @@ def resume_scan() -> dict:
     return {"ok": True, "paused": False}
 
 
+# --- watching a folder ----------------------------------------------------
+# A watch is a resume that happens on its own. Frames that land in the folder
+# after the scan started get added to the same album, which is the ordinary
+# case of a card still copying while the shoot is being packed up.
+
+_watch: dict[str, Any] = {
+    "active": False, "folder": None, "job_id": None, "recursive": True,
+    "interval": watch.DEFAULT_INTERVAL, "added": 0, "checked": 0.0,
+    "message": "",
+    # Bumped every time a watch is set up. Turning one off and straight back
+    # on would otherwise leave two loops polling the same folder, and both
+    # would try to start the same resume.
+    "generation": 0,
+}
+_watcher: watch.Watcher | None = None
+_watch_wake = threading.Event()
+
+
+def _known_frames(job_id: int) -> set[str]:
+    """Every frame the album already holds, however its path is spelled."""
+    conn = store.connect()
+    try:
+        return {watch.key(r["path"]) for r in conn.execute(
+            "SELECT path FROM images WHERE job_id=?", (job_id,))}
+    finally:
+        conn.close()
+
+
+def _watch_loop(generation: int) -> None:
+    while _watch["active"] and _watch["generation"] == generation:
+        # Interruptible, so turning the watch off is immediate rather than
+        # up to a minute later.
+        _watch_wake.wait(timeout=float(_watch["interval"]))
+        _watch_wake.clear()
+        if not _watch["active"] or _watch["generation"] != generation:
+            break
+        if _run["active"] or _watcher is None:
+            continue                     # a scan is already using the folder
+        try:
+            found = _watcher.poll(known=_known_frames(_watch["job_id"]))
+            _watch["checked"] = time.time()
+            if not found:
+                continue
+            _watch["added"] += len(found)
+            _watch["message"] = (f"{len(found)} new frame"
+                                 f"{'' if len(found) == 1 else 's'}")
+            note(f"watch: {_watch['message']}, continuing the album", "info")
+            # The pipeline lists the folder itself and skips what is already
+            # done, so handing it the folder is enough -- and means a watched
+            # scan and a resumed one are the same code path.
+            start_scan(ScanRequest(path=str(_watch["folder"]),
+                                   recursive=bool(_watch["recursive"]),
+                                   resume_job=_watch["job_id"]))
+        except Exception as exc:         # a watch must not die on one bad pass
+            _watch["message"] = f"{type(exc).__name__}: {exc}"
+            note(f"watch: {_watch['message']}", "warn")
+
+
+class WatchRequest(BaseModel):
+    active: bool
+    path: str | None = None
+    job_id: int | None = None
+    recursive: bool = True
+    interval: float = watch.DEFAULT_INTERVAL
+
+
+@app.get("/api/watch")
+def watch_status() -> dict:
+    out = dict(_watch)
+    out["folder"] = str(out["folder"]) if out["folder"] else None
+    return out
+
+
+@app.post("/api/watch")
+def set_watch(body: WatchRequest) -> dict:
+    """Turn folder monitoring on or off."""
+    global _watcher
+    settings: Settings = _state["settings"]
+
+    if not body.active:
+        _watch.update({"active": False, "message": "",
+                       "generation": _watch["generation"] + 1})
+        _watcher = None
+        _watch_wake.set()
+        settings.extra.pop("watch", None)
+        settings.save()
+        return watch_status()
+
+    folder = Path(body.path or "")
+    if not folder.is_dir():
+        raise HTTPException(400, "not a folder")
+    if body.job_id is None:
+        raise HTTPException(400, "a watch continues an album, so it needs one")
+
+    _watcher = watch.Watcher(folder, recursive=body.recursive)
+    generation = _watch["generation"] + 1
+    _watch.update({"active": True, "folder": folder, "job_id": body.job_id,
+                   "recursive": body.recursive,
+                   "interval": max(10.0, float(body.interval)),
+                   "added": 0, "checked": 0.0, "message": "waiting",
+                   "generation": generation})
+    # Remembered so a watch survives closing the application, which is the
+    # case that matters: the copy is still running and Conrod is not.
+    settings.extra["watch"] = {"path": str(folder), "job_id": body.job_id,
+                               "recursive": body.recursive,
+                               "interval": _watch["interval"]}
+    settings.save()
+    threading.Thread(target=_watch_loop, args=(generation,), daemon=True).start()
+    note(f"watch: monitoring {folder}", "info")
+    return watch_status()
+
+
 @app.get("/api/log")
 def read_log(after: float = 0.0) -> dict:
     """What the scan has been doing. Everything the console would have shown."""
@@ -870,6 +1005,7 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.plate, d.plate_state, d.plate_conf, d.attributes,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
        d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
+       d.cull_reason, d.clipped, d.rating, d.rating_verdict,
        i.path AS image_path, i.id AS image_id, i.camera, i.burst_key
   FROM detections d
   JOIN images i ON i.id = d.image_id
@@ -963,6 +1099,10 @@ def detections(
         # rather than on the blur that makes it worth keeping.
         item["sharpness"] = item.get("sharpness")
         item["sharpness_verdict"] = item.get("sharpness_verdict") or ""
+        # Why it was cut, if it was cut by Conrod rather than by a person.
+        item["cull_reason"] = item.get("cull_reason") or ""
+        item["rating_verdict"] = item.get("rating_verdict") or ""
+        item["clipped"] = item.get("clipped") or 0
         try:
             item["second_look"] = bool(json.loads(raw_attributes or "{}")
                                        .get("group_second_look"))
