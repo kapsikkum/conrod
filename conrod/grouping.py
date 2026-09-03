@@ -379,6 +379,75 @@ def _median_hex(values: list[str]) -> str | None:
     return "#%02x%02x%02x" % tuple(middle)
 
 
+# When one spelling is a misreading of another. Two conditions have to hold
+# together -- close enough to be the same word, and rare enough against it to
+# be a mistake rather than a second decal:
+#
+#   1 edit   4+ characters   3x commoner    "Betto"  against 19 "Betta"
+#   2 edits  5+ characters   10x commoner   "Bella"  against 19 "Betta"
+#
+# The second rule is deliberately much stricter. Two edits reaches a lot of
+# real words, so it is only allowed where the count makes a genuine second
+# sponsor implausible. "Castrel" seen nine times against ten "Castrol" is
+# two decals by this rule, and stays two.
+VARIANT_RULES = ((1, 4, 3), (2, 5, 10))
+
+
+def _edit_distance(a: str, b: str, limit: int) -> int:
+    """Levenshtein distance, abandoned once it passes ``limit``.
+
+    Returns ``limit + 1`` for anything further apart, which is all the
+    caller needs and saves walking the whole matrix for two unrelated names.
+    """
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    previous = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        current = [i]
+        for j, y in enumerate(b, 1):
+            current.append(min(previous[j] + 1,          # deletion
+                               current[j - 1] + 1,       # insertion
+                               previous[j - 1] + (x != y)))
+        if min(current) > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _is_variant(text: str, count: int, kept: str, kept_count: int) -> bool:
+    """Whether ``text`` is a misreading of the better-attested ``kept``."""
+    for edits, min_length, ratio in VARIANT_RULES:
+        if (min(len(text), len(kept)) >= min_length
+                and count * ratio <= kept_count
+                and _edit_distance(text, kept, edits) <= edits):
+            return True
+    return False
+
+
+def _fold_variants(counts: Counter) -> Counter:
+    """Merge misreadings of one decal into the spelling most frames agreed on.
+
+    OCR off a moving car is not stable. One Mini's door was read as "Betta"
+    nineteen times, "Betto" three times and "Bella" once -- one sponsor, and
+    the card listed three, which pushed the real ones down the list and made
+    the accumulated answer look like noise.
+
+    Only the rare spelling moves, and only towards a much commoner one, so
+    two sponsors that genuinely both appear are never merged into each other.
+    """
+    folded: Counter = Counter()
+    # Commonest first, so variants always fold towards an established
+    # spelling rather than whichever happened to be seen first.
+    for text, count in counts.most_common():
+        for kept in folded:
+            if _is_variant(text, count, kept, folded[kept]):
+                folded[kept] += count
+                break
+        else:
+            folded[text] = count
+    return folded
+
+
 def _accumulate(members: list[dict], key: str) -> list[str]:
     """Every distinct string any frame in the group saw, commonest first.
 
@@ -397,7 +466,7 @@ def _accumulate(members: list[dict], key: str) -> list[str]:
                 continue
             counts[text.lower()] += 1
             original.setdefault(text.lower(), text)
-    return [original[k] for k, _ in counts.most_common()]
+    return [original[k] for k, _ in _fold_variants(counts).most_common()]
 
 
 def _vote(values: list[str | None]) -> tuple[str | None, float]:

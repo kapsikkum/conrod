@@ -77,10 +77,6 @@ class Consensus(unittest.TestCase):
         self.assertEqual(out.plate, "73111J")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Nameplates(unittest.TestCase):
     """A make that contradicts the model name beside it."""
 
@@ -311,3 +307,58 @@ class Accumulation(unittest.TestCase):
 
     def test_the_most_confident_plate_read_wins(self):
         self.assertEqual(consensus(self.PAIR).plate, "EYU06S")
+
+
+class SponsorVariants(unittest.TestCase):
+    """One decal, read several ways, must end up as one sponsor.
+
+    Taken from a Mini Cooper in a real scan: thirty-two frames returned
+    "Betta" nineteen times, "Betto" three times and "Bella" once. That is one
+    sponsor on one door, and it was listed as three -- which pushed the real
+    ones down the list and made the accumulated answer look like noise.
+    """
+
+    @staticmethod
+    def _members(**spellings):
+        out = []
+        for text, count in spellings.items():
+            out += [{"sponsors": [text]}] * count
+        return out
+
+    def test_misreadings_fold_into_the_spelling_most_frames_agreed_on(self):
+        members = self._members(Betta=19, Betto=3, Bella=1)
+        self.assertEqual(consensus(members).sponsors, ["Betta"])
+
+    def test_a_different_sponsor_is_not_swallowed(self):
+        """"Betting Direct" is not a misreading of "Betta"."""
+        got = consensus(self._members(Betta=19))
+        got_both = consensus(self._members(**{"Betta": 19, "Betting Direct": 1}))
+        self.assertEqual(got.sponsors, ["Betta"])
+        self.assertEqual(set(got_both.sponsors), {"Betta", "Betting Direct"})
+
+    def test_two_sponsors_that_both_appear_a_lot_stay_apart(self):
+        """The guard against folding being too eager.
+
+        Similar spellings that are each well attested are two decals, not one
+        misread. Only a rare spelling moves, and only towards a common one.
+        """
+        got = consensus(self._members(Castrol=10, Castrel=9))
+        self.assertEqual(len(got.sponsors), 2)
+
+    def test_short_names_are_never_folded(self):
+        """At three characters everything is one edit from everything else."""
+        got = consensus(self._members(BP=12, GP=1))
+        self.assertEqual(len(got.sponsors), 2)
+
+    def test_an_inserted_or_dropped_letter_counts(self):
+        got = consensus(self._members(Bridgestone=15, Bridgstone=2))
+        self.assertEqual(got.sponsors, ["Bridgestone"])
+
+    def test_the_kept_spelling_is_the_one_that_was_actually_seen(self):
+        """Never invent a spelling: report the one the frames returned."""
+        self.assertEqual(consensus(self._members(BETTA=19, betta=2)).sponsors,
+                         ["BETTA"])
+
+
+if __name__ == "__main__":
+    unittest.main()
