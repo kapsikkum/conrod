@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
-from . import normalise
+from . import marques, normalise
 
 HASH_EDGE = 8          # 8x9 grey samples -> 64 bits of shape
 HUE_BINS = 12
@@ -565,6 +565,21 @@ def consensus(members: list[dict]) -> Consensus:
 SECOND_LOOK_FRAMES = 3
 
 
+def _proposed_makes(members: list[dict]) -> set[str]:
+    """Every make the frames' own readers actually named, folded for spelling."""
+    out = set()
+    for member in members:
+        make = member.get("own_make") or member.get("make")
+        if make:
+            out.add(_plain(str(make)))
+    return out
+
+
+def _plain(text: str) -> str:
+    """Letters and digits only, lowercased -- "Harley-Davidson" == "harley davidson"."""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
 def _second_look(ids: list[int], crops: dict, settings) -> "object":
     """Ask the vision model about the sharpest frames of one vehicle."""
     from . import vlm
@@ -661,9 +676,27 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
             # disagreement in the first place. See vlm.identify_burst.
             if look_again and not agreed.model and len(ids) > 1:
                 seen = _second_look(ids, crops, settings)
-                if seen.make or seen.model:
+                # The second look arbitrates between the makes the readers
+                # proposed. It does not get to introduce a new one.
+                #
+                # Shown three frames of a red motorbike whose readers had said
+                # Yamaha, it answered "Harley-Davidson" -- a marque no frame
+                # had ever named -- and that went straight into the group.
+                # An invented answer is worse than a wrong one, because a
+                # wrong one at least came from looking at the photograph.
+                proposed = _proposed_makes(group_members)
+                if seen.make and proposed and _plain(seen.make) not in proposed:
+                    # The model name belongs to the make it was chosen with,
+                    # so a rejected make takes its model with it.
+                    seen = None
+                if seen is not None and (seen.make or seen.model):
                     agreed.make = seen.make or agreed.make
                     agreed.model = seen.model or agreed.model
+                    # Nameplate beats badge: "Ninja H2" is a Kawasaki whatever
+                    # the burst call put in the make field.
+                    if agreed.model:
+                        agreed.make = marques.correct_make(agreed.make,
+                                                           agreed.model)
                     agreed.second_look = True
         for det_id in ids:
             current = attributes.get(det_id, {})

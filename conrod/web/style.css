@@ -701,3 +701,12 @@ button.small { padding: 4px 10px; font-size: 12px; }
 /* Sponsors past the sixth. Kept reachable rather than dropped: a Mini read
    "Betta" nineteen times and the card had no room to say so. */
 .fact.soft.more { cursor: help; border-style: dashed; }
+
+/* Why the review grid is not grouped yet. Grouping runs at the end of a
+   scan, and without this the ungrouped grid reads as grouping gone wrong. */
+.review-note {
+  margin: 0 0 14px; padding: 10px 14px;
+  border: 1px solid #24365a; border-left-width: 3px;
+  border-radius: 6px; background: #131a29;
+  color: var(--text-dim); font-size: 13px;
+}

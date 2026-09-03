@@ -360,5 +360,107 @@ class SponsorVariants(unittest.TestCase):
                          ["BETTA"])
 
 
+class SecondLookIsArbitration(unittest.TestCase):
+    """The burst call chooses between the readers; it does not overrule them.
+
+    Measured: three frames of a red motorbike whose per-frame readers said
+    Yamaha came back from the burst call as "Harley-Davidson" -- a marque no
+    frame had ever named. It was accepted unconditionally and written into
+    the group. Both answers were wrong, but only one of them was invented.
+    """
+
+    from conrod import grouping as _g
+
+    def test_a_make_no_frame_proposed_is_refused(self):
+        members = [{"own_make": "Yamaha", "own_model": "YZF-R1"},
+                   {"own_make": "Yamaha", "own_model": "R6"},
+                   {"own_make": "Yamaha", "own_model": None}]
+        proposed = self._g._proposed_makes(members)
+        self.assertNotIn(self._g._plain("Harley-Davidson"), proposed)
+        self.assertIn(self._g._plain("Yamaha"), proposed)
+
+    def test_a_make_the_readers_did_propose_is_allowed(self):
+        """It still has to be able to settle a real disagreement."""
+        members = [{"own_make": "Jaguar", "own_model": "XJS"},
+                   {"own_make": "Holden", "own_model": "Monaro"},
+                   {"own_make": "Jaguar", "own_model": "XJ-S"}]
+        proposed = self._g._proposed_makes(members)
+        self.assertIn(self._g._plain("Jaguar"), proposed)
+        self.assertIn(self._g._plain("Holden"), proposed)
+
+    def test_spelling_does_not_decide_it(self):
+        """"Harley Davidson" and "Harley-Davidson" are one marque."""
+        members = [{"own_make": "Harley Davidson"}]
+        self.assertIn(self._g._plain("Harley-Davidson"),
+                      self._g._proposed_makes(members))
+
+    def test_a_group_whose_readers_named_nothing_is_not_gated(self):
+        """With no proposals there is nothing to arbitrate between.
+
+        Refusing everything here would disable the second look on exactly the
+        groups it was built for -- the ones where no frame could name the car.
+        """
+        self.assertEqual(self._g._proposed_makes([{}, {"own_make": None}]), set())
+
+
+class SecondLookThroughConsolidate(unittest.TestCase):
+    """The guard driven through consolidate(), not just its helper."""
+
+    def _run(self, answer, readers):
+        import json, sqlite3
+        from unittest import mock
+        from conrod import grouping
+        from conrod.config import Settings
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            "CREATE TABLE images (id INTEGER PRIMARY KEY, job_id INT, burst_key INT);"
+            "CREATE TABLE detections (id INTEGER PRIMARY KEY, image_id INT,"
+            " crop_path TEXT, attributes TEXT, signature TEXT, colour_hex TEXT,"
+            " cls TEXT, plate TEXT, sharpness REAL, rejected INT DEFAULT 0,"
+            " group_key TEXT, group_size INT, group_agreement REAL,"
+            " group_colour_hex TEXT);")
+        sig = "ffff0000:" + ",".join(["0.03"] * 36)
+        for n, make in enumerate(readers, start=1):
+            conn.execute("INSERT INTO images (id, job_id, burst_key) VALUES (?,1,7)", (n,))
+            conn.execute(
+                "INSERT INTO detections (id, image_id, crop_path, attributes,"
+                " signature, colour_hex, cls, sharpness) VALUES (?,?,?,?,?,?,?,?)",
+                (n, n, f"c{n}.jpg",
+                 json.dumps({"make": make, "model": None, "colour": "red"}),
+                 sig, "#b03030", "motorcycle", 0.8))
+        conn.commit()
+
+        settings = Settings()
+        settings.normalise_names = True
+        settings.use_vlm = True
+        settings.burst_second_look = True
+
+        with mock.patch.object(grouping, "_second_look", return_value=answer),              mock.patch.object(grouping.normalise, "canonical",
+                               return_value=grouping.normalise.Canonical(
+                                   make=None, model=None)):
+            grouping.consolidate(conn, 1, settings)
+        return [json.loads(r["attributes"])
+                for r in conn.execute("SELECT attributes FROM detections")]
+
+    def test_an_invented_marque_never_reaches_the_record(self):
+        from conrod import vlm
+        out = self._run(vlm.VehicleDescription(make="Harley-Davidson",
+                                               model="Sportster"),
+                        ["Yamaha", "Yamaha", "Yamaha"])
+        for row in out:
+            self.assertNotEqual(row.get("group_make"), "Harley-Davidson")
+            self.assertNotEqual(row.get("model"), "Sportster")
+            self.assertEqual(row.get("own_make"), "Yamaha")
+
+    def test_a_proposed_marque_still_settles_the_group(self):
+        from conrod import vlm
+        out = self._run(vlm.VehicleDescription(make="Jaguar", model="XJ-S"),
+                        ["Jaguar", "Holden", "Jaguar"])
+        self.assertTrue(any(r.get("group_model") == "XJ-S" for r in out),
+                        "the guard blocked an answer the readers had proposed")
+
+
 if __name__ == "__main__":
     unittest.main()

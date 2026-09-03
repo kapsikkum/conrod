@@ -830,6 +830,22 @@ async function refreshReview() {
     el("option", { value: j.id, textContent: `${j.label || j.root} — ${j.image_count}` })));
   if (!state.jobId || !jobs.some((j) => j.id === state.jobId)) state.jobId = jobs[0].id;
   select.value = String(state.jobId);
+
+  // Grouping is the last stage of a scan, so a job still running shows every
+  // frame on its own -- ten frames of one Jaguar as ten cards, and two frames
+  // sharing a 94% plate read still side by side. That looks exactly like
+  // grouping having run and failed, so say which it is.
+  const job = jobs.find((j) => j.id === state.jobId) || {};
+  const note = $("#review-note");
+  const waiting = job.status === "scanning" || (job.unfinished_count || 0) > 0;
+  note.hidden = !waiting;
+  if (waiting) {
+    const left = job.unfinished_count || 0;
+    note.textContent = `Still scanning — ${left.toLocaleString()} frame`
+      + `${left === 1 ? "" : "s"} to go. Vehicles are grouped once the scan `
+      + `finishes, so every frame is listed on its own until then.`;
+  }
+
   state.offset = 0;
   state.selected.clear();
   updateBulkBar();
