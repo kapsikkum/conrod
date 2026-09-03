@@ -8,6 +8,7 @@ database the pipeline writes, so review can start while a run is still going.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -213,6 +214,38 @@ def update_check() -> dict:
     }
 
 
+# Set by desktop.launch so the app can close itself. An update swaps the
+# folder the running executable lives in, which Windows will not allow while
+# it is running, so quitting is a required step of installing -- not a
+# courtesy. Without it the swap script waited sixty seconds for a process that
+# was never going to exit, tried the move anyway, failed because the files
+# were in use, rolled back, and left no trace but a progress bar that stopped.
+_quit_hook = None
+
+
+def set_quit_hook(fn) -> None:
+    global _quit_hook
+    _quit_hook = fn
+
+
+def request_quit(delay: float = 1.5) -> None:
+    """Close the app, after giving the reply time to reach the page."""
+    def go() -> None:
+        time.sleep(delay)
+        if _quit_hook is not None:
+            try:
+                _quit_hook()
+            except Exception:
+                pass
+        # The hook closes the window, which normally ends the process on its
+        # own. If anything is still holding it, leave anyway: the update is
+        # already staged and waiting on us.
+        time.sleep(5)
+        os._exit(0)
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 @app.post("/api/update/install")
 def update_install() -> dict:
     """Download the newest release and swap the app over to it.
@@ -252,6 +285,8 @@ def update_install() -> dict:
             note(f"update: installing {release.version}")
             _update["message"] = updater.install(archive)
             _update["state"] = "restarting"
+            # The swap cannot happen while this process holds the folder.
+            request_quit()
         except Exception as exc:
             _update.update({"state": "error", "message": str(exc)})
             note(f"update failed: {exc}", "error")

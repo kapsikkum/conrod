@@ -44,7 +44,15 @@ def sidecar_for(image: Path) -> Path:
     return image.with_suffix(".xmp")
 
 
-def read_culls(paths: Sequence[Path], tool: ExifTool) -> dict[Path, Cull]:
+# Frames per exiftool call. One call for the whole shoot is faster in theory
+# and unusable in practice: 6,000 frames took about three minutes during which
+# the app said nothing at all and looked hung. Chunking gives the scan screen
+# something to report without meaningfully slowing the read.
+CULL_CHUNK = 200
+
+
+def read_culls(paths: Sequence[Path], tool: ExifTool,
+               on_progress=None) -> dict[Path, Cull]:
     """Ratings and colour labels for a batch of frames."""
     out: dict[Path, Cull] = {}
     if not paths:
@@ -59,7 +67,13 @@ def read_culls(paths: Sequence[Path], tool: ExifTool) -> dict[Path, Cull]:
             image.suffix.lower() not in JPEG_SUFFIXES and sidecar.exists()
         ) else image
 
-    rows = tool.read_tags(list(targets.values()), ["Rating", "Label", "XMP:Rating"])
+    wanted = list(targets.values())
+    rows: list[dict] = []
+    for start in range(0, len(wanted), CULL_CHUNK):
+        rows += tool.read_tags(wanted[start:start + CULL_CHUNK],
+                               ["Rating", "Label", "XMP:Rating"])
+        if on_progress:
+            on_progress(min(start + CULL_CHUNK, len(wanted)), len(wanted))
     by_path = {Path(r.get("SourceFile", "")).resolve(): r for r in rows}
 
     for image, target in targets.items():
@@ -80,12 +94,13 @@ def read_culls(paths: Sequence[Path], tool: ExifTool) -> dict[Path, Cull]:
 
 
 def filter_frames(paths: Sequence[Path], settings: Settings,
-                  tool: ExifTool) -> tuple[list[Path], dict[str, int]]:
+                  tool: ExifTool,
+                  on_progress=None) -> tuple[list[Path], dict[str, int]]:
     """Split a scan list into what will be analysed and why the rest was not."""
     if not settings.respect_culling:
         return list(paths), {}
 
-    culls = read_culls(paths, tool)
+    culls = read_culls(paths, tool, on_progress)
     keep: list[Path] = []
     skipped: dict[str, int] = {}
     for image in paths:
