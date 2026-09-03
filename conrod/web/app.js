@@ -49,6 +49,9 @@ const state = {
   limit: 120,
   total: 0,
   selected: new Set(),
+  scanning: false,          // a close while this is true asks first
+  watchWanted: null,        // folder to watch once the album exists
+  watchTimer: null,
   scanTimer: null,
   frameToken: -1,
   shownToken: null,
@@ -438,6 +441,8 @@ $("#btn-scan").onclick = async () => {
         recursive: $("#scan-recursive").checked,
       }),
     });
+    state.watchWanted = $("#scan-watch").checked
+      ? { path, recursive: $("#scan-recursive").checked } : null;
     $("#scan-setup-pane").hidden = true;
     $("#scanner").hidden = false;
     $("#btn-scan-review").hidden = true;
@@ -551,6 +556,8 @@ async function pollHealth() {
   try {
     const h = await api("/api/health");
     const node = $("#health");
+    // Closing the window ends the run, so the guard below needs to know.
+    state.scanning = Boolean(h.scanning) && !h.paused;
     node.className = "health " + h.level + (h.scanning ? " busy" : "");
     $("#health-text").textContent = h.paused ? "Paused"
       : h.scanning ? "Scanning" : h.level === "ok" ? "Ready" : h.summary;
@@ -565,6 +572,18 @@ async function pollHealth() {
   state.healthTimer = setTimeout(pollHealth, 8000);
 }
 $("#health").onclick = () => show("setup");
+
+// Closing the window closes the application, which ends the scan wherever it
+// had got to. Hours of a shoot went that way on a misplaced click, and
+// nothing asked. The browser only shows this prompt on a page the user has
+// actually interacted with -- true of an app window by the time a scan is
+// running -- and the wording is Chromium's own, not ours.
+window.addEventListener("beforeunload", (event) => {
+  if (!state.scanning) return;
+  event.preventDefault();
+  event.returnValue = "";        // still required by Chromium
+  return "";                     // and by older WebKit
+});
 
 /* ── activity log ─────────────────────────────────────────── */
 /* exiftool, the detector and the vision model all write to a console the
@@ -609,6 +628,10 @@ function pollScan() {
     let data;
     try { data = await api("/api/scan"); } catch { return; }
     renderScan(data);
+    // A watch continues an album, and the album does not exist until the
+    // pipeline has created it -- so it can only be armed once the scan has
+    // reported which job it is filling.
+    if (state.watchWanted && data.job_id) armWatch(data.job_id);
     if (!data.active) {
       clearInterval(state.scanTimer);
       $("#btn-stop").hidden = true;
@@ -620,6 +643,50 @@ function pollScan() {
     }
   }, 500);
 }
+
+/* ── watching a folder ────────────────────────────────────── */
+/* The card still copying while the shoot is packed up. The watch adds the
+   frames that land afterwards to the album the scan just filled, so the
+   second half of a shoot does not have to be scanned by hand. */
+
+async function armWatch(jobId) {
+  const wanted = state.watchWanted;
+  state.watchWanted = null;            // one attempt; a failure is reported
+  try {
+    await api("/api/watch", {
+      method: "POST",
+      body: JSON.stringify({ active: true, job_id: jobId, ...wanted }),
+    });
+    pollWatch();
+  } catch (err) {
+    toast(`Could not watch the folder: ${err.message}`);
+  }
+}
+
+async function pollWatch() {
+  let data;
+  try { data = await api("/api/watch"); } catch { return; }
+  $("#watch-card").hidden = !data.active;
+  if (data.active) {
+    const added = data.added
+      ? `${data.added} new frame${data.added === 1 ? "" : "s"} picked up`
+      : "Watching for new frames";
+    $("#watch-text").textContent = data.message && data.message !== "waiting"
+      ? `${added} — ${data.message}` : added;
+  }
+  clearTimeout(state.watchTimer);
+  if (data.active) state.watchTimer = setTimeout(pollWatch, 5000);
+}
+
+$("#btn-watch-stop").onclick = async () => {
+  try {
+    await api("/api/watch", { method: "POST",
+                              body: JSON.stringify({ active: false }) });
+    $("#watch-card").hidden = true;
+    clearTimeout(state.watchTimer);
+    toast("Stopped watching the folder");
+  } catch (err) { toast(err.message); }
+};
 
 function renderScan(data) {
   const pause = $("#btn-pause");
@@ -837,6 +904,10 @@ function groupItems(items) {
   return order.map((key) => byKey.get(key));
 }
 
+// How many sponsors fit on the header before it stops being readable. The
+// rest are still reachable: they go behind a "+N" that lists all of them.
+const SPONSORS_SHOWN = 6;
+
 // The facts the group agreed on, shown once above its frames rather than
 // repeated on every card. Each frame only sees the panels facing the camera,
 // so the header is the accumulated answer and the cards below are evidence.
@@ -858,16 +929,30 @@ function vehicleBlock(members) {
   const facts = el("div", { className: "facts" });
   const number = members.find((m) => m.number)?.number;
   const plate = members.find((m) => m.plate)?.plate;
-  const attrs = members.find((m) => (m.attributes || {}).team)?.attributes || {};
+  // Consolidation writes the accumulated answer onto every member of the
+  // group, so any member carries it. This used to read it off "the first
+  // member that has a team" -- and a road car with sponsor decals and no
+  // race team has no such member, so attrs fell back to {} and every
+  // sponsor the readers found was thrown away on the way to the screen.
+  // Nineteen frames read "Betta" off a Mini and the card showed nothing.
+  const attrs = members.find((m) => Object.keys(m.attributes || {}).length)?.attributes || {};
   if (number) facts.append(el("span", { className: "fact number", textContent: `#${number}` }));
   if (plate) facts.append(el("span", { className: "fact plate", textContent: plate }));
   if (attrs.team) facts.append(el("span", { className: "fact team", textContent: attrs.team }));
 
-  const sponsors = attrs.sponsors || [];
-  for (const name of sponsors.slice(0, 3)) {
-    if (name && name !== attrs.team) {
-      facts.append(el("span", { className: "fact soft", textContent: name }));
-    }
+  // Filter first, then cap. Slicing first meant a group whose first three
+  // sponsors included the team name showed two, and the fourth sponsor --
+  // which was on the car -- was never reachable at all.
+  const sponsors = (attrs.sponsors || []).filter((n) => n && n !== attrs.team);
+  for (const name of sponsors.slice(0, SPONSORS_SHOWN)) {
+    facts.append(el("span", { className: "fact soft", textContent: name }));
+  }
+  if (sponsors.length > SPONSORS_SHOWN) {
+    facts.append(el("span", {
+      className: "fact soft more",
+      textContent: `+${sponsors.length - SPONSORS_SHOWN}`,
+      title: sponsors.join(", "),
+    }));
   }
   if (members.length > 1) {
     const pct = Math.round((lead.group_agreement || 0) * 100);
@@ -984,16 +1069,28 @@ function card(item) {
     });
     title.append(" ", badge);
   }
-  // Sharpness is measured on the crop, so a panning shot is judged on its
-  // subject rather than on the background blur that makes it a good picture.
-  if (item.sharpness_verdict && item.sharpness_verdict !== "unknown") {
-    const focus = el("span", {
-      className: "focus " + item.sharpness_verdict,
-      textContent: item.sharpness_verdict,
-      title: `Subject sharpness ${(item.sharpness || 0).toFixed(2)}`
-             + " — measured on the vehicle, not the whole frame",
-    });
-    node.append(focus);
+  // One chip for the picture, combining two separate measurements: how sharp
+  // the subject is, and how much of it the frame edge took. They are kept
+  // apart in the database and in the tooltip, because they are different
+  // faults with different fixes -- a frame cut in half is often pin sharp.
+  const verdict = item.rating_verdict || item.sharpness_verdict;
+  if (verdict && verdict !== "unknown") {
+    const why = [`sharpness ${(item.sharpness || 0).toFixed(2)}`];
+    if (item.clipped) {
+      why.push(item.clipped === 1 ? "touches the frame edge"
+                                  : `cut off on ${item.clipped} edges`);
+    }
+    node.append(el("span", {
+      className: "focus " + verdict,
+      textContent: verdict,
+      title: `${why.join(" · ")} — measured on the vehicle, not the whole frame`,
+    }));
+  }
+
+  // Cut by Conrod, not by a person. Saying which is the difference between
+  // "I decided this" and "something decided this and will not say what".
+  if (item.cull_reason) {
+    node.append(el("div", { className: "culled", textContent: item.cull_reason }));
   }
 
   const who = el("div", { className: "who", textContent: item.who || "" });

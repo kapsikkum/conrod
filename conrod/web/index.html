@@ -85,6 +85,8 @@
       </div>
       <div class="field-row"><input id="scan-label" placeholder="Name for this album (optional)"></div>
       <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
+      <label class="check-line"><input type="checkbox" id="scan-watch"> Keep watching this folder
+        <span class="muted">— frames that arrive later join the same album</span></label>
 
       <div class="field-row entry-row">
         <label for="scan-entries" class="filebtn">Entry list…</label>
@@ -125,6 +127,10 @@
           <div class="big-stat mono" id="scan-counter">0 / 0</div>
           <div class="big-label" id="scan-eta">estimating…</div>
           <p class="muted mono scan-note" id="scan-found"></p>
+        </div>
+        <div class="rail-card" id="watch-card" hidden>
+          <div class="watch-line"><span class="dot"></span><span id="watch-text">Watching for new frames</span></div>
+          <button id="btn-watch-stop" class="ghost small">Stop watching</button>
         </div>
         <div class="rail-card">
           <button id="btn-pause" class="ghost">Pause</button>

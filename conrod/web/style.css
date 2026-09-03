@@ -542,9 +542,13 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
   text-transform: uppercase; padding: 2px 6px; border-radius: 5px;
   background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
 }
-.card .focus.sharp   { color: var(--good); }
-.card .focus.soft    { color: var(--warn2); }
-.card .focus.blurred { color: var(--bad); }
+.card .focus.sharp, .card .focus.good { color: var(--good); }
+.card .focus.soft,  .card .focus.fair { color: var(--warn2); }
+.card .focus.blurred, .card .focus.poor { color: var(--bad); }
+
+.card .culled {
+  margin: 6px 10px 0; font-size: 11.5px; color: var(--warn2);
+}
 
 .rail .bar { margin-bottom: 12px; }
 .rail-card .scan-note { margin: 10px 0 0; font-size: 12px; }
@@ -676,3 +680,24 @@ button.small { padding: 4px 10px; font-size: 12px; }
 .swatch.big {
   width: 1.15em; height: 1.15em; border-radius: 4px;
 }
+
+/* A folder still being copied into. The pulse is the only thing on the rail
+   that moves while a watch is idle, so it reads as "still listening" rather
+   than as a stale panel left behind by the scan. */
+.watch-line {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text-dim); margin-bottom: 10px;
+}
+.watch-line .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); flex: none;
+  animation: watch-pulse 2.4s ease-in-out infinite;
+}
+@keyframes watch-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.25; }
+}
+
+/* Sponsors past the sixth. Kept reachable rather than dropped: a Mini read
+   "Betta" nineteen times and the card had no room to say so. */
+.fact.soft.more { cursor: help; border-style: dashed; }

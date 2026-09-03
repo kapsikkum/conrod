@@ -218,10 +218,6 @@ class SettingsRoundTrip(unittest.TestCase):
         self.assertIn(3, settings.active_classes())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExistingMetadataIsPreserved(unittest.TestCase):
     """A shoot is usually keyworded after it has been culled and captioned,
     so the write must add to the sidecar rather than replace it. Keywords
@@ -270,3 +266,7 @@ class ExistingMetadataIsPreserved(unittest.TestCase):
         self.assertIn("Bathurst", subject)      # theirs kept
         self.assertIn("#21", subject)           # ours added
         self.assertEqual(description, "Mine, not yours")   # never replaced
+
+
+if __name__ == "__main__":
+    unittest.main()
