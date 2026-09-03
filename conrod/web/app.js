@@ -774,9 +774,9 @@ async function loadGrid(append = false) {
 
   const data = await api(`/api/jobs/${state.jobId}/detections?${params}`);
   state.total = data.total;
-  const cards = data.items.map(card);
-  if (append) $("#grid").append(...cards);
-  else $("#grid").replaceChildren(...cards);
+  const blocks = groupItems(data.items).map(vehicleBlock);
+  if (append) $("#grid").append(...blocks);
+  else $("#grid").replaceChildren(...blocks);
 
   $("#more").hidden = state.offset + data.items.length >= state.total;
   $("#empty").hidden = state.total > 0;
@@ -785,6 +785,68 @@ async function loadGrid(append = false) {
       ? "Nothing left to review. Write the XMP when you are ready."
       : "Nothing here.";
   }
+}
+
+// One vehicle, however many frames it appeared in. Detections with no group
+// stand alone, keyed by their own id so they cannot collide with a group key.
+function groupItems(items) {
+  const order = [];
+  const byKey = new Map();
+  for (const item of items) {
+    const key = item.group_size > 1 && item.group_key != null
+      ? `g${item.group_key}` : `d${item.id}`;
+    if (!byKey.has(key)) { byKey.set(key, []); order.push(key); }
+    byKey.get(key).push(item);
+  }
+  return order.map((key) => byKey.get(key));
+}
+
+// The facts the group agreed on, shown once above its frames rather than
+// repeated on every card. Each frame only sees the panels facing the camera,
+// so the header is the accumulated answer and the cards below are evidence.
+function vehicleBlock(members) {
+  const lead = members[0];
+  const section = el("section", { className: "vehicle" });
+
+  const head = el("div", { className: "vehicle-head" });
+  if (lead.colour_hex) {
+    const swatch = el("span", { className: "swatch big" });
+    swatch.style.background = lead.colour_hex;
+    swatch.title = lead.colour_word
+      ? `Sampled ${lead.colour_hex} — the model called it "${lead.colour_word}"`
+      : `Sampled ${lead.colour_hex}`;
+    head.append(swatch);
+  }
+  head.append(el("h3", { textContent: lead.title || lead.cls }));
+
+  const facts = el("div", { className: "facts" });
+  const number = members.find((m) => m.number)?.number;
+  const plate = members.find((m) => m.plate)?.plate;
+  const attrs = members.find((m) => (m.attributes || {}).team)?.attributes || {};
+  if (number) facts.append(el("span", { className: "fact number", textContent: `#${number}` }));
+  if (plate) facts.append(el("span", { className: "fact plate", textContent: plate }));
+  if (attrs.team) facts.append(el("span", { className: "fact team", textContent: attrs.team }));
+
+  const sponsors = attrs.sponsors || [];
+  for (const name of sponsors.slice(0, 3)) {
+    if (name && name !== attrs.team) {
+      facts.append(el("span", { className: "fact soft", textContent: name }));
+    }
+  }
+  if (members.length > 1) {
+    const pct = Math.round((lead.group_agreement || 0) * 100);
+    const disputed = lead.disputed?.length ? lead.disputed : null;
+    facts.append(el("span", {
+      className: "fact count" + (disputed ? " disputed" : ""),
+      textContent: `${members.length} frames`,
+      title: disputed
+        ? `The readers disagreed: ${disputed.join(", ")}`
+        : `${pct}% agreed across ${members.length} frames`,
+    }));
+  }
+  head.append(facts);
+  section.append(head, el("div", { className: "strip" }, ...members.map(card)));
+  return section;
 }
 
 function band(value) {

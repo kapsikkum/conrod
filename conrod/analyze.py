@@ -79,7 +79,13 @@ class VehicleAnalysis:
         make = self.make or ""
         if make and model.lower().startswith(make.lower()):
             make = ""
-        bits = [b for b in (self.colour, make, model) if b]
+        # Sentence case on the colour alone. The model returns it lowercase
+        # ("blue Ford Fairmont"), which read as a typo next to the proper
+        # nouns beside it. Only the first character, so "dark metallic blue"
+        # does not lose its other words to .capitalize().
+        colour = self.colour or ""
+        colour = colour[:1].upper() + colour[1:]
+        bits = [b for b in (colour, make, model) if b]
         label = " ".join(bits) if bits else self.kind
         if self.race_number:
             label = f"#{self.race_number} {label}"

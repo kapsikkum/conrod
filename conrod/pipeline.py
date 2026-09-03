@@ -84,8 +84,16 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
     if settings.respect_culling:
         found = len(files)
+        on_progress({"stage": "cull", "done": 0, "total": found,
+                     "message": f"checking ratings and labels on {found} frames"})
+
+        def cull_progress(done: int, total: int) -> None:
+            on_progress({"stage": "cull", "done": done, "total": total,
+                         "message": f"checked {done}/{total} frames"})
+
         with ExifTool() as tool:
-            files, skipped = culling.filter_frames(files, settings, tool)
+            files, skipped = culling.filter_frames(files, settings, tool,
+                                                   cull_progress)
         if skipped:
             detail = ", ".join(f"{n} {why}" for why, n in sorted(skipped.items()))
             on_progress({"stage": "cull", "done": len(files), "total": found,
