@@ -22,6 +22,7 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+from . import marques
 from .config import Settings
 
 CAR_PROMPT = """This is a photograph of a single vehicle, taken by a motorsport
@@ -178,9 +179,16 @@ def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = F
     except json.JSONDecodeError:
         return VehicleDescription()
 
+    make = _text(parsed.get("make"))
+    model = _text(parsed.get("model"))
+    # The nameplate is read more reliably than the badge; where the two
+    # contradict each other and the nameplate belongs to exactly one marque,
+    # the nameplate wins. See marques.py.
+    make = marques.correct_make(make, model)
+
     return VehicleDescription(
-        make=_text(parsed.get("make")),
-        model=_text(parsed.get("model")),
+        make=make,
+        model=model,
         colour=_text(parsed.get("colour")),
         body_type=_text(parsed.get("body_type")),
         race_number=_digits(parsed.get("race_number"), settings),
