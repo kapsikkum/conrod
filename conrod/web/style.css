@@ -759,3 +759,77 @@ button.small { padding: 4px 10px; font-size: 12px; }
   opacity: 1; border-left: 3px solid var(--bad);
 }
 .card.culled .thumb { opacity: .82; }
+
+/* ── album ─────────────────────────────────────────────────────
+   The album screen. Adding a folder used to land on a progress bar, and
+   the two things worth doing next were small buttons on a card back on
+   the home screen. The album is the subject; what to do to it sits beside
+   it, the size of a decision rather than the size of a chip. */
+.album { display: flex; gap: 0; flex: 1; min-height: 100%; align-items: stretch; }
+.album-main { flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0; }
+.album-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; margin-bottom: 20px;
+}
+.album-head h2 { margin: 0 0 4px; }
+.album-head p { margin: 0; font-size: 12px; }
+
+/* A contact sheet: small, dense, and the frame is the whole point, so the
+   tile is the photograph with its name under it and nothing else on top. */
+.sheet {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.sheet .tile {
+  border-radius: 8px; overflow: hidden; border: 1px solid var(--line-soft);
+  background: var(--surface-2); position: relative;
+}
+.sheet .tile img {
+  display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover;
+  background: var(--surface-3);
+}
+/* A RAW with no preview yet, and a frame the detector has not reached. */
+.sheet .tile .blank {
+  aspect-ratio: 3 / 2; display: grid; place-items: center;
+  color: var(--text-mute); font-size: 11px;
+}
+.sheet .tile .cap {
+  padding: 5px 7px; font-size: 10.5px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sheet .tile .pip {
+  position: absolute; right: 6px; top: 6px; width: 8px; height: 8px;
+  border-radius: 50%; box-shadow: 0 0 0 2px rgba(0,0,0,.45);
+}
+.sheet .tile .pip.good { background: var(--good); }
+.sheet .tile .pip.fair { background: var(--warn2); }
+.sheet .tile .pip.poor { background: var(--bad); }
+.sheet .tile .count {
+  position: absolute; left: 6px; top: 6px; font-size: 10px; font-weight: 600;
+  background: rgba(0,0,0,.62); border-radius: 5px; padding: 2px 6px;
+}
+.sheet-more { display: flex; justify-content: center; margin: 18px 0 4px; }
+
+/* The two decisions, as cards rather than buttons: this is the screen's
+   whole purpose, so they are the biggest thing on it. */
+.do-card {
+  display: flex; align-items: center; gap: 14px; cursor: pointer;
+  background: var(--surface-2); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg); padding: 16px; margin-bottom: 12px;
+  transition: border-color .12s, background .12s, transform .12s;
+}
+.do-card:hover { border-color: var(--accent); background: var(--surface-3); }
+.do-card:active { transform: scale(.995); }
+.do-card[aria-disabled="true"] {
+  opacity: .45; cursor: not-allowed; border-color: var(--line-soft);
+  background: var(--surface-2);
+}
+.do-card .do-icon {
+  flex: none; width: 34px; height: 34px; border-radius: 9px;
+  display: grid; place-items: center; font-size: 16px;
+  background: var(--surface-3); color: var(--accent);
+}
+.do-card .do-text { flex: 1; min-width: 0; }
+.do-card .do-text h4 { margin: 0 0 3px; font-size: 15px; font-weight: 600; }
+.do-card .do-text p { margin: 0; font-size: 12px; color: var(--text-dim); line-height: 1.45; }
+.do-card .do-go { flex: none; color: var(--text-mute); font-size: 20px; }

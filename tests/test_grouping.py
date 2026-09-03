@@ -238,6 +238,59 @@ class BurstsGroup(unittest.TestCase):
                 (2, self.SIG, 2, "#2c426c", "car", None, None, None)]
         self.assertEqual(len(set(cluster(rows).values())), 1)
 
+    def test_being_close_in_the_folder_cannot_cross_a_burst(self):
+        """The 41-frame vehicle.
+
+        On a real shoot a Jaguar, a Mini and a black sedan became one group
+        of 41 frames spanning three bursts. Before identify runs there is no
+        make and no sampled swatch, and both of those gates abstain on a
+        missing value rather than refusing -- so with the detector class the
+        only thing left, "within six frames" walked the whole corner
+        together, one car onto the next.
+        """
+        from conrod.grouping import cluster
+
+        # Adjacent frames, no colour and no make to disagree about: exactly
+        # what a cull-stage album looks like.
+        rows = [(1, self.SIG, 1, None, "car", None, None, 1),
+                (2, self.SIG, 2, None, "car", None, None, 2)]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_nor_can_shape_alone(self):
+        """The other half of the same merge: thirteen frames across two
+        bursts minutes apart, joined on shape. This module's own measurements
+        say shape overlaps almost entirely between same and different cars,
+        so it cannot carry a burst boundary by itself."""
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, None, "car", None, None, 1),
+                (2, self.SIG, 90, None, "car", None, None, 8)]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_a_make_both_sides_named_still_carries_a_burst_boundary(self):
+        """Two runs of the shutter at one car must still come together, or
+        every panning sequence broken by a shutter gap splits in two."""
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", "Holden", None, 3),
+                (2, self.SIG, 2, "#2c426c", "car", "Holden", None, 4)]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+    def test_so_does_paint_both_sides_sampled(self):
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", None, None, 3),
+                (2, self.SIG, 2, "#2c426c", "car", None, None, 4)]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+    def test_a_plate_still_overrides_everything(self):
+        """A read plate is an identity, not a resemblance."""
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, None, "car", None, "39432J", 1),
+                (2, self.OTHER, 90, None, "car", None, "39432J", 8)]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
 
 class SecondLook(unittest.TestCase):
     """Which frames get shown to the model when the readings disagree."""

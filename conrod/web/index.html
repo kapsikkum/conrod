@@ -74,6 +74,77 @@
     </div>
   </section>
 
+  <!-- ─────────────────────────── ALBUM ─────────────────────────── -->
+  <!-- Where an album lands once its frames are known. Adding a folder used
+       to drop you on a progress bar, and the two things you might actually
+       want to do next were small buttons on a card back on the home screen.
+       The album is the thing; what to do to it belongs beside it. -->
+  <section class="screen" id="screen-album" hidden>
+    <div class="album">
+      <div class="album-main">
+        <div class="album-head">
+          <div>
+            <h2 id="album-name">Album</h2>
+            <p class="muted mono" id="album-path"></p>
+          </div>
+          <button class="ghost small" data-goto="home">← All albums</button>
+        </div>
+        <div class="section-label">
+          <span>Frames</span><span class="mono" id="album-count"></span>
+        </div>
+        <div class="sheet" id="album-sheet"></div>
+        <div class="empty" id="album-empty" hidden>No frames in this album.</div>
+        <div class="sheet-more">
+          <button id="album-more" class="ghost" hidden>Show more frames</button>
+        </div>
+      </div>
+
+      <aside class="rail">
+        <div class="rail-card">
+          <h4>Album</h4>
+          <div class="big-stat mono" id="album-stat">—</div>
+          <div class="big-label" id="album-state">reading…</div>
+          <div class="stat-grid" id="album-grid"></div>
+        </div>
+
+        <div class="do-card" id="do-cull">
+          <div class="do-icon">◐</div>
+          <div class="do-text">
+            <h4>Cull Album</h4>
+            <p>Find the vehicles, measure how sharp each one is, rate and
+               colour the frames. About a second a frame.</p>
+          </div>
+          <div class="do-go">›</div>
+        </div>
+
+        <div class="do-card" id="do-identify">
+          <div class="do-icon">◆</div>
+          <div class="do-text">
+            <h4>Identify Album</h4>
+            <p>Name make, model, colour, team and numbers on what survived
+               the cull. This is the slow one.</p>
+          </div>
+          <div class="do-go">›</div>
+        </div>
+
+        <div class="do-card" id="do-both">
+          <div class="do-icon">⚡</div>
+          <div class="do-text">
+            <h4>Cull &amp; Identify</h4>
+            <p>Both, back to back, without waiting to press the second one.</p>
+          </div>
+          <div class="do-go">›</div>
+        </div>
+
+        <div class="rail-card">
+          <button id="album-review" class="primary">Review vehicles</button>
+          <button id="album-write" class="ghost">Write XMP</button>
+          <p class="muted" id="album-hint"></p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
   <!-- ──────────────────────────── SCAN ─────────────────────────── -->
   <section class="screen" id="screen-scan" hidden>
     <div class="pane wide" id="scan-setup-pane">

@@ -190,8 +190,43 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
                 continue
             if not _swatch_matches(swatch, group.swatch, max_swatch):
                 continue
+            # Shape and frame proximity are resemblances, not identities, and
+            # neither may cross a burst boundary on its own.
+            #
+            # Inside one run of the shutter, same_burst already says these
+            # frames are one vehicle, so these two only ever *add* something
+            # across bursts -- which is exactly where they are wrong. The
+            # next car onto the same corner is photographed from the same
+            # spot, at the same focal length, against the same fence,
+            # seconds later: "within six frames" is true of two different
+            # cars, and this module's own measurements say shape overlaps
+            # almost entirely between same and different vehicles.
+            #
+            # Nothing else was stopping them. Before identify has run there
+            # is no make and no sampled swatch, and both of those gates
+            # abstain on a missing value rather than refusing -- deliberately,
+            # so a crop too small to read can still join on other evidence.
+            # With the detector class the only gate left, proximity chained a
+            # Jaguar, a Mini and a black sedan into one 41-frame vehicle
+            # across three bursts, and shape merged another thirteen frames
+            # across two bursts minutes apart.
+            #
+            # So crossing a burst needs something that is an identity or an
+            # agreed measurement: a near-matching plate, a make both sides
+            # named, or a swatch both sides sampled. Absent values are not
+            # agreement.
+            crosses_burst = (burst is not None and bool(group.bursts)
+                             and burst not in group.bursts)
+            corroborated = bool(
+                (make and group.make and _same_make(make, group.make))
+                or (swatch and group.swatch
+                    and _swatch_matches(swatch, group.swatch, max_swatch)))
+
             shape_agrees = _shape_distance(sig, group.signature) <= max_bits
             nearby = abs(frame_index - group.last_frame) <= frame_window
+            if crosses_burst and not corroborated:
+                shape_agrees = nearby = False
+
             if shape_agrees or nearby or near or same_burst:
                 _join(group, det_id, frame_index, make, plate, assignment, burst)
                 break

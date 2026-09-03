@@ -38,6 +38,9 @@ function toast(message) {
 
 const state = {
   screen: "home",
+  album: null,
+  sheetOffset: 0,
+  lastStage: null,
   logAt: 0,
   logTimer: null,
   healthTimer: null,
@@ -67,6 +70,7 @@ function show(screen) {
   if (screen === "home") loadHome();
   if (screen === "setup") { loadSetup(); checkUpdate(); }
   if (screen === "settings") loadSettings();
+  if (screen === "album") loadAlbum();
   if (screen === "review") refreshReview();
 }
 
@@ -193,7 +197,10 @@ Its results and cached crops go. Your photos and any XMP already written are not
     menu.append(rename, remove);
     card.append(menu);
 
-    card.onclick = () => { state.jobId = job.id; show("review"); };
+    // The album, not the vehicle grid: an album that has only been
+    // indexed has no vehicles, so review had nothing to show and the
+    // card appeared to open an empty screen.
+    card.onclick = () => { state.jobId = job.id; show("album"); };
     return card;
   }));
 
@@ -486,6 +493,7 @@ function estimate(frames) {
 async function startScan(stage) {
   const path = $("#scan-path").value.trim();
   if (!path) { toast("Choose a folder first"); return; }
+  state.lastStage = stage;
   try {
     await api("/api/scan", {
       method: "POST",
@@ -513,6 +521,8 @@ $("#btn-scan").onclick = () => startScan("all");
 /* Running one stage over an album that already exists. The folder is the
    album's own, so a card never has to be told where its frames are. */
 async function runStage(job, stage) {
+  state.lastStage = stage;
+  state.jobId = job.id;
   try {
     await api("/api/scan", {
       method: "POST",
@@ -560,7 +570,8 @@ $("#btn-pause").onclick = async () => {
   toast(paused ? "Resuming" : "Paused — anything mid-analysis will still finish");
 };
 
-$("#btn-scan-review").onclick = () => show("review");
+$("#btn-scan-review").onclick = () =>
+  show(state.lastStage === "index" ? "album" : "review");
 
 /* ── updates ──────────────────────────────────────────────── */
 async function checkUpdate() {
@@ -725,6 +736,12 @@ function pollScan() {
       if (data.error) toast(data.error);
       else toast(data.message || "Scan complete");
       if (data.job_id) state.jobId = data.job_id;
+      // Reading a folder takes seconds and finds nothing — leaving someone
+      // looking at a finished progress bar, with the two decisions that
+      // matter on another screen. Go to the album instead.
+      if (state.lastStage === "index" && data.job_id && !data.error) {
+        show("album");
+      }
     }
   }, 500);
 }
@@ -990,6 +1007,112 @@ async function loadGrid(append = false) {
       : "Nothing here.";
   }
 }
+
+/* ── album ────────────────────────────────────────────────────
+   An album and the two things you might do to it. Adding a folder used to
+   drop you on a progress bar, after which Cull and Identify were small
+   buttons on a card back on the home screen — the work made to look like
+   an afterthought to the reading of the folder, which is the cheap part. */
+
+const SHEET_PAGE = 200;
+
+async function loadAlbum() {
+  const id = state.jobId;
+  if (!id) { show("home"); return; }
+  state.sheetOffset = 0;
+  const jobs = await api("/api/jobs");
+  const job = jobs.find((j) => j.id === id);
+  if (!job) { toast("That album is gone"); show("home"); return; }
+  state.album = job;
+
+  $("#album-name").textContent = job.label || job.root;
+  $("#album-path").textContent = job.root;
+  $("#album-stat").textContent = `${job.image_count || 0}`;
+  $("#album-state").textContent = ALBUM_STATE[job.status] || job.status || "";
+
+  const found = job.detection_count || 0;
+  $("#album-grid").replaceChildren(
+    stat("Vehicles", found),
+    stat("Frames", job.image_count || 0));
+
+  // Offer only what this album is actually ready for. An album with no
+  // vehicles cannot be identified, and offering it anyway means pressing a
+  // button that does nothing and says nothing about why.
+  const indexed = job.status === "indexed";
+  offer($("#do-cull"), true,
+        () => runStage(job, "cull"));
+  offer($("#do-identify"), !indexed && found > 0,
+        () => runStage(job, "identify"),
+        indexed ? "Cull the album first — there are no vehicles yet." : "");
+  offer($("#do-both"), true, () => runStage(job, "all"));
+
+  $("#album-review").disabled = !found;
+  $("#album-write").disabled = !found;
+  $("#album-hint").textContent = found
+    ? "Nothing is written to your photographs until you press Write XMP."
+    : "No vehicles found yet.";
+
+  await loadSheet(true);
+}
+
+const ALBUM_STATE = {
+  indexed: "frames read — ready to cull",
+  culled: "culled — ready to identify",
+  scanning: "still working",
+  done: "finished",
+};
+
+function stat(label, n) {
+  return el("div", {}, el("div", { className: "n", textContent: String(n) }),
+                       el("div", { className: "big-label", textContent: label }));
+}
+
+function offer(card, enabled, run, why) {
+  card.setAttribute("aria-disabled", enabled ? "false" : "true");
+  card.title = enabled ? "" : (why || "");
+  card.onclick = enabled ? run : null;
+}
+
+async function loadSheet(reset) {
+  const id = state.jobId;
+  const data = await api(
+    `/api/jobs/${id}/frames?offset=${state.sheetOffset}&limit=${SHEET_PAGE}`);
+  const tiles = data.frames.map((f) => {
+    const tile = el("div", { className: "tile" });
+    if (f.viewable) {
+      tile.append(el("img", { src: `/api/thumb/${f.id}`, alt: "",
+                              loading: "lazy", decoding: "async" }));
+    } else {
+      tile.append(el("div", { className: "blank",
+                              textContent: f.status === "pending"
+                                ? "not read yet" : "no preview" }));
+    }
+    if (f.vehicles) {
+      tile.append(el("span", { className: "count",
+                               textContent: `${f.kept}/${f.vehicles}` }));
+    }
+    if (f.verdict) {
+      tile.append(el("span", { className: `pip ${f.verdict}`,
+                               title: `${f.verdict} — ${f.label || ""}` }));
+    }
+    tile.append(el("div", { className: "cap", textContent: f.name,
+                            title: f.name }));
+    return tile;
+  });
+
+  const sheet = $("#album-sheet");
+  if (reset) sheet.replaceChildren(...tiles); else sheet.append(...tiles);
+  $("#album-count").textContent = `${sheet.children.length} of ${data.total}`;
+  $("#album-empty").hidden = data.total > 0;
+  $("#album-more").hidden = sheet.children.length >= data.total;
+}
+
+$("#album-more").onclick = async () => {
+  state.sheetOffset += SHEET_PAGE;
+  await loadSheet(false);
+};
+$("#album-review").onclick = () => show("review");
+$("#album-write").onclick = () => { show("review"); toast("Review, then Write XMP"); };
 
 // One vehicle, however many frames it appeared in. Detections with no group
 // stand alone, keyed by their own id so they cannot collide with a group key.

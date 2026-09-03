@@ -263,6 +263,10 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                             background=focus.background, uncertain=unsure)
                         box["focus"] = focus.verdict
                         box["rating"] = verdict
+                        # The stars the cull would write. Carried on the box
+                        # so the live view can say what it decided without
+                        # keeping its own copy of the bands.
+                        box["stars"] = sharpness_mod.stars_for(rating)
                         if focus.panning:
                             box["panning"] = True
                         # A held pan is never culled automatically, and a

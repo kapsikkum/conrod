@@ -26,7 +26,8 @@ from . import keywords as keywords_mod
 from . import pipeline, setup_check, store, watch
 from . import sharpness as sharpness_mod
 from .analyze import VehicleAnalysis
-from .config import DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES, Settings
+from .config import (CACHE_DIR, DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES,
+                     Settings)
 from .mapping import NumberMap
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -619,18 +620,25 @@ def start_scan(body: ScanRequest) -> dict:
             if frame.get("phase") == "scanning":
                 return
             boxes = frame.get("boxes") or []
+            culling = body.stage == "cull"
             record = {
                 "name": frame.get("name"), "preview": frame.get("preview"),
-                "boxes": boxes, "phase": "VEHICLES FOUND" if boxes else "NO VEHICLE",
-                "log": [f"{len(boxes)} vehicle{'' if len(boxes) == 1 else 's'} detected"
-                        if boxes else "no vehicle detected"],
+                "boxes": boxes,
+                "phase": _frame_phase(boxes, culling),
+                "log": _frame_log(boxes, culling),
             }
             for box in boxes:
                 _frames[box["id"]] = record
             # Trim the ring; a long scan would otherwise hold every frame.
             while len(_frames) > 400:
                 _frames.pop(next(iter(_frames)))
-            if not boxes:
+            # A frame with vehicles normally waits for the vision model to
+            # say something about them before it is shown. A cull never
+            # calls the vision model, so nothing ever arrived and the live
+            # view showed only the frames where nothing was found -- four
+            # tiles reading NO VEHICLE while the counter beside them climbed
+            # past fifty. The cull has plenty to say; it just was not asked.
+            if not boxes or culling:
                 _show(record)
 
         elif stage == "vehicle":
@@ -937,6 +945,47 @@ def read_log(after: float = 0.0) -> dict:
     return {"lines": lines, "at": lines[-1]["at"] if lines else after}
 
 
+def _frame_phase(boxes: list, culling: bool) -> str:
+    if not boxes:
+        return "NO VEHICLE"
+    return "CHECKING SHARPNESS" if culling else "VEHICLES FOUND"
+
+
+def _frame_log(boxes: list, culling: bool) -> list[str]:
+    """What was done to this frame, in the order it happened.
+
+    During a cull this is the whole story -- there is no vision model to add
+    to it later -- so it says what the cull measured and what it decided,
+    rather than the one line about detection it used to say.
+    """
+    if not boxes:
+        return ["no vehicle found in this frame"]
+
+    plural = "" if len(boxes) == 1 else "s"
+    lines = [f"{len(boxes)} vehicle{plural} detected"]
+    if not culling:
+        return lines
+
+    lines.append("checking sharpness on each vehicle")
+    for box in boxes:
+        kind = box.get("kind") or "vehicle"
+        if box.get("culled"):
+            lines.append(f"{kind}: too soft — culled")
+        elif box.get("panning"):
+            # A held pan is blur in the background, not on the car, and is
+            # never culled automatically. Saying so is the difference
+            # between "it understood the shot" and "it got it wrong".
+            lines.append(f"{kind}: panning shot — kept")
+        elif box.get("rating"):
+            stars = box.get("stars")
+            grade = (f"{stars} star{'' if stars == 1 else 's'}" if stars
+                     else box["rating"])
+            lines.append(f"{kind}: {box.get('focus') or box['rating']} — {grade}")
+        else:
+            lines.append(f"{kind}: kept")
+    return lines
+
+
 @app.get("/api/scan/frame")
 def scan_frame(t: int = 0):
     """The preview of a frame currently being scanned.
@@ -1005,6 +1054,61 @@ def delete_job(job_id: int) -> dict:
             except OSError:
                 pass
     return {"ok": True, "crops_removed": removed}
+
+
+@app.get("/api/jobs/{job_id}/frames")
+def job_frames(job_id: int, offset: int = 0,
+               limit: int = Query(200, le=500)) -> dict:
+    """The album's frames, for a contact sheet.
+
+    An album that has only been indexed has no vehicles and no crops, so the
+    review screen -- which is a grid of vehicles -- has nothing to show and
+    the album looks empty when it is not. This is the frames themselves,
+    which exist from the moment the folder is read.
+    """
+    with store.session() as conn:
+        if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(404, "no such album")
+        total = conn.execute("SELECT COUNT(*) FROM images WHERE job_id=?",
+                             (job_id,)).fetchone()[0]
+        rows = conn.execute(
+            """SELECT i.id, i.path, i.status, i.preview_path, i.written_at,
+                      COUNT(d.id)                        AS vehicles,
+                      SUM(CASE WHEN d.rejected THEN 1 ELSE 0 END) AS cut,
+                      MAX(d.rating)                      AS rating,
+                      -- The frame's best surviving vehicle decides how the
+                      -- frame reads, which is the same rule write_job uses
+                      -- to pick the rating it writes.
+                      (SELECT d2.rating_verdict FROM detections d2
+                        WHERE d2.image_id = i.id AND d2.rejected = 0
+                        ORDER BY d2.rating DESC LIMIT 1) AS verdict
+                 FROM images i
+                 LEFT JOIN detections d ON d.image_id = i.id
+                WHERE i.job_id = ?
+                GROUP BY i.id
+                ORDER BY i.id
+                LIMIT ? OFFSET ?""", (job_id, limit, offset)).fetchall()
+
+    frames = []
+    for row in rows:
+        preview = row["preview_path"] or ""
+        vehicles = row["vehicles"] or 0
+        kept = vehicles - (row["cut"] or 0)
+        frames.append({
+            "id": row["id"],
+            "name": Path(row["path"]).name,
+            "status": row["status"],
+            # Only a JPEG preview can be shown; a RAW with none yet cannot.
+            "viewable": preview.lower().endswith((".jpg", ".jpeg")),
+            "vehicles": vehicles,
+            "kept": kept,
+            "verdict": row["verdict"],
+            "label": (sharpness_mod.label_for(row["verdict"])
+                      if row["verdict"] else None),
+            "rating": row["rating"],
+            "written": bool(row["written_at"]),
+        })
+    return {"total": total, "offset": offset, "frames": frames}
 
 
 @app.get("/api/jobs/{job_id}/summary")
@@ -1369,6 +1473,64 @@ def crop(det_id: int, w: int | None = None) -> FileResponse:
         width = min(THUMB_WIDTHS, key=lambda c: abs(c - w))
         path = _thumbnail(path, width)
     return FileResponse(path, media_type="image/jpeg")
+
+
+THUMB_EDGE = 420
+THUMB_DIR = CACHE_DIR / "thumbs"
+
+
+@app.get("/api/thumb/{image_id}")
+def thumb(image_id: int) -> FileResponse:
+    """A contact-sheet sized copy of a frame.
+
+    The stored preview is JpgFromRaw: 4640x6960 and about 6MB, chosen at that
+    size deliberately because a registration plate has to survive in it. A
+    200-tile sheet of those is 1.2GB over the wire, which is exactly how the
+    album screen behaved -- tiles arriving one at a time and the page unable
+    to finish rendering.
+
+    Cached on disk beside the previews, and keyed by the preview's own
+    modification time so a re-extracted frame is not served stale.
+    """
+    with store.session() as conn:
+        row = conn.execute("SELECT preview_path, path FROM images WHERE id=?",
+                           (image_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "no such image")
+    source = Path(row["preview_path"] or row["path"])
+    if not source.exists() or source.suffix.lower() not in {".jpg", ".jpeg"}:
+        raise HTTPException(404, "no viewable preview")
+
+    cached = THUMB_DIR / f"{image_id}.jpg"
+    try:
+        make_thumb(source, cached)
+    except OSError as exc:
+        raise HTTPException(404, f"could not make a thumbnail: {exc}")
+
+    return FileResponse(cached, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+def make_thumb(source: Path, cached: Path, edge: int = THUMB_EDGE) -> Path:
+    """Shrink one preview, unless a current thumbnail is already there."""
+    if cached.exists() and cached.stat().st_mtime >= source.stat().st_mtime:
+        return cached
+
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source) as image:
+        # draft() lets libjpeg decode straight to roughly the size wanted by
+        # skipping DCT coefficients. On a 4640x6960 frame that is the
+        # difference between decoding 32 megapixels and about half of one.
+        image.draft("RGB", (edge, edge))
+        image = image.convert("RGB")
+        image.thumbnail((edge, edge), Image.LANCZOS)
+        # Written under a temporary name and moved into place: two requests
+        # for the same new thumbnail arrive together, and a half-written JPEG
+        # served to the other one is a broken tile that never heals.
+        staging = cached.with_suffix(f".{os.getpid()}.tmp")
+        image.save(staging, "JPEG", quality=78, optimize=True)
+        staging.replace(cached)
+    return cached
 
 
 @app.get("/api/frame/{image_id}")
