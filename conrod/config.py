@@ -234,6 +234,13 @@ class Settings:
     min_rating: int = 0            # 0 = any; 1-5 = that many stars or better
     require_label: str = ""        # e.g. "Green" to keyword only that label
 
+    # --- the window ---
+    # A scan runs for hours and the window is the least interesting part of
+    # it, so closing the window leaves Conrod running in the notification
+    # area rather than throwing the work away. Off restores the old
+    # behaviour, where closing the window ends the program.
+    close_to_tray: bool = True
+
     # --- writing ---
     write_sidecar_for_raw: bool = True
     # Off by default: a description is a single value, so writing one replaces

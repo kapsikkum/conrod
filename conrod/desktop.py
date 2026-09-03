@@ -35,7 +35,7 @@ from pathlib import Path
 
 import uvicorn
 
-from . import server
+from . import server, tray
 from .config import DATA_ROOT, Settings
 from .mapping import NumberMap
 
@@ -165,34 +165,117 @@ def _close_orphan_windows() -> bool:
     return True
 
 
-def _show_window(url: str) -> bool:
-    """Open the window and block until the person closes it.
+class AppWindow:
+    """The browser window, which can now be closed and opened again.
 
-    False means no window could be opened at all, and the caller should fall
+    The process used to live exactly as long as this: `wait()` returned and
+    main() fell off the end. That is the wrong lifetime for a program whose
+    main job takes hours, so the window is now something Conrod has rather
+    than something Conrod is, and it has to survive being reopened.
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self._proc: subprocess.Popen | None = None
+        self._closing = False
+        self._lock = threading.Lock()
+
+    def is_open(self) -> bool:
+        proc = self._proc
+        return proc is not None and proc.poll() is None
+
+    def open(self) -> bool:
+        with self._lock:
+            if self.is_open():
+                return True
+            self._closing = False
+            self._proc = _open_app_window(self.url)
+            return self._proc is not None
+
+    def wait(self) -> None:
+        """Block until the window is gone."""
+        for attempt in range(2):
+            proc = self._proc
+            if proc is None:
+                return
+            opened = time.monotonic()
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                self.terminate()
+                return
+            if self._closing:
+                return          # we closed it; nothing to investigate
+            if time.monotonic() - opened >= HANDOFF_SECONDS or attempt:
+                return
+            # Gone in under five seconds: not closed, handed off. Clear the
+            # stale window out of the way and open ours properly, once.
+            if not _close_orphan_windows() or not self.open():
+                return
+
+    def terminate(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+            self._closing = True
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def _run_windowed(url: str, settings: Settings) -> bool:
+    """Show the window, and keep Conrod alive in the tray once it is closed.
+
+    False means no window could be opened at all and the caller should fall
     back to the default browser.
     """
-    window = _open_app_window(url)
-    if window is None:
+    window = AppWindow(url)
+    if not window.open():
         return False
 
-    for attempt in range(2):
-        server.set_quit_hook(window.terminate)
-        opened = time.monotonic()
-        try:
-            window.wait()          # the app lives as long as its window
-        except KeyboardInterrupt:
-            window.terminate()
-            return True
-        if time.monotonic() - opened >= HANDOFF_SECONDS or attempt:
-            return True
-        # Gone in under five seconds: not closed, handed off. Clear the stale
-        # window out of the way and open ours properly, once.
-        if not _close_orphan_windows():
-            return True
-        retry = _open_app_window(url)
-        if retry is None:
-            return True
-        window = retry
+    finished = threading.Event()
+
+    def shutdown() -> None:
+        finished.set()
+        window.terminate()
+
+    # Installing an update means replacing the folder this executable runs
+    # from, which Windows refuses while it is open. So the updater's quit has
+    # to end the process -- tucking it into the tray instead would leave the
+    # swap script waiting for a process that is never going to exit.
+    server.set_quit_hook(shutdown)
+
+    def show() -> None:
+        if not window.open():
+            webbrowser.open(url)
+
+    icon = None
+    if getattr(settings, "close_to_tray", True) and tray.available():
+        icon = tray.Tray(on_open=show, on_quit=shutdown)
+        if not icon.start():
+            icon = None
+
+    try:
+        announced = False
+        while True:
+            window.wait()
+            if finished.is_set() or icon is None:
+                break
+            if not announced:
+                # A window that vanishes with the work still running needs to
+                # say where it went, once.
+                icon.notify("Conrod is still running",
+                            "Any scan carries on. Click here to open it, or "
+                            "right-click to quit.")
+                announced = True
+            while not finished.is_set() and not window.is_open():
+                time.sleep(0.25)
+            if finished.is_set():
+                break
+    finally:
+        if icon is not None:
+            icon.stop()
     return True
 
 
@@ -300,11 +383,7 @@ def launch(settings: Settings | None = None, number_map: NumberMap | None = None
                 pass
             return 0
 
-        # Installing an update means replacing the folder this executable is
-        # running from, which Windows refuses while it is open. Closing the
-        # window ends the wait inside _show_window and the process exits
-        # normally -- see server.set_quit_hook.
-        if not force_browser and _show_window(url):
+        if not force_browser and _run_windowed(url, settings):
             return 0
 
         if not force_browser:

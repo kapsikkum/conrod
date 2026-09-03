@@ -152,10 +152,28 @@ def _check_window() -> tuple[str, str]:
     return OK, f"{found[0].name} will host the window"
 
 
+def _check_tray_icon() -> tuple[bool, str]:
+    """The icon has to be a file inside the build, not just the exe's own.
+
+    The tray loads it from disk at runtime, so a spec that sets `icon=` but
+    forgets `datas` produces a build where the notification area shows a
+    generic square -- and nothing about running from source would show it.
+    """
+    from .tray import available, icon_path
+
+    if not available():
+        return OK, "not Windows; no notification area to use"
+    path = icon_path()
+    if path is None:
+        return FAIL, "assets/conrod.ico is not in this build"
+    return OK, f"{path.name}, {path.stat().st_size // 1024} KB"
+
+
 def run() -> int:
     settings = Settings.load()
     checks = [
         ("web assets", _check_web_assets),
+        ("tray icon", _check_tray_icon),
         ("job store", _check_store),
         ("torchvision ops", _check_torchvision_ops),
         ("vehicle detector", lambda: _check_detector(settings)),

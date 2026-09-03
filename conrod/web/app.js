@@ -316,6 +316,10 @@ const SETTING_GROUPS = [
     ["vlm_input_edge", "Input size (px)", "number", null, ""],
     ["identify_team", "Read team and sponsors", "bool", null, ""],
   ]],
+  ["Window", [
+    ["close_to_tray", "Keep running when the window is closed", "bool", null,
+      "Conrod stays in the notification area and any scan carries on. Quit it from there."],
+  ]],
   ["Cull verdict", [
     ["write_rating", "Write the star rating", "bool", null,
       "Stars follow how sharp the vehicle is, not the whole frame."],
@@ -400,6 +404,8 @@ $("#btn-save-settings").onclick = async () => {
     });
     $("#settings-note").textContent = "Saved.";
     setTimeout(() => { $("#settings-note").textContent = ""; }, 2500);
+    // The close guard reads this without being able to ask the server.
+    state.closeToTray = payload.close_to_tray;
     loadSettings();
   } catch (err) {
     toast(`Could not save: ${err.message}`);
@@ -655,7 +661,10 @@ $("#health").onclick = () => show("setup");
 // actually interacted with -- true of an app window by the time a scan is
 // running -- and the wording is Chromium's own, not ours.
 window.addEventListener("beforeunload", (event) => {
-  if (!state.scanning) return;
+  // Closing the window used to end the program and throw the scan away, so
+  // it was worth interrupting for. With the tray on it costs nothing -- the
+  // scan carries on -- and a warning that cries wolf is worse than none.
+  if (!state.scanning || state.closeToTray) return;
   event.preventDefault();
   event.returnValue = "";        // still required by Chromium
   return "";                     // and by older WebKit
@@ -1472,6 +1481,11 @@ $("#btn-write").onclick = async () => {
     await loadSetup();
     const setup = await api("/api/setup");
     const scan = await api("/api/scan");
+    // beforeunload cannot wait on a request, so this has to be known before
+    // the person ever reaches for the close button.
+    try {
+      state.closeToTray = (await api("/api/settings")).settings.close_to_tray;
+    } catch { state.closeToTray = false; }
 
     $("#splash").classList.add("gone");
     setTimeout(() => { $("#splash").hidden = true; }, 500);

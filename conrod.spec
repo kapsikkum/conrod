@@ -26,6 +26,9 @@ here = Path(SPECPATH)
 datas = [
     (str(here / "conrod" / "web"), "conrod/web"),
     (str(here / "samples"), "samples"),
+    # The tray loads this at runtime, so it has to be inside the build as a
+    # file -- being the exe's own icon is not enough.
+    (str(here / "assets" / "conrod.ico"), "assets"),
 ]
 
 # RapidOCR keeps its detection/recognition ONNX models and config.yaml inside
