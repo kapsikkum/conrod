@@ -80,6 +80,8 @@ _MIGRATIONS = [
     ("detections", "group_key", "INTEGER"),
     ("detections", "group_size", "INTEGER"),
     ("detections", "group_agreement", "REAL"),
+    ("detections", "colour_hex", "TEXT"),
+    ("detections", "group_colour_hex", "TEXT"),
 ]
 
 
@@ -98,6 +100,14 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     """
     target = str(path or DB_PATH)
     conn = sqlite3.connect(target, timeout=30, check_same_thread=False)
+    # Autocommit. Python's default opens a transaction on the first write and
+    # holds it until commit(), which meant the analysis workers -- batching a
+    # commit every five detections, each detection a multi-second call to the
+    # vision model -- sat on the single write lock for twenty to thirty
+    # seconds at a stretch. Everything else waited, and on slower frames the
+    # wait passed busy_timeout and the scan died with "database is locked".
+    # Each statement is now its own transaction, which is what WAL is for.
+    conn.isolation_level = None
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     # WAL lets the UI read while a scan writes. NORMAL is the matching
@@ -222,16 +232,18 @@ def set_number(conn: sqlite3.Connection, det_id: int, number: str | None,
     )
 
 
-def set_analysis(conn: sqlite3.Connection, det_id: int, analysis) -> None:
+def set_analysis(conn: sqlite3.Connection, det_id: int, analysis,
+                 colour_hex: str | None = None) -> None:
     """Store a completed VehicleAnalysis against a detection."""
     conn.execute(
         """UPDATE detections
               SET number=?, number_source=?, number_conf=?,
-                  plate=?, plate_state=?, plate_conf=?, attributes=?
+                  plate=?, plate_state=?, plate_conf=?, attributes=?,
+                  colour_hex=COALESCE(?, colour_hex)
             WHERE id=?""",
         (analysis.race_number, analysis.number_source, analysis.number_conf,
          analysis.plate, analysis.plate_state, analysis.plate_conf,
-         analysis.to_json(), det_id),
+         analysis.to_json(), colour_hex, det_id),
     )
 
 

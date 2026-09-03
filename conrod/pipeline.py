@@ -18,6 +18,7 @@ from typing import Callable, Iterable
 import httpx
 from PIL import Image
 
+from . import colour as colour_mod
 from . import culling
 from . import detect as detect_mod
 from . import keywords as keywords_mod
@@ -336,7 +337,6 @@ def _analysis_worker(work, settings: Settings, counters: dict,
     conn = store.connect()
     client = httpx.Client(timeout=settings.vlm_timeout)
     try:
-        pending = 0
         while True:
             item = work.get()
             if item is None:
@@ -348,7 +348,14 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                     crop.load()
                     analysis = analyze(crop, settings, is_bike=is_bike, kind=kind,
                                        client=client, native=native)
-                store.set_analysis(conn, det_id, analysis)
+                    # Sampled from the crop rather than taken from the model's
+                    # word for it, so the review grid can show the paint.
+                    # Never worth failing a whole detection over.
+                    try:
+                        swatch = colour_mod.dominant(crop)
+                    except Exception:
+                        swatch = None
+                store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
             except Exception as exc:
@@ -379,10 +386,10 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                 },
             })
 
-            pending += 1
-            if pending >= 5:
-                conn.commit()
-                pending = 0
+            # Connections autocommit (see store.connect), so there is
+            # nothing to batch and nothing held open across the next
+            # model call. Left explicit rather than silently removed.
+            conn.commit()
         conn.commit()
     finally:
         client.close()
