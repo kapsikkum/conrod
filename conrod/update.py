@@ -187,24 +187,47 @@ def install(archive: Path, on_progress=None) -> str:
     if not (unpacked / "Conrod.exe").is_file():
         raise RuntimeError("the archive did not unpack into the expected shape")
 
-    script = staging / "swap.ps1"
+    # Not inside the staging folder: the script deletes that folder as its
+    # last act, and a running script cannot be sure of removing itself.
+    script = archive.parent / "swap.ps1"
     script.write_text(
         _SWAP_SCRIPT
         .replace("@PID@", str(os.getpid()))
         .replace("@NEW@", str(unpacked))
         .replace("@TARGET@", str(current))
         .replace("@OLD@", str(current.parent / "Conrod-previous"))
-        .replace("@STAGING@", str(staging)),
+        .replace("@STAGING@", str(staging))
+        .replace("@LOG@", str(archive.parent / "swap.log")),
         encoding="utf-8",
     )
 
-    subprocess.Popen(
+    launch_swap(script, archive.parent)
+    return "Conrod will close and reopen on the new version."
+
+
+def launch_swap(script: Path, cwd: Path) -> subprocess.Popen:
+    """Start the swap script so that it outlives us and actually runs.
+
+    Both halves of that were wrong once and neither said so:
+
+    * cwd matters more than it looks. A child inherits ours, which is the
+      folder about to be moved, and Windows locks a process's working
+      directory -- so the swap script ended up holding the very folder it
+      was trying to move. Move-Item failed, the rollback tidied up, and
+      nothing anywhere recorded that an update had been attempted.
+    * DETACHED_PROCESS sounds like exactly what a script that outlives us
+      wants. PowerShell given no console at all exits 0 immediately without
+      running the file. CREATE_NO_WINDOW gives it a console nobody can see,
+      which is the real requirement; the new process group keeps our own
+      shutdown from reaching it.
+    """
+    return subprocess.Popen(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
          "-WindowStyle", "Hidden", "-File", str(script)],
+        cwd=str(cwd),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        | getattr(subprocess, "DETACHED_PROCESS", 0),
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
-    return "Conrod will close and reopen on the new version."
 
 
 # Waits for this process to go, keeps the old build until the new one is in
@@ -212,7 +235,29 @@ def install(archive: Path, on_progress=None) -> str:
 # someone with no application at all.
 _SWAP_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
-try { Wait-Process -Id @PID@ -Timeout 60 } catch { }
+
+# Never stand in the folder being moved. Popen is started outside it too;
+# this is the belt to that pair of braces, and costs nothing.
+Set-Location -LiteralPath $env:SystemRoot
+
+# The app is gone by the time any of this runs, so a failure here has no way
+# to reach the user except by writing it down. Everything below appends.
+$log = '@LOG@'
+function Say($text) {
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $text" |
+        Out-File -FilePath $log -Append -Encoding utf8
+}
+Say 'swap starting'
+
+# Conrod has to be gone before its folder can be moved. It closes itself as
+# part of installing, but if it is somehow still running, stop here: trying
+# the move anyway fails on files that are in use, and the rollback that
+# follows made it look like nothing had happened at all.
+try { Wait-Process -Id @PID@ -Timeout 90 } catch { }
+if (Get-Process -Id @PID@ -ErrorAction SilentlyContinue) {
+    Say 'giving up: Conrod (pid @PID@) is still running'
+    exit 2
+}
 Start-Sleep -Seconds 1
 
 $target = '@TARGET@'
@@ -223,14 +268,18 @@ if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force
 try {
     Move-Item -LiteralPath $target -Destination $old -Force
     Move-Item -LiteralPath $new -Destination $target -Force
+    Say 'swapped in the new build'
 } catch {
+    Say "swap failed: $($_.Exception.Message)"
     if ((Test-Path -LiteralPath $old) -and -not (Test-Path -LiteralPath $target)) {
         Move-Item -LiteralPath $old -Destination $target -Force
+        Say 'rolled back to the previous build'
     }
     exit 1
 }
 
 Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath '@STAGING@' -Recurse -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath (Join-Path $target 'Conrod.exe')
+Say 'starting the new build'
+Start-Process -FilePath (Join-Path $target 'Conrod.exe') -WorkingDirectory $target
 """
