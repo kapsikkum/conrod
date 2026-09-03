@@ -42,6 +42,10 @@ from PIL import Image
 # them, few enough that each still holds real detail at thumbnail sizes.
 TILE_GRID = 6
 
+# The background is measured on a finer grid, because the crop is padded by
+# less than a fifth and a coarse tile almost always catches some of the car.
+BACKGROUND_GRID = 16
+
 # Which tile speaks for the crop. The maximum is too eager -- one specular
 # highlight or a sharp-edged sticker on an otherwise soft car will hit it --
 # so this takes the top of the distribution without taking its outlier.
@@ -62,13 +66,73 @@ MIN_TILE_CONTRAST = 1.5
 WORKING_EDGE = 512
 
 
+# How much sharper the subject has to be than what is behind it before the
+# frame is called a pan rather than a miss. Measured on real frames: a held
+# pan runs 0.2 to 0.5 above its background, and a frame where the whole
+# picture moved runs within 0.05 either way.
+PAN_MARGIN = 0.15
+
+# Above this the background is not blurred enough for the frame to be a pan,
+# whatever the subject is doing. Without it a sharp car against a sharp fence
+# reads as a pan on the strength of a small difference.
+PAN_BACKGROUND_CEILING = 0.55
+
+# Bands along the vehicle's longer axis. Three is the useful number: a car
+# has two ends and a middle, and the question being asked is whether the
+# softness is confined to one end.
+BANDS = 3
+
+# How much higher one end has to score before it is worth saying that end is
+# the sharp one, rather than that the car is evenly sharp.
+END_MARGIN = 0.12
+
+# A score this close to a threshold is not a judgement, it is a coin toss.
+# Frames inside this band are still culled if they fall the wrong side, but
+# they are flagged so a person sees them rather than losing them silently.
+UNCERTAIN_MARGIN = 0.06
+
+# Fewer usable tiles than this and the subject is too small or too flat to
+# have been measured at all.
+MIN_SUBJECT_TILES = 4
+
+
 @dataclass
 class Sharpness:
     score: float = 0.0        # 0..1, the normalised focus measure
     verdict: str = "unknown"  # sharp | soft | blurred | unknown
 
+    # What is behind the subject. -1 means it was not measured, which is the
+    # case whenever no box was given and the whole crop is the subject.
+    background: float = -1.0
+
+    # The subject is clearly sharper than its background: a held pan, which
+    # is a keeper and must never be culled for the blur that makes it one.
+    panning: bool = False
+
+    # Which end of the vehicle carries the sharpness, in image terms:
+    # "left", "right", or "even". Not front/back -- that needs to know which
+    # way the car is pointing, and nothing at cull time does.
+    sharp_end: str = "even"
+
+    # Per-band scores along the longer axis, sharpest-end-first order kept as
+    # measured (left to right, or top to bottom for a tall crop).
+    bands: tuple = ()
+
+    # The score sits close enough to a threshold that the verdict could have
+    # gone either way. Culled all the same, but flagged for a person.
+    uncertain: bool = False
+
     def __bool__(self) -> bool:
         return self.verdict != "unknown"
+
+    @property
+    def partly_sharp(self) -> bool:
+        """One end of the car is sharp even though the score overall is not.
+
+        A panner focused on the nose with a smeared tail is a picture; the
+        same score spread evenly over the whole car is a missed frame.
+        """
+        return bool(self.bands) and max(self.bands) - min(self.bands) >= END_MARGIN
 
 
 def _focus_map(grey: np.ndarray) -> np.ndarray:
@@ -85,25 +149,19 @@ def _focus_map(grey: np.ndarray) -> np.ndarray:
     return gx * gx + gy * gy
 
 
-def measure(image: Image.Image) -> Sharpness:
-    """Score how sharp the subject of this crop is, from 0 to 1."""
-    try:
-        grey = image.convert("L")
-    except (OSError, ValueError):
-        return Sharpness()
-
-    grey.thumbnail((WORKING_EDGE, WORKING_EDGE), Image.BILINEAR)
-    data = np.asarray(grey, dtype=np.float32)
-    if data.ndim != 2 or min(data.shape) < TILE_GRID * 4:
-        return Sharpness()
-
+def _tile_scores(data: np.ndarray, grid: int = TILE_GRID) -> list[float]:
+    """The per-tile focus ratios of one region, skipping the featureless ones."""
+    if data.ndim != 2 or min(data.shape) < grid * 4:
+        return []
     energy = _focus_map(data)
-    rows = np.array_split(np.arange(data.shape[0]), TILE_GRID)
-    cols = np.array_split(np.arange(data.shape[1]), TILE_GRID)
+    rows = np.array_split(np.arange(data.shape[0]), grid)
+    cols = np.array_split(np.arange(data.shape[1]), grid)
 
     scores: list[float] = []
     for row in rows:
         for col in cols:
+            if not len(row) or not len(col):
+                continue
             tile = data[row[0]:row[-1] + 1, col[0]:col[-1] + 1]
             contrast = float(tile.std())
             if contrast < MIN_TILE_CONTRAST:
@@ -115,12 +173,164 @@ def measure(image: Image.Image) -> Sharpness:
             # Without it this measures how contrasty the paint is, not how
             # well focused it was.
             scores.append(tile_energy / (contrast * contrast))
+    return scores
 
+
+def _region_score(data: np.ndarray, grid: int = TILE_GRID) -> float:
+    scores = _tile_scores(data, grid)
     if not scores:
+        return -1.0
+    return _normalise(float(np.percentile(scores, TILE_PERCENTILE)))
+
+
+def _greyscale(image: Image.Image):
+    try:
+        grey = image.convert("L")
+    except (OSError, ValueError):
+        return None
+    return grey
+
+
+def measure(image: Image.Image, box=None) -> Sharpness:
+    """Score how sharp the subject is, and say what is behind it.
+
+    ``box`` is the detector's box in the coordinates of ``image``. Given one,
+    everything is measured on the vehicle and the rest of the crop is scored
+    separately as background -- which is the only way to tell a held pan from
+    a missed frame, because they differ in where the sharpness is and not in
+    how much of it there is.
+
+    Without a box the whole crop is treated as the subject, which is the old
+    behaviour and is wrong in both directions: a car against a sharp fence
+    scored the fence, and a panner scored its own smeared background.
+    """
+    grey = _greyscale(image)
+    if grey is None:
         return Sharpness()
 
-    raw = float(np.percentile(scores, TILE_PERCENTILE))
-    return Sharpness(score=_normalise(raw), verdict="unknown")
+    # Scale the box with the image, so the measure means the same thing on a
+    # 300px crop and a 3000px one.
+    scale = min(1.0, WORKING_EDGE / max(grey.size)) if max(grey.size) else 1.0
+    grey.thumbnail((WORKING_EDGE, WORKING_EDGE), Image.BILINEAR)
+    data = np.asarray(grey, dtype=np.float32)
+    if data.ndim != 2 or min(data.shape) < TILE_GRID * 4:
+        return Sharpness()
+
+    height, width = data.shape
+    inner = None
+    if box is not None:
+        x1, y1, x2, y2 = (float(v) * scale for v in box)
+        x1, y1 = max(0.0, x1), max(0.0, y1)
+        x2, y2 = min(float(width), x2), min(float(height), y2)
+        if x2 - x1 >= TILE_GRID * 4 and y2 - y1 >= TILE_GRID * 4:
+            inner = (int(x1), int(y1), int(x2), int(y2))
+
+    if inner is None:
+        score = _region_score(data)
+        if score < 0:
+            return Sharpness()
+        return Sharpness(score=score, verdict="unknown")
+
+    x1, y1, x2, y2 = inner
+    subject = data[y1:y2, x1:x2]
+    subject_tiles = _tile_scores(subject)
+    if len(subject_tiles) < MIN_SUBJECT_TILES:
+        # Too little of the vehicle carries any detail to measure. Falling
+        # back to the whole crop is better than refusing to answer, but the
+        # answer is about the picture rather than the car, so say so.
+        score = _region_score(data)
+        if score < 0:
+            return Sharpness()
+        return Sharpness(score=score, verdict="unknown", uncertain=True)
+
+    score = _normalise(float(np.percentile(subject_tiles, TILE_PERCENTILE)))
+
+    # What is behind it. Everything outside the box, which on a pan is the
+    # smear that makes the picture and on a missed frame is often the only
+    # sharp thing in it.
+    background = _background_score(data, inner)
+
+    panning = (background >= 0.0
+               and background <= PAN_BACKGROUND_CEILING
+               and score - background >= PAN_MARGIN)
+
+    bands, sharp_end = _bands(subject)
+    return Sharpness(score=score, verdict="unknown", background=background,
+                     panning=panning, bands=bands, sharp_end=sharp_end)
+
+
+def _background_score(data: np.ndarray, inner) -> float:
+    """Focus of the parts of the crop the vehicle is not in.
+
+    Tiles that straddle the edge of the box are dropped rather than assigned:
+    they hold both the car and what is behind it, and on a pan that is the
+    one place the two cannot be told apart.
+
+    On a finer grid than the subject uses, and for a reason found by running
+    it: the crop is padded by less than a fifth, so on a six by six grid
+    almost every tile touches the vehicle, nothing survives the overlap rule
+    and the background comes back unmeasured on every frame. That silently
+    turned off pan detection altogether -- it was reporting "no background"
+    for all seventeen vehicles of a test shoot.
+    """
+    x1, y1, x2, y2 = inner
+    height, width = data.shape
+    rows = np.array_split(np.arange(height), BACKGROUND_GRID)
+    cols = np.array_split(np.arange(width), BACKGROUND_GRID)
+    energy = _focus_map(data)
+
+    scores: list[float] = []
+    for row in rows:
+        for col in cols:
+            if not len(row) or not len(col):
+                continue
+            r0, r1, c0, c1 = row[0], row[-1] + 1, col[0], col[-1] + 1
+            # Any overlap with the vehicle at all disqualifies the tile.
+            if not (c1 <= x1 or c0 >= x2 or r1 <= y1 or r0 >= y2):
+                continue
+            tile = data[r0:r1, c0:c1]
+            contrast = float(tile.std())
+            if contrast < MIN_TILE_CONTRAST:
+                continue
+            scores.append(float(energy[r0:r1, c0:c1].mean())
+                          / (contrast * contrast))
+
+    if len(scores) < 2:
+        return -1.0
+    return _normalise(float(np.percentile(scores, TILE_PERCENTILE)))
+
+
+def _bands(subject: np.ndarray):
+    """Sharpness along the vehicle's longer axis, and which end wins.
+
+    Reported in image terms -- left and right, or top and bottom for a tall
+    crop. Deliberately not "front" and "back": that needs to know which way
+    the car is pointing, and nothing available at cull time does.
+    """
+    height, width = subject.shape
+    horizontal = width >= height
+    length = width if horizontal else height
+    if length < BANDS * TILE_GRID * 2:
+        return (), "even"
+
+    edges = np.linspace(0, length, BANDS + 1).astype(int)
+    scores = []
+    for start, end in zip(edges, edges[1:]):
+        piece = subject[:, start:end] if horizontal else subject[start:end, :]
+        # A coarser grid inside a band, which is a third of the vehicle.
+        scores.append(_region_score(piece, grid=max(2, TILE_GRID // 2)))
+    if any(s < 0 for s in scores):
+        return (), "even"
+
+    bands = tuple(round(s, 3) for s in scores)
+    if max(bands) - min(bands) < END_MARGIN:
+        return bands, "even"
+    first, last = bands[0], bands[-1]
+    if abs(first - last) < END_MARGIN:
+        return bands, "middle" if bands[1] == max(bands) else "even"
+    if horizontal:
+        return bands, "left" if first > last else "right"
+    return bands, "top" if first > last else "bottom"
 
 
 # Measured across Gaussian blurs of a detailed target: a crisp crop lands
@@ -161,12 +371,80 @@ def rating_for(score: float, sharp_at: float, blurred_below: float) -> str:
     return "fair"
 
 
-def rate(image: Image.Image, settings=None) -> Sharpness:
+# The rating, as a photographer's catalogue understands it. Conrod judges the
+# subject and the framing; the catalogue is where that judgement is acted on,
+# so it has to arrive as stars and a colour label rather than as a private
+# score in a private database.
+#
+# Five stars is deliberately never given automatically. A machine that has
+# measured focus and framing has not seen the picture -- whether the moment
+# is any good is the photographer's, and the top of the scale is left for it.
+STAR_BANDS = ((0.72, 4), (0.52, 3), (0.34, 2), (0.0, 1))
+
+LABEL_GOOD, LABEL_FAIR, LABEL_POOR = "Green", "Yellow", "Red"
+
+
+def stars_for(rating: float) -> int:
+    """Subject rating on the one to five scale every catalogue shares."""
+    for floor, stars in STAR_BANDS:
+        if rating >= floor:
+            return stars
+    return 1
+
+
+def label_for(rating_verdict: str) -> str:
+    """The colour a culled frame turns, and the one a keeper turns.
+
+    Red for what the cull dropped, green for what it kept: filterable in
+    Lightroom without knowing anything about how the number was arrived at.
+    """
+    if rating_verdict == "good":
+        return LABEL_GOOD
+    if rating_verdict == "poor":
+        return LABEL_POOR
+    return LABEL_FAIR
+
+
+def rate(image: Image.Image, settings=None, box=None) -> Sharpness:
     """Measure a crop and label it against the configured thresholds."""
-    result = measure(image)
+    result = measure(image, box)
     if not result and result.score <= 0:
         return result
     sharp_at = getattr(settings, "sharp_at", 0.62) if settings else 0.62
     blurred_below = getattr(settings, "blurred_below", 0.40) if settings else 0.40
     result.verdict = verdict_for(result.score, sharp_at, blurred_below)
     return result
+
+
+def doubtful(result: "Sharpness", rating_verdict: str,
+             blurred_below: float = 0.25) -> bool:
+    """Whether a decision to cull this frame was a close one.
+
+    Deliberately only asked about frames being culled. Every measurement is
+    uncertain somewhere, and flagging all of them buries the ones that matter:
+    on a real shoot, "close to some threshold" was two thirds of the frames
+    and "close to being thrown away for the wrong reason" was three percent.
+    """
+    if rating_verdict != "poor":
+        return False
+    if result.uncertain:                       # the subject could not be measured
+        return True
+    if abs(result.score - blurred_below) < UNCERTAIN_MARGIN:
+        return True
+    # One end sharp and the other smeared is what a pan looks like from the
+    # side. Averaged over the whole car that reads "blurred", and the frame
+    # the photographer went there to take is the one that gets binned.
+    return result.partly_sharp
+
+
+def cullable(result: "Sharpness", rating_verdict: str) -> bool:
+    """Whether this may be culled automatically at all.
+
+    A held pan is the picture the photographer went there for: the background
+    is smeared on purpose and the subject is not. Culling it for being blurred
+    is the worst thing an automatic cull can do, so a pan is never dropped
+    without a person seeing it -- however low the number is.
+    """
+    if rating_verdict != "poor":
+        return False
+    return not result.panning

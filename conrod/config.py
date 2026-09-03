@@ -216,6 +216,14 @@ class Settings:
     group_vehicles: bool = True
     respect_culling: bool = True
     skip_rejected: bool = True
+    # The cull's verdict, written where a catalogue can act on it: stars to
+    # sort by, a colour to filter on. Create-only by default, so a rating the
+    # photographer has already given is never argued with -- turning
+    # overwrite_rating on is how you ask Conrod to take over.
+    write_rating: bool = True
+    write_label: bool = True
+    overwrite_rating: bool = False
+
     min_rating: int = 0            # 0 = any; 1-5 = that many stars or better
     require_label: str = ""        # e.g. "Green" to keyword only that label
 

@@ -104,6 +104,17 @@ _MIGRATIONS = [
     ("detections", "clipped", "INTEGER"),
     ("detections", "rating", "REAL"),
     ("detections", "rating_verdict", "TEXT"),
+
+    # Where the sharpness is, rather than how much of it there is. A held pan
+    # has a sharp subject against a smeared background, and judged on the
+    # whole picture it is the worst frame of the set instead of the best.
+    ("detections", "panning", "INTEGER"),
+    ("detections", "background", "REAL"),
+    ("detections", "sharp_end", "TEXT"),
+
+    # The cull was a close call and a person should see the frame. Culled all
+    # the same -- the alternative is a shoot that quietly loses its panners.
+    ("detections", "uncertain", "INTEGER"),
 ]
 
 
@@ -309,26 +320,35 @@ def _path_key(path) -> str:
 
 def set_quality(conn: sqlite3.Connection, det_id: int, *,
                 sharpness: float, sharpness_verdict: str,
-                clipped: int, rating: float, rating_verdict: str) -> None:
+                clipped: int, rating: float, rating_verdict: str,
+                panning: bool = False, sharp_end: str = "even",
+                background: float = -1.0, uncertain: bool = False) -> None:
     """Everything known about the picture, as opposed to what is in it."""
     conn.execute(
         """UPDATE detections
               SET sharpness=?, sharpness_verdict=?, clipped=?,
-                  rating=?, rating_verdict=?
+                  rating=?, rating_verdict=?, panning=?, background=?,
+                  sharp_end=?, uncertain=?
             WHERE id=?""",
-        (sharpness, sharpness_verdict, clipped, rating, rating_verdict, det_id))
+        (sharpness, sharpness_verdict, clipped, rating, rating_verdict,
+         int(bool(panning)), background, sharp_end, int(bool(uncertain)),
+         det_id))
 
 
-def cull_detection(conn: sqlite3.Connection, det_id: int, reason: str) -> None:
+def cull_detection(conn: sqlite3.Connection, det_id: int, reason: str,
+                   uncertain: bool = False) -> None:
     """Cut a detection before it is identified, and say why.
 
     Rejected rather than deleted: the crop and its score stay, so the
     Rejected view can show what was cut and put anything back that should not
     have been.
+
+    ``uncertain`` marks a cull that was a close call, so review can surface it
+    rather than leaving it to be found by someone counting their frames.
     """
     conn.execute(
-        "UPDATE detections SET rejected=1, cull_reason=? WHERE id=?",
-        (reason, det_id))
+        "UPDATE detections SET rejected=1, cull_reason=?, uncertain=? WHERE id=?",
+        (reason, int(bool(uncertain)), det_id))
 
 
 def unread_detections(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:

@@ -136,5 +136,161 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(sharpness.rate(_flat(400, 300)).verdict, "unknown")
 
 
+class PanningShots(unittest.TestCase):
+    """The frame the photographer went there to take.
+
+    A held pan is mostly blur on purpose: the background is smeared and only
+    the car is meant to be crisp. Judged on the whole picture it is the worst
+    frame of the set, and an automatic cull throws away the keepers.
+    """
+
+    @staticmethod
+    def _frame(subject_sharp: bool, background_sharp: bool, size=(600, 400)):
+        """A crop with a vehicle-sized box in it, each part blurred or not."""
+        from PIL import ImageFilter
+        rng = np.random.default_rng(7)
+        noise = rng.integers(0, 255, (size[1], size[0]), dtype=np.uint8)
+        img = Image.fromarray(noise, "L").convert("RGB")
+        box = (150, 100, 450, 300)
+
+        def maybe_blur(part, sharp):
+            return part if sharp else part.filter(ImageFilter.GaussianBlur(6))
+
+        base = maybe_blur(img, background_sharp)
+        subject = maybe_blur(img.crop(box), subject_sharp)
+        base.paste(subject, box[:2])
+        return base, box
+
+    def test_a_pan_is_recognised_and_never_culled(self) -> None:
+        image, box = self._frame(subject_sharp=True, background_sharp=False)
+        out = sharpness.measure(image, box)
+        self.assertTrue(out.panning, f"subject {out.score} background {out.background}")
+        self.assertFalse(sharpness.cullable(out, "poor"),
+                         "a held pan was offered up for automatic culling")
+
+    def test_a_genuinely_missed_frame_is_not_a_pan(self) -> None:
+        """Everything moved, not just the background."""
+        image, box = self._frame(subject_sharp=False, background_sharp=False)
+        out = sharpness.measure(image, box)
+        self.assertFalse(out.panning)
+        self.assertTrue(sharpness.cullable(out, "poor"))
+
+    def test_a_sharp_car_against_a_sharp_background_is_not_a_pan(self) -> None:
+        image, box = self._frame(subject_sharp=True, background_sharp=True)
+        self.assertFalse(sharpness.measure(image, box).panning)
+
+    def test_the_background_does_not_decide_the_subject_score(self) -> None:
+        """The complaint this was built for.
+
+        The same car, once against a smeared background and once against a
+        sharp one. The subject is identical, so its score must be too.
+        """
+        blurred_bg, box = self._frame(subject_sharp=True, background_sharp=False)
+        sharp_bg, _ = self._frame(subject_sharp=True, background_sharp=True)
+        a = sharpness.measure(blurred_bg, box).score
+        b = sharpness.measure(sharp_bg, box).score
+        self.assertAlmostEqual(a, b, delta=0.05,
+                               msg="the background moved the subject's score")
+
+    def test_a_soft_car_is_not_rescued_by_a_sharp_background(self) -> None:
+        """The larger half of the same defect, and the more dangerous one.
+
+        A high percentile already leans towards the sharpest tiles, so a
+        smeared background costs a good pan comparatively little. What it
+        cannot survive is the reverse: a soft car in front of a sharp fence
+        or a banner, where the background *is* the sharpest thing in the crop
+        and the frame gets called sharp on the strength of it.
+
+        Measured across 1,256 real detections, the whole-crop score ran as
+        much as 0.30 above the subject's own, and the rating changed on about
+        one detection in five.
+        """
+        image, box = self._frame(subject_sharp=False, background_sharp=True)
+        whole = sharpness.measure(image).score
+        subject = sharpness.measure(image, box).score
+        # Relative, not absolute: the thresholds were calibrated on real
+        # photographs, and a synthetic noise target sits nowhere near where a
+        # car does on the scale. What is being asserted is the direction of
+        # the error, which is the part that was wrong.
+        self.assertGreater(whole, subject + 0.15,
+                           "the sharp background did not contaminate the old measure")
+
+
+class DoubtfulCulls(unittest.TestCase):
+    """Cull, but say so when it was a close call."""
+
+    def test_a_comfortable_cull_is_not_flagged(self) -> None:
+        result = sharpness.Sharpness(score=0.02, verdict="blurred")
+        self.assertFalse(sharpness.doubtful(result, "poor", 0.25))
+
+    def test_a_score_on_the_line_is_flagged(self) -> None:
+        result = sharpness.Sharpness(score=0.26, verdict="blurred")
+        self.assertTrue(sharpness.doubtful(result, "poor", 0.25))
+
+    def test_one_sharp_end_is_flagged(self) -> None:
+        """A pan held on the nose averages out to blurred over the whole car."""
+        result = sharpness.Sharpness(score=0.10, verdict="blurred",
+                                     bands=(0.55, 0.20, 0.05), sharp_end="left")
+        self.assertTrue(result.partly_sharp)
+        self.assertTrue(sharpness.doubtful(result, "poor", 0.25))
+
+    def test_frames_that_are_kept_are_never_flagged(self) -> None:
+        """Uncertainty is only interesting about a frame being thrown away.
+
+        Flagging everything near any threshold queued two thirds of a real
+        shoot for review, which is the same as flagging nothing.
+        """
+        result = sharpness.Sharpness(score=0.53, verdict="soft",
+                                     bands=(0.7, 0.3, 0.2), sharp_end="left")
+        self.assertFalse(sharpness.doubtful(result, "good", 0.25))
+        self.assertFalse(sharpness.doubtful(result, "fair", 0.25))
+
+
+class StarsAndLabels(unittest.TestCase):
+    """The verdict as a catalogue understands it."""
+
+    def test_the_bands_run_the_right_way(self) -> None:
+        self.assertGreater(sharpness.stars_for(0.9), sharpness.stars_for(0.4))
+        self.assertEqual(sharpness.stars_for(0.0), 1)
+
+    def test_five_stars_is_never_given_automatically(self) -> None:
+        """Whether the moment is any good is not a focus measurement."""
+        self.assertLessEqual(sharpness.stars_for(1.0), 4)
+
+    def test_colours_match_the_verdicts(self) -> None:
+        self.assertEqual(sharpness.label_for("good"), "Green")
+        self.assertEqual(sharpness.label_for("poor"), "Red")
+        self.assertEqual(sharpness.label_for("fair"), "Yellow")
+
+
+class WhereTheSharpnessIs(unittest.TestCase):
+    """Which end of the car is sharp -- in image terms, not front and back."""
+
+    @staticmethod
+    def _split(left_sharp: bool):
+        from PIL import ImageFilter
+        rng = np.random.default_rng(11)
+        noise = rng.integers(0, 255, (300, 600), dtype=np.uint8)
+        img = Image.fromarray(noise, "L").convert("RGB")
+        half = img.crop((0, 0, 300, 300) if left_sharp else (300, 0, 600, 300))
+        blurred = img.filter(ImageFilter.GaussianBlur(7))
+        blurred.paste(half, (0, 0) if left_sharp else (300, 0))
+        return blurred
+
+    def test_a_sharp_left_end_is_reported(self) -> None:
+        out = sharpness.measure(self._split(True), (0, 0, 600, 300))
+        self.assertEqual(out.sharp_end, "left")
+
+    def test_a_sharp_right_end_is_reported(self) -> None:
+        out = sharpness.measure(self._split(False), (0, 0, 600, 300))
+        self.assertEqual(out.sharp_end, "right")
+
+    def test_an_evenly_sharp_car_says_even(self) -> None:
+        rng = np.random.default_rng(3)
+        noise = rng.integers(0, 255, (300, 600), dtype=np.uint8)
+        img = Image.fromarray(noise, "L").convert("RGB")
+        self.assertEqual(sharpness.measure(img, (0, 0, 600, 300)).sharp_end, "even")
+
+
 if __name__ == "__main__":
     unittest.main()

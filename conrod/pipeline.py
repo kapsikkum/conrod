@@ -246,21 +246,33 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                     # edge is arithmetic; the vision model is seconds, and no
                     # amount of it will name a car that is not there to be
                     # seen or is half outside the picture.
-                    focus = _focus_of(det.crop_path, settings)
+                    focus = _focus_of(det.crop_path, settings,
+                                      box=det.box, crop_box=det.crop_box)
                     edges = framing.assess(det.box, frame_w, frame_h)
                     if focus:
                         rating = focus.score * edges.factor
                         verdict = sharpness_mod.rating_for(
                             rating, settings.sharp_at, settings.blurred_below)
+                        unsure = sharpness_mod.doubtful(
+                            focus, verdict, settings.blurred_below)
                         store.set_quality(
                             conn, det_id, sharpness=focus.score,
                             sharpness_verdict=focus.verdict, clipped=edges.sides,
-                            rating=rating, rating_verdict=verdict)
+                            rating=rating, rating_verdict=verdict,
+                            panning=focus.panning, sharp_end=focus.sharp_end,
+                            background=focus.background, uncertain=unsure)
                         box["focus"] = focus.verdict
                         box["rating"] = verdict
-                        if verdict == "poor" and settings.cull_blurred:
-                            store.cull_detection(conn, det_id,
-                                                 _cull_reason(focus, edges))
+                        if focus.panning:
+                            box["panning"] = True
+                        # A held pan is never culled automatically, and a
+                        # close call is culled but flagged, so it turns up in
+                        # review instead of vanishing.
+                        if (settings.cull_blurred
+                                and sharpness_mod.cullable(focus, verdict)):
+                            store.cull_detection(
+                                conn, det_id, _cull_reason(focus, edges),
+                                uncertain=unsure)
                             culled += 1
                             box["culled"] = True
                             continue
@@ -538,11 +550,22 @@ def _cull_reason(focus, edges) -> str:
         return framing.describe(edges)
     if edges.cut_off:
         return f"blurred, and {framing.describe(edges)}"
+    # Where the softness sits is the difference between a missed frame and a
+    # pan that was held on the wrong end of the car, and only one of those is
+    # worth a second look.
+    if focus.partly_sharp and focus.sharp_end != "even":
+        return f"soft overall, though the {focus.sharp_end} is sharper"
     return "too blurred to identify"
 
 
-def _focus_of(crop_path, settings):
+def _focus_of(crop_path, settings, box=None, crop_box=None):
     """Subject sharpness for one crop, or nothing if it cannot be judged.
+
+    ``box`` and ``crop_box`` are the vehicle and the padded region the crop
+    was cut from, both in frame coordinates. Given them, sharpness is measured
+    on the vehicle rather than on the whole crop -- which is what stops a
+    smeared background from condemning a good pan, and a sharp fence behind a
+    soft car from rescuing a bad frame.
 
     Never worth failing a detection over: an unreadable crop is a detection
     with no score, not a scan that stops.
@@ -550,7 +573,17 @@ def _focus_of(crop_path, settings):
     try:
         with Image.open(crop_path) as crop:
             crop.load()
-            return sharpness_mod.rate(crop, settings)
+            inner = None
+            if box is not None and crop_box is not None:
+                cx1, cy1, cx2, cy2 = crop_box
+                span = cx2 - cx1
+                if span > 0:
+                    # The crop may have been resized on the way to disk, so
+                    # the box is scaled by what actually came back.
+                    scale = crop.width / span
+                    inner = ((box[0] - cx1) * scale, (box[1] - cy1) * scale,
+                             (box[2] - cx1) * scale, (box[3] - cy1) * scale)
+            return sharpness_mod.rate(crop, settings, box=inner)
     except Exception:
         return None
 
@@ -657,13 +690,17 @@ def _analysis_worker(work, settings: Settings, counters: dict,
         conn.close()
 
 
+# Every vehicle of the job, culled ones included. The cull's verdict is a
+# rating and a colour label, and a frame that was culled is exactly the frame
+# that needs to arrive in the catalogue marked red -- so it cannot be filtered
+# out of the write the way it used to be.
 WRITE_QUERY = """
-SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes
+SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
+       d.rejected AS rejected, d.rating AS rating,
+       d.rating_verdict AS rating_verdict, d.panning AS panning
   FROM images i
   JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
-   AND d.rejected = 0
-   AND d.attributes IS NOT NULL
  ORDER BY i.id, d.id
 """
 
@@ -673,28 +710,54 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
     """Push everything read off each frame's vehicles into XMP."""
     conn = store.connect()
     try:
-        by_image: dict[int, tuple[Path, list[VehicleAnalysis]]] = {}
+        by_image: dict[int, dict] = {}
         for row in conn.execute(WRITE_QUERY, (job_id,)).fetchall():
-            entry = by_image.setdefault(row["image_id"], (Path(row["path"]), []))
-            entry[1].append(VehicleAnalysis.from_json(row["attributes"]))
+            entry = by_image.setdefault(
+                row["image_id"], {"path": Path(row["path"]), "analyses": [],
+                                  "best": None, "panning": False})
+            # Keywords come only from vehicles that survived and were read.
+            if not row["rejected"] and row["attributes"]:
+                entry["analyses"].append(
+                    VehicleAnalysis.from_json(row["attributes"]))
+            # The rating is the best vehicle in the frame: a photograph is
+            # kept for its best subject, not marked down for a blurred car
+            # that happened to be in the background of a good one.
+            if row["rating"] is not None:
+                if entry["best"] is None or row["rating"] > entry["best"]:
+                    entry["best"] = row["rating"]
+            entry["panning"] = entry["panning"] or bool(row["panning"])
 
         written = failed = skipped = 0
         with ExifTool() as tool:
-            for index, (image_id, (path, analyses)) in enumerate(
-                    by_image.items(), start=1):
+            for index, (image_id, entry) in enumerate(by_image.items(), start=1):
+                path, analyses = entry["path"], entry["analyses"]
                 words = keywords_mod.for_frame(analyses, settings, number_map)
-                if not words:
+                rating = label = None
+                if entry["best"] is not None:
+                    verdict = sharpness_mod.rating_for(
+                        entry["best"], settings.sharp_at, settings.blurred_below)
+                    rating = sharpness_mod.stars_for(entry["best"])
+                    label = sharpness_mod.label_for(verdict)
+                if not words and rating is None:
                     skipped += 1
                     continue
                 if dry_run:
+                    said = ", ".join(words) if words else "(no keywords)"
+                    if label:
+                        # Spelled out rather than drawn. This line reaches a
+                        # console, and a Windows console is cp1252: a star
+                        # glyph raises UnicodeEncodeError and takes the whole
+                        # write down with it.
+                        said += f"  [{label}, {rating} stars]"
                     on_progress({"stage": "write", "done": index,
                                  "total": len(by_image),
-                                 "message": f"{path.name}: {', '.join(words)}"})
+                                 "message": f"{path.name}: {said}"})
                     continue
                 caption = (keywords_mod.caption_for(analyses)
                            if settings.write_caption else None)
                 result = write_keywords(tool, path, words, settings,
-                                        caption=caption)
+                                        caption=caption, rating=rating,
+                                        label=label)
                 if result.ok:
                     written += 1
                     conn.execute("UPDATE images SET written_at=? WHERE id=?",

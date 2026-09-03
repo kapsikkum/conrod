@@ -30,10 +30,17 @@ def sidecar_for(image: Path) -> Path:
 
 
 def write_keywords(tool: ExifTool, image: Path, keywords: Sequence[str],
-                   settings: Settings, caption: str | None = None) -> WriteResult:
-    """Write one frame's keywords. Returns a result rather than raising."""
+                   settings: Settings, caption: str | None = None,
+                   rating: int | None = None,
+                   label: str | None = None) -> WriteResult:
+    """Write one frame's keywords, and how good the frame is.
+
+    ``rating`` and ``label`` carry the cull's verdict into the catalogue,
+    where it can actually be acted on: stars to sort by and a colour to
+    filter on, rather than a number in a database only Conrod can read.
+    """
     keywords = [k for k in dict.fromkeys(keywords) if k]
-    if not keywords:
+    if not keywords and rating is None and label is None:
         return WriteResult(image, image, [], True, "no keywords")
 
     is_jpeg = image.suffix.lower() in JPEG_SUFFIXES
@@ -47,6 +54,15 @@ def write_keywords(tool: ExifTool, image: Path, keywords: Sequence[str],
             if not created:
                 return WriteResult(image, target, keywords, False,
                                    "could not create XMP sidecar")
+
+    if not keywords:
+        # Nothing to keyword, but there is still a verdict to record: a frame
+        # the cull dropped has no vehicle worth naming and is exactly the one
+        # that needs to arrive in the catalogue marked red. Running the
+        # keyword command with no keywords in it reported failure for every
+        # such frame while the label was in fact written.
+        ok = _write_verdict(tool, target, rating, label, is_jpeg, settings)
+        return WriteResult(image, target, [], ok, "rating only")
 
     tags = ["XMP-dc:Subject", "XMP-lr:HierarchicalSubject"]
     if is_jpeg:
@@ -70,7 +86,52 @@ def write_keywords(tool: ExifTool, image: Path, keywords: Sequence[str],
 
     if caption:
         _write_caption(tool, target, caption, is_jpeg, settings)
+    if rating is not None or label is not None:
+        _write_verdict(tool, target, rating, label, is_jpeg, settings)
     return WriteResult(image, target, keywords, ok, output.strip())
+
+
+def _write_verdict(tool: ExifTool, target: Path, rating: int | None,
+                   label: str | None, is_jpeg: bool, settings: Settings) -> bool:
+    """Put the cull's judgement where a photographer already looks for it.
+
+    Separate from the keyword write for the same reason the caption is: these
+    are single values rather than lists, so writing one replaces what is
+    there. That matters more here than anywhere else in this file -- a rating
+    is often the photographer's own first pass, and overwriting it would
+    destroy an afternoon's work without saying so.
+
+    So unless told otherwise Conrod only fills in what is missing. The rating
+    cannot use exiftool's create-only mode to decide that, because a camera
+    writes ``Rating=0`` meaning *unrated*: the tag is present, create-only
+    skips it, and the star rating silently never appears. Zero is therefore
+    treated as absent, which is what every catalogue means by it.
+    """
+    keep = not getattr(settings, "overwrite_rating", False)
+    wrote = False
+    base = ["-overwrite_original", "-charset", "filename=utf8"]
+
+    if rating is not None and getattr(settings, "write_rating", True):
+        args = list(base)
+        if keep:
+            # Write only where the frame is unrated. "0" is unrated.
+            args += ["-if", 'not $Rating or $Rating eq "0"']
+        args.append(f"-XMP:Rating={rating}")
+        if is_jpeg:
+            args.append(f"-EXIF:Rating={rating}")
+        args.append(str(target))
+        out = tool.execute(*args)
+        wrote = wrote or "1 image files updated" in out
+
+    if label is not None and getattr(settings, "write_label", True):
+        args = list(base)
+        if keep:
+            args += ["-wm", "cg"]      # a label has no "unset but present" value
+        args += [f"-XMP:Label={label}", str(target)]
+        out = tool.execute(*args)
+        wrote = wrote or "1 image files updated" in out
+
+    return wrote
 
 
 def _write_caption(tool: ExifTool, target: Path, caption: str, is_jpeg: bool,

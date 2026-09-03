@@ -1153,16 +1153,31 @@ function card(item) {
   // faults with different fixes -- a frame cut in half is often pin sharp.
   const verdict = item.rating_verdict || item.sharpness_verdict;
   if (verdict && verdict !== "unknown") {
-    const why = [`sharpness ${(item.sharpness || 0).toFixed(2)}`];
+    const why = [`subject sharpness ${(item.sharpness || 0).toFixed(2)}`];
+    if (item.background >= 0) why.push(`background ${item.background.toFixed(2)}`);
     if (item.clipped) {
       why.push(item.clipped === 1 ? "touches the frame edge"
                                   : `cut off on ${item.clipped} edges`);
     }
+    if (item.sharp_end && item.sharp_end !== "even") {
+      why.push(`sharpest towards the ${item.sharp_end}`);
+    }
     node.append(el("span", {
       className: "focus " + verdict,
-      textContent: verdict,
+      textContent: item.stars ? "★".repeat(item.stars) : verdict,
       title: `${why.join(" · ")} — measured on the vehicle, not the whole frame`,
     }));
+    // The card takes the colour it will carry into the catalogue, so the
+    // grid can be read at a glance the way a filmstrip is.
+    node.classList.add(`rated-${verdict}`);
+  }
+
+  // A held pan: subject sharp, background smeared on purpose. Never culled
+  // automatically, and worth saying out loud, because the numbers underneath
+  // it look exactly like a frame that was simply missed.
+  if (item.panning) {
+    node.append(el("span", { className: "focus panning", textContent: "panned",
+      title: "Subject sharp against a blurred background — kept, never auto-culled" }));
   }
 
   // Cut by Conrod, not by a person. Saying which is the difference between

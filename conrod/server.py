@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from . import keywords as keywords_mod
 from . import pipeline, setup_check, store, watch
+from . import sharpness as sharpness_mod
 from .analyze import VehicleAnalysis
 from .config import DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES, Settings
 from .mapping import NumberMap
@@ -973,7 +974,7 @@ def delete_job(job_id: int) -> dict:
 def job_summary(job_id: int) -> dict:
     settings: Settings = _state["settings"]
     with store.session() as conn:
-        conn.create_function("_needs_review", 4, _needs_review)
+        conn.create_function("_needs_review", 5, _needs_review)
         job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not job:
             raise HTTPException(404, "no such job")
@@ -986,7 +987,7 @@ def job_summary(job_id: int) -> dict:
                  SUM(CASE WHEN d.rejected = 1 THEN 1 END)            AS rejected,
                  SUM(CASE WHEN d.reviewed = 1 THEN 1 END)            AS reviewed,
                  SUM(CASE WHEN _needs_review(d.number_conf, d.reviewed,
-                                             d.rejected, :thresh) = 1
+                                             d.rejected, d.uncertain, :thresh) = 1
                           THEN 1 END)                                AS to_review
                FROM detections d JOIN images i ON i.id = d.image_id
               WHERE i.job_id = :job_id""",
@@ -1028,6 +1029,7 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
        d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
        d.cull_reason, d.clipped, d.rating, d.rating_verdict,
+       d.panning, d.background, d.sharp_end, d.uncertain,
        i.path AS image_path, i.id AS image_id, i.camera, i.burst_key
   FROM detections d
   JOIN images i ON i.id = d.image_id
@@ -1050,7 +1052,8 @@ def detections(
 
     if view == "review":
         clauses.append(
-            "_needs_review(d.number_conf, d.reviewed, d.rejected, :thresh) = 1"
+            "_needs_review(d.number_conf, d.reviewed, d.rejected, d.uncertain,"
+            " :thresh) = 1"
         )
         params["thresh"] = settings.ocr_accept_confidence
     elif view == "number":
@@ -1076,7 +1079,7 @@ def detections(
     sql += " ORDER BY d.number_conf ASC, d.id ASC LIMIT :limit OFFSET :offset"
 
     with store.session() as conn:
-        conn.create_function("_needs_review", 4, _needs_review)
+        conn.create_function("_needs_review", 5, _needs_review)
         rows = conn.execute(sql, params).fetchall()
         count_sql = ("SELECT COUNT(*) FROM detections d "
                      "JOIN images i ON i.id=d.image_id WHERE i.job_id = :job_id")
@@ -1125,6 +1128,17 @@ def detections(
         item["cull_reason"] = item.get("cull_reason") or ""
         item["rating_verdict"] = item.get("rating_verdict") or ""
         item["clipped"] = item.get("clipped") or 0
+        # Where the sharpness is, not just how much. A pan is a keeper whose
+        # numbers look like a reject, so the card has to be able to say so.
+        item["panning"] = bool(item.get("panning"))
+        item["sharp_end"] = item.get("sharp_end") or "even"
+        item["background"] = item.get("background")
+        item["uncertain"] = bool(item.get("uncertain"))
+        # The stars the catalogue will get, so the card and the sidecar
+        # cannot disagree about how good the frame is.
+        rating_value = item.get("rating")
+        item["stars"] = (None if rating_value is None
+                         else sharpness_mod.stars_for(rating_value))
         try:
             item["second_look"] = bool(json.loads(raw_attributes or "{}")
                                        .get("group_second_look"))
@@ -1135,14 +1149,22 @@ def detections(
     return {"total": total, "items": items}
 
 
-def _needs_review(number_conf, reviewed, rejected, threshold) -> int:
+def _needs_review(number_conf, reviewed, rejected, uncertain, threshold) -> int:
     """A detection a human should still look at.
 
     Registered as a SQL function so the summary count and the review grid
     cannot drift apart — they were inconsistent when this logic was duplicated.
+
+    A culled frame normally leaves review: it has been dealt with. The
+    exception is a cull the measurement was not sure about -- a pan held on
+    one end of the car reads as blurred when it is averaged over the whole
+    vehicle, and a shoot that silently loses those is worse than one that
+    culls nothing. Those come back into review until someone has looked.
     """
-    if reviewed or rejected:
+    if reviewed:
         return 0
+    if rejected:
+        return 1 if uncertain else 0
     return 1 if (number_conf is None or number_conf < (threshold or 0.8)) else 0
 
 
