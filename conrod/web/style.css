@@ -423,7 +423,10 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
 .scanner.busy .sweep { opacity: 1; animation: scan-sweep 1.9s linear infinite; }
 @keyframes scan-sweep { from { left: 0%; } to { left: 100%; } }
 
-.overlay { position: absolute; inset: 0; pointer-events: none; }
+/* Geometry is set by fitOverlay() in app.js so the boxes track the
+   letterboxed photo rather than the panel around it. */
+.overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+           pointer-events: none; }
 .overlay .box {
   position: absolute; border: 2px solid var(--scan);
   box-shadow: 0 0 0 1px rgba(0,0,0,.35);
@@ -561,3 +564,16 @@ button.small { padding: 4px 10px; font-size: 12px; }
 .version-box .muted { margin: 3px 0 0; font-size: 12px; }
 .version-actions { display: flex; gap: 8px; flex: none; }
 .version-box.update-available { border-color: var(--accent); }
+
+/* The measured paint colour, shown beside the name the model gave it. A
+   square of the actual colour settles "is this really blue?" instantly,
+   which the word on its own never did. */
+.swatch {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border-radius: 3px;
+  vertical-align: baseline;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
