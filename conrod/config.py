@@ -160,6 +160,33 @@ class Settings:
     # canonical name with a text-only call. One call per vehicle, not per
     # frame, and it can only choose among names that were actually read.
     normalise_names: bool = True
+
+    # --- bursts and sharpness ---
+    # Which body took each frame and which run of frames it belongs to. Two
+    # shooters interleave into one folder, so this is what makes "the same
+    # burst" mean anything -- see bursts.py.
+    # When a burst cannot agree what the vehicle is, show the model its
+    # sharpest frames together rather than trusting any single blurred one.
+    burst_second_look: bool = True
+    group_by_burst: bool = True
+    burst_gap: float = 4.0
+    # Where the subject sharpness score lands a frame.
+    #
+    # Set from 280 real crops of a roadside session rather than guessed. Real
+    # photographs score well below synthetic test targets -- a car is mostly
+    # smooth painted panel -- so thresholds picked on synthetic images called
+    # four per cent of a shoot sharp and forty per cent unusable.
+    #
+    # Placed by looking at the pictures at each decile. Below 0.25 the
+    # subject is genuinely gone; above 0.52 it is crisp. The wide band
+    # between them is where the good panning shots live, and calling those
+    # anything worse than "soft" would throw away the keepers.
+    #
+    # Still a per-shooter number: it depends on the lens, the light and how
+    # you pan. The raw score is stored beside the verdict, so a shoot can be
+    # re-sorted on a new threshold without re-reading a single file.
+    sharp_at: float = 0.52
+    blurred_below: float = 0.25
     identify_make_model: bool = True
     identify_colour: bool = True
     identify_team: bool = True

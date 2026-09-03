@@ -9,6 +9,7 @@ interrupted and resumed without redoing work.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -82,6 +83,16 @@ _MIGRATIONS = [
     ("detections", "group_agreement", "REAL"),
     ("detections", "colour_hex", "TEXT"),
     ("detections", "group_colour_hex", "TEXT"),
+    # Which body shot it and which burst it belongs to. Two shooters at one
+    # event interleave into a single folder, so neither filename nor
+    # timestamp alone identifies a run of frames -- see bursts.py.
+    ("images", "camera", "TEXT"),
+    ("images", "burst_key", "INTEGER"),
+    ("images", "taken_at", "REAL"),
+    # How sharp the subject is, measured on the crop rather than the frame,
+    # so a panning shot is not marked down for the blur that makes it good.
+    ("detections", "sharpness", "REAL"),
+    ("detections", "sharpness_verdict", "TEXT"),
 ]
 
 
@@ -233,18 +244,56 @@ def set_number(conn: sqlite3.Connection, det_id: int, number: str | None,
 
 
 def set_analysis(conn: sqlite3.Connection, det_id: int, analysis,
-                 colour_hex: str | None = None) -> None:
+                 colour_hex: str | None = None,
+                 sharpness: float | None = None,
+                 sharpness_verdict: str | None = None) -> None:
     """Store a completed VehicleAnalysis against a detection."""
     conn.execute(
         """UPDATE detections
               SET number=?, number_source=?, number_conf=?,
                   plate=?, plate_state=?, plate_conf=?, attributes=?,
-                  colour_hex=COALESCE(?, colour_hex)
+                  colour_hex=COALESCE(?, colour_hex),
+                  sharpness=COALESCE(?, sharpness),
+                  sharpness_verdict=COALESCE(?, sharpness_verdict)
             WHERE id=?""",
         (analysis.race_number, analysis.number_source, analysis.number_conf,
          analysis.plate, analysis.plate_state, analysis.plate_conf,
-         analysis.to_json(), colour_hex, det_id),
+         analysis.to_json(), colour_hex, sharpness, sharpness_verdict, det_id),
     )
+
+
+def set_frame_origin(conn: sqlite3.Connection, job_id: int,
+                     frames: "list") -> int:
+    """Record which camera took each frame and which burst it belongs to.
+
+    Written in one transaction after the folder is read, before any frame is
+    analysed, so grouping and the review screen can both lean on it. Frames
+    the scan has never heard of are ignored rather than inserted: this only
+    annotates, it does not decide what is in the job.
+    """
+    # Matched on a normalised path, not the string. exiftool reports
+    # SourceFile with forward slashes and the database holds what Windows
+    # gave us, so comparing them directly matched nothing at all -- and
+    # silently, because an UPDATE that hits no rows is not an error. Every
+    # burst was computed correctly and then thrown away.
+    known = {_path_key(row["path"]): row["id"] for row in conn.execute(
+        "SELECT id, path FROM images WHERE job_id=?", (job_id,))}
+
+    rows = []
+    for frame in frames:
+        image_id = known.get(_path_key(frame.path))
+        if image_id is not None:
+            rows.append((frame.camera, frame.burst, frame.taken, image_id))
+    if not rows:
+        return 0
+    conn.executemany(
+        "UPDATE images SET camera=?, burst_key=?, taken_at=? WHERE id=?", rows)
+    conn.commit()
+    return len(rows)
+
+
+def _path_key(path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
 
 
 def unread_detections(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:

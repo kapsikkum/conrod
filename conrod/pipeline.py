@@ -18,11 +18,13 @@ from typing import Callable, Iterable
 import httpx
 from PIL import Image
 
+from . import bursts
 from . import colour as colour_mod
 from . import culling
 from . import detect as detect_mod
 from . import keywords as keywords_mod
 from . import grouping
+from . import sharpness as sharpness_mod
 from . import store, vlm
 from .analyze import VehicleAnalysis, analyze
 from .config import CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES, RAW_SUFFIXES, Settings
@@ -131,6 +133,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             store.set_job_status(conn, job_id, "analysed")
             conn.commit()
             return JobSummary(job_id, 0, 0, 0)
+
+        _record_origins(conn, job_id, files, on_progress, settings)
 
         previews = _prepare_previews(files, on_progress, settings)
 
@@ -334,6 +338,38 @@ def _safely(fn, *args) -> None:
         pass
 
 
+def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
+    """Work out which camera took each frame and which burst it belongs to.
+
+    One exiftool pass over the whole shoot, before anything is analysed. Two
+    shooters interleave into one folder and neither the filenames nor the
+    timestamps separate them on their own, so this is what makes "the same
+    run of frames" mean anything at all -- see bursts.py.
+
+    Advisory, not required: a folder of files with no EXIF at all still
+    scans, it just has one camera and a burst per frame.
+    """
+    if not getattr(settings, "group_by_burst", True):
+        return
+    on_progress({"stage": "cameras", "message": "reading camera and capture times"})
+    try:
+        with ExifTool() as tool:
+            rows = tool.read_tags(list(files), list(bursts.TAGS))
+    except Exception as exc:                      # exiftool missing or unhappy
+        on_progress({"stage": "cameras",
+                     "message": f"could not read capture times: {exc}"})
+        return
+
+    frames = bursts.describe(rows, fallback="camera",
+                             gap=getattr(settings, "burst_gap", bursts.BURST_GAP_SECONDS))
+    store.set_frame_origin(conn, job_id, frames)
+    cameras = {f.camera for f in frames}
+    runs = len({f.burst for f in frames})
+    on_progress({"stage": "cameras",
+                 "message": f"{runs} burst{'' if runs == 1 else 's'} from "
+                            f"{len(cameras)} camera{'' if len(cameras) == 1 else 's'}"})
+
+
 def _analysis_worker(work, settings: Settings, counters: dict,
                      counter_lock: threading.Lock, errors: list[str],
                      on_progress: Progress) -> None:
@@ -363,7 +399,16 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                         swatch = colour_mod.dominant(crop)
                     except Exception:
                         swatch = None
-                store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
+                    # Measured on the crop, which is the whole point: a
+                    # panning shot is mostly blur on purpose and a
+                    # whole-frame measure calls the best pictures the worst.
+                    try:
+                        focus = sharpness_mod.rate(crop, settings)
+                    except Exception:
+                        focus = sharpness_mod.Sharpness()
+                store.set_analysis(conn, det_id, analysis, colour_hex=swatch,
+                                   sharpness=focus.score if focus else None,
+                                   sharpness_verdict=focus.verdict if focus else None)
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
             except Exception as exc:
