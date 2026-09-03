@@ -107,13 +107,14 @@ def _write_verdict(tool: ExifTool, target: Path, rating: int | None,
     skips it, and the star rating silently never appears. Zero is therefore
     treated as absent, which is what every catalogue means by it.
     """
-    keep = not getattr(settings, "overwrite_rating", False)
+    keep_rating = not getattr(settings, "overwrite_rating", False)
+    keep_label = not getattr(settings, "overwrite_label", False)
     wrote = False
     base = ["-overwrite_original", "-charset", "filename=utf8"]
 
     if rating is not None and getattr(settings, "write_rating", True):
         args = list(base)
-        if keep:
+        if keep_rating:
             # Write only where the frame is unrated. "0" is unrated.
             args += ["-if", 'not $Rating or $Rating eq "0"']
         args.append(f"-XMP:Rating={rating}")
@@ -125,7 +126,7 @@ def _write_verdict(tool: ExifTool, target: Path, rating: int | None,
 
     if label is not None and getattr(settings, "write_label", True):
         args = list(base)
-        if keep:
+        if keep_label:
             args += ["-wm", "cg"]      # a label has no "unset but present" value
         args += [f"-XMP:Label={label}", str(target)]
         out = tool.execute(*args)

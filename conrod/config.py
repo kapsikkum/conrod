@@ -220,9 +220,16 @@ class Settings:
     # sort by, a colour to filter on. Create-only by default, so a rating the
     # photographer has already given is never argued with -- turning
     # overwrite_rating on is how you ask Conrod to take over.
+    #
+    # The label needs its own switch rather than sharing the rating's. A
+    # shoot that has been through any first pass already carries a colour on
+    # every frame, and create-only then means Conrod's verdict silently never
+    # lands -- the cull appears to do nothing. Which of the two passes wins is
+    # the photographer's call, so it is a setting and not a guess.
     write_rating: bool = True
     write_label: bool = True
     overwrite_rating: bool = False
+    overwrite_label: bool = False
 
     min_rating: int = 0            # 0 = any; 1-5 = that many stars or better
     require_label: str = ""        # e.g. "Green" to keyword only that label

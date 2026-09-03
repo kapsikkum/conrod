@@ -316,6 +316,16 @@ const SETTING_GROUPS = [
     ["vlm_input_edge", "Input size (px)", "number", null, ""],
     ["identify_team", "Read team and sponsors", "bool", null, ""],
   ]],
+  ["Cull verdict", [
+    ["write_rating", "Write the star rating", "bool", null,
+      "Stars follow how sharp the vehicle is, not the whole frame."],
+    ["overwrite_rating", "Replace ratings I have already given", "bool", null,
+      "Off, Conrod only rates frames left unrated. A camera writes 0 for unrated, which counts as unrated."],
+    ["write_label", "Write the colour label", "bool", null,
+      "Green kept, Yellow borderline, Red culled."],
+    ["overwrite_label", "Replace labels I have already given", "bool", null,
+      "Off, a frame that already carries any colour keeps it -- so on a shoot you have culled once, Conrod's colours will not appear."],
+  ]],
   ["Output and speed", [
     ["write_sidecar_for_raw", "Write .xmp sidecars for RAW", "bool", null,
       "Off writes into the RAW file itself."],

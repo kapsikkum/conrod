@@ -65,6 +65,16 @@ class ExifTool:
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
+        finally:
+            # Asking exiftool to stop ends the process but leaves our two
+            # pipes open until the garbage collector gets to them. A long
+            # session opens this many times, so the handles accumulate.
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
 
     def execute(self, *args: str) -> str:
         if not self._proc or not self._proc.stdin or not self._proc.stdout:
