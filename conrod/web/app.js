@@ -598,6 +598,12 @@ The download is checked against the checksum published with the release before a
   pollUpdate();
 };
 
+function etaText(seconds) {
+  if (!seconds || seconds < 0) return "";
+  if (seconds < 90) return `, ${Math.round(seconds)}s left`;
+  return `, ${Math.round(seconds / 60)} min left`;
+}
+
 async function pollUpdate() {
   try {
     const u = await api("/api/update/status");
@@ -605,6 +611,7 @@ async function pollUpdate() {
     $("#update-fill").style.width = `${pct}%`;
     $("#update-status").textContent = u.total
       ? `${u.message} — ${(u.done / 1e6).toFixed(0)} of ${(u.total / 1e6).toFixed(0)} MB`
+        + (u.rate ? ` at ${(u.rate / 1e6).toFixed(1)} MB/s${etaText(u.eta)}` : "")
       : u.message;
     if (u.state === "error") {
       $("#btn-update-install").disabled = false;

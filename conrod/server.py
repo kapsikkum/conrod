@@ -355,9 +355,21 @@ def update_install() -> dict:
                 return
             _update["release"] = release.version
 
+            started = {"at": time.monotonic(), "from": 0, "seen": False}
+
             def progress(done: int, total: int) -> None:
-                _update.update({"done": done, "total": total,
-                                "message": f"downloading {release.version}"})
+                # Timed from the first chunk, and from the byte it started at,
+                # so a resumed download reports the speed it is getting now
+                # rather than averaging in the part it did not fetch.
+                if not started["seen"]:
+                    started.update({"at": time.monotonic(), "from": done,
+                                    "seen": True})
+                elapsed = time.monotonic() - started["at"]
+                rate = (done - started["from"]) / elapsed if elapsed > 1 else 0
+                _update.update({
+                    "done": done, "total": total, "rate": rate,
+                    "eta": int((total - done) / rate) if rate > 0 else None,
+                    "message": f"downloading {release.version}"})
 
             archive = updater.download(release, DATA_ROOT / "updates", progress)
             _update.update({"state": "installing", "message": "unpacking"})

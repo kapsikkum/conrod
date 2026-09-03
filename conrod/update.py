@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,36 +130,156 @@ def _looks_like_conrod(archive: Path) -> bool:
     return any(n.replace("\\", "/").endswith("Conrod/Conrod.exe") for n in names)
 
 
+STALL_FLOOR = 96 * 1024        # bytes/sec a healthy connection beats easily
+STALL_SECONDS = 20.0           # how long it may sit under the floor
+MAX_ATTEMPTS = 6
+
+
+def _digest_of(path: Path) -> str:
+    """Hash the finished file rather than the bytes as they arrive.
+
+    A resumed download only sees the tail, so a running hash would be of the
+    wrong thing. Reading 300MB back costs about a second and means the
+    checksum covers what is actually on disk -- including the part written
+    before some earlier attempt gave up.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tidy(into: Path, keep: str | None = None) -> int:
+    """Delete archives left behind by previous updates.
+
+    Each one is about 300MB and nothing ever removed them, so a few updates
+    quietly cost a gigabyte in the data folder.
+    """
+    freed = 0
+    for old in sorted(into.glob("Conrod-*-win64.zip")):
+        if keep and old.name == keep:
+            continue
+        try:
+            size = old.stat().st_size
+            old.unlink()
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
 def download(release: Release, into: Path, on_progress=None) -> Path:
-    """Fetch the release zip and verify it before anything unpacks it."""
+    """Fetch the release zip and verify it before anything unpacks it.
+
+    Resumable, and it gives up on a connection that has stopped making
+    progress. A single long-lived TCP flow that hits packet loss can settle
+    into a collapsed congestion window and stay there: measured here at
+    72 KB/s for the whole of a 305MB download -- about an hour and a half --
+    while a *new* connection to the very same CDN address pulled 7.6 MB/s at
+    the same moment. Waiting it out does not work, because nothing about that
+    connection is going to recover. So when throughput sits under the floor
+    for long enough, the connection is dropped and the rest is asked for with
+    a Range header, which is also what makes an interrupted update pick up
+    where it left off instead of starting the 305MB again.
+    """
     if not release.asset or not _trusted(release.asset):
         raise RuntimeError("that release has no download from GitHub")
 
     into.mkdir(parents=True, exist_ok=True)
     filename = release.asset.rsplit("/", 1)[-1]
     target = into / filename
-    digest = hashlib.sha256()
+    total = release.size or 0
+    # Before adding another 300MB, not after: the old ones are dead weight
+    # and the disk may be why this is being done at all.
+    tidy(into, keep=filename)
 
     with httpx.Client(timeout=60.0, follow_redirects=True) as client:
         expected = _expected_digest(client, release, filename)
-        with client.stream("GET", release.asset) as response:
-            response.raise_for_status()
-            total = int(response.headers.get("content-length") or release.size or 0)
-            done = 0
-            with open(target, "wb") as fh:
-                for chunk in response.iter_bytes(1 << 16):
-                    fh.write(chunk)
-                    digest.update(chunk)
-                    done += len(chunk)
-                    if on_progress:
-                        on_progress(done, total)
 
-    if expected and digest.hexdigest() != expected:
+        # Reconnecting only helps if a *different* connection would be
+        # faster. After a couple of attempts have each collapsed, the honest
+        # reading is that this link really is slow, and dropping a working
+        # download over and over would then be the bug. So the floor applies
+        # to the first attempts only.
+        give_up_on_speed = 2
+        stalls = 0
+
+        for attempt in range(MAX_ATTEMPTS):
+            done = target.stat().st_size if target.exists() else 0
+            if total and done >= total:
+                break
+
+            headers = {"Range": f"bytes={done}-"} if done else {}
+            stalled = False
+            try:
+                with client.stream("GET", release.asset, headers=headers) as response:
+                    if done and response.status_code == 416:
+                        break          # the file on disk is already complete
+                    if done and response.status_code == 200:
+                        # The range was ignored and the whole file is coming.
+                        # Start over rather than append to a prefix.
+                        done = 0
+                    response.raise_for_status()
+
+                    # Only when the release did not tell us. Taking it from
+                    # the response instead means a truncated reply redefines
+                    # the target as its own short length, and the download
+                    # then looks complete at exactly the wrong moment.
+                    if not total:
+                        length = int(response.headers.get("content-length") or 0)
+                        if length:
+                            total = done + length
+
+                    watch = stalls < give_up_on_speed
+                    window_start, window_bytes = time.monotonic(), 0
+                    with open(target, "ab" if done else "wb") as fh:
+                        for chunk in response.iter_bytes(1 << 16):
+                            fh.write(chunk)
+                            done += len(chunk)
+                            window_bytes += len(chunk)
+                            if on_progress:
+                                on_progress(done, total)
+
+                            if not watch:
+                                continue
+                            elapsed = time.monotonic() - window_start
+                            if elapsed >= STALL_SECONDS:
+                                if window_bytes / elapsed < STALL_FLOOR:
+                                    stalled = True
+                                    break
+                                window_start, window_bytes = time.monotonic(), 0
+            except httpx.HTTPError:
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(min(2 ** attempt, 10))
+                continue
+
+            if stalled:
+                stalls += 1
+                continue      # a fresh connection, resuming from `done`
+            if total and done < total:
+                # The stream ended cleanly but short -- a server that closed
+                # early, or a Content-Length smaller than the file. There is
+                # no exception to catch here, so without this check the
+                # truncated file goes straight to the checksum and the update
+                # fails with a mismatch that says nothing about the cause.
+                continue
+            break
+
+    got = target.stat().st_size if target.exists() else 0
+    if total and got < total:
+        raise RuntimeError(
+            f"the download stopped at {got // (1 << 20)} of "
+            f"{total // (1 << 20)} MB -- press Update again to resume")
+
+    if expected and _digest_of(target) != expected:
         target.unlink(missing_ok=True)
         raise RuntimeError("the download did not match the published checksum")
     if not _looks_like_conrod(target):
         target.unlink(missing_ok=True)
         raise RuntimeError("that download does not look like a Conrod build")
+    tidy(into, keep=target.name)
     return target
 
 
