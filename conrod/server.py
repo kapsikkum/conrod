@@ -140,6 +140,12 @@ def configure(settings: Settings | None = None,
               number_map: NumberMap | None = None) -> None:
     if settings is not None:
         _state["settings"] = settings
+        # Where the loaded entry list came from. main.py reads this at
+        # startup and hands us the map, but nothing told the UI which file it
+        # was, so an entry list applied to every scan was invisible in
+        # Settings -- there was no way to see what was loaded, and so no
+        # obvious way to get rid of it.
+        _state["map_path"] = settings.extra.get("map_path") or None
     if number_map is not None:
         _state["number_map"] = number_map
 
@@ -410,12 +416,19 @@ def update_settings(body: SettingsUpdate) -> dict:
         path = body.map_path.strip()
         if not path:
             _state["number_map"], _state["map_path"] = NumberMap(), None
+            # Forgetting it in memory was not enough. The path stayed in the
+            # saved settings, main.py loaded it again on the next launch, and
+            # an entry list cleared in the UI came straight back -- so a CSV
+            # loaded once could never be got rid of.
+            settings.extra.pop("map_path", None)
         else:
             try:
                 _state["number_map"] = NumberMap.load(Path(path))
                 _state["map_path"] = path
+                settings.extra["map_path"] = path
             except Exception as exc:
                 raise HTTPException(400, f"could not read that CSV: {exc}")
+        settings.save()
 
     return get_settings()
 
