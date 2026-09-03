@@ -20,10 +20,13 @@ six-thousand-frame shoot.
 from __future__ import annotations
 
 from collections import Counter
+import colorsys
 from dataclasses import dataclass, field
 
 import numpy as np
 from PIL import Image
+
+from . import normalise
 
 HASH_EDGE = 8          # 8x9 grey samples -> 64 bits of shape
 HUE_BINS = 12
@@ -86,6 +89,7 @@ class Group:
     swatch: str | None = None
     cls: str | None = None
     make: str | None = None
+    plates: set = field(default_factory=set)
 
 
 def cluster(rows: list[tuple], *, max_bits: int = 14,
@@ -119,6 +123,10 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
     Only then does shape or frame proximity decide. Without the class and
     make gates, a motorbike and a silver SUV shot moments apart were merged
     and the bike's name was written over the car.
+
+    A read plate overrides all of it, in both directions: same plate is the
+    same vehicle, different plates are different vehicles. It is the only
+    signal here that is an identity rather than a resemblance.
     """
     groups: list[Group] = []
     assignment: dict[int, int] = {}
@@ -128,14 +136,38 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
         swatch = row[3] if len(row) > 3 else None
         cls = row[4] if len(row) > 4 else None
         make = row[5] if len(row) > 5 else None
+        plate = _tidy_plate(row[6]) if len(row) > 6 else None
         if not sig:
             continue
         for group in groups:
             if frame_index in group.frames:
                 continue
+
+            # A plate is an identity, not a hint. Two crops showing the same
+            # plate are one vehicle whatever the shape, colour or gap between
+            # frames suggests, and two crops showing different plates are not
+            # one vehicle however alike they look. This settles the case the
+            # other signals kept getting wrong: a purple Falcon shot side-on
+            # in sun and from behind in shade, read as the same plate both
+            # times and as two different colours.
+            verdict = _plate_verdict(plate, group.plates)
+            if verdict is False:
+                continue
+            if verdict is True:
+                _join(group, det_id, frame_index, make, plate, assignment)
+                break
+
+            # A plate one confusable character away from one this group has
+            # already seen. Not identity, but a measurement -- and it beats
+            # the make, which is the vision model's opinion. Ranking them the
+            # other way round is circular: the model called one blue Ford a
+            # Holden, the make gate then refused the merge, and the eleven
+            # frames that read it right never got to outvote it.
+            near = _nearly_seen(plate, group.plates)
+
             if cls and group.cls and cls != group.cls:
                 continue
-            if not _same_make(make, group.make):
+            if not near and not _same_make(make, group.make):
                 continue
             if not _colour_matches(sig, group.signature, min_colour):
                 continue
@@ -143,20 +175,85 @@ def cluster(rows: list[tuple], *, max_bits: int = 14,
                 continue
             shape_agrees = _shape_distance(sig, group.signature) <= max_bits
             nearby = abs(frame_index - group.last_frame) <= frame_window
-            if shape_agrees or nearby:
-                group.members.append(det_id)
-                group.last_frame = max(group.last_frame, frame_index)
-                group.frames.add(frame_index)
-                group.make = group.make or make
-                assignment[det_id] = group.key
+            if shape_agrees or nearby or near:
+                _join(group, det_id, frame_index, make, plate, assignment)
                 break
         else:
             groups.append(Group(key=len(groups) + 1, members=[det_id],
                                 signature=sig, last_frame=frame_index,
                                 frames={frame_index}, swatch=swatch,
-                                cls=cls, make=make))
+                                cls=cls, make=make,
+                                plates={plate} if plate else set()))
             assignment[det_id] = groups[-1].key
     return assignment
+
+
+def _join(group: "Group", det_id: int, frame_index: int, make: str | None,
+          plate: str | None, assignment: dict[int, int]) -> None:
+    group.members.append(det_id)
+    group.last_frame = max(group.last_frame, frame_index)
+    group.frames.add(frame_index)
+    group.make = group.make or make
+    if plate:
+        group.plates.add(plate)
+    assignment[det_id] = group.key
+
+
+def _tidy_plate(value: str | None) -> str | None:
+    """A plate reduced to what can be compared: letters and digits only."""
+    if not value:
+        return None
+    cleaned = "".join(c for c in str(value).upper() if c.isalnum())
+    return cleaned or None
+
+
+# Character pairs a plate reader confuses. Not a general edit distance: these
+# are the substitutions that actually happen on a photographed plate, where
+# the glyph is thirty pixels wide and half of it is motion blur.
+CONFUSABLE = [set(x) for x in ("047", "8B", "0OQD", "1IL", "5S", "2Z", "6G",
+                               "VY", "MN", "CG", "UV")]
+
+
+def _near_plate(a: str, b: str) -> bool:
+    """One character apart, and that character is one a reader confuses.
+
+    A plate read as 43111J in one frame and 73111J in the next is one plate.
+    Treating those as two was the single worst thing grouping did: because a
+    plate is identity, the mismatch was proof of *different* vehicles, so one
+    car panned across twenty-seven frames became four cars -- and the eleven
+    frames that read it correctly never got to outvote the sixteen that did
+    not.
+    """
+    if len(a) != len(b):
+        return False
+    differences = [(x, y) for x, y in zip(a, b) if x != y]
+    if len(differences) != 1:
+        return False
+    x, y = differences[0]
+    return any({x, y} <= pair for pair in CONFUSABLE)
+
+
+def _nearly_seen(plate: str | None, seen: set) -> bool:
+    """Whether this plate is one confusable character from one already seen."""
+    if not plate or not seen:
+        return False
+    return any(_near_plate(plate, other) for other in seen)
+
+
+def _plate_verdict(plate: str | None, seen: set) -> bool | None:
+    """True: same vehicle. False: a different one. None: no opinion.
+
+    A near miss is deliberately not False. It is not proof of the same
+    vehicle either, so it abstains and lets the measured signals decide --
+    see the near-plate branch in cluster().
+    """
+    if not plate or not seen:
+        return None
+    if plate in seen:
+        return True
+    if _nearly_seen(plate, seen):
+        return None
+    return False
 
 
 def _same_make(a: str | None, b: str | None) -> bool:
@@ -172,21 +269,51 @@ def _same_make(a: str | None, b: str | None) -> bool:
     return a.strip().lower() == b.strip().lower()
 
 
+def _rgb(value: str) -> tuple[int, int, int] | None:
+    try:
+        return tuple(int(value[1 + i * 2:3 + i * 2], 16) for i in range(3))
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
 def _swatch_matches(a: str | None, b: str | None, limit: int) -> bool:
     """Whether two sampled paint colours are close enough to be one car.
 
+    Compared by hue rather than by distance in RGB. One purple Falcon shot
+    side-on in sun and from behind in shade sampled two colours far enough
+    apart in RGB to be rejected as different cars, when only the brightness
+    had moved -- the hue was the same purple in both.
+
     Absent on either side means "no opinion", not "no match": a crop the
-    sampler could not read should still be allowed to join on shape.
+    sampler could not read should still be allowed to join on other evidence.
     """
     if not a or not b:
         return True
-    try:
-        pa = [int(a[1 + i * 2:3 + i * 2], 16) for i in range(3)]
-        pb = [int(b[1 + i * 2:3 + i * 2], 16) for i in range(3)]
-    except (ValueError, IndexError):
+    pa, pb = _rgb(a), _rgb(b)
+    if pa is None or pb is None:
         return True
-    return sum((x - y) ** 2 for x, y in zip(pa, pb)) ** 0.5 <= limit
 
+    ha, sa, va = colorsys.rgb_to_hsv(*[c / 255 for c in pa])
+    hb, sb, vb = colorsys.rgb_to_hsv(*[c / 255 for c in pb])
+
+    # Neither has a usable hue: black, white, silver, grey. Compare how light
+    # they are instead, and generously, because exposure moves this a lot.
+    if sa < 0.18 and sb < 0.18:
+        return abs(va - vb) <= 0.45
+
+    # One is coloured and the other is not. That is a real difference.
+    if (sa < 0.18) != (sb < 0.18):
+        return False
+
+    apart = abs(ha - hb)
+    apart = min(apart, 1.0 - apart)          # hue is a circle
+    return apart <= HUE_TOLERANCE
+
+
+# How far two hues may sit apart and still be called the same paint, of 1.0
+# around the wheel. Purple in sun and purple in shade differ in brightness,
+# not in hue.
+HUE_TOLERANCE = 0.075
 
 # Below this level of agreement the group has no answer, only a disagreement.
 MIN_AGREEMENT = 0.5
@@ -204,6 +331,9 @@ class Consensus:
     race_number: str | None = None
     plate: str | None = None
     colour_hex: str | None = None   # sampled paint, not the model's word
+    team: str | None = None
+    sponsors: list[str] = field(default_factory=list)
+    livery_text: list[str] = field(default_factory=list)
     agreement: float = 0.0     # how much of the group backed the winning name
     size: int = 0
     disputed: list[str] = field(default_factory=list)
@@ -222,6 +352,27 @@ def _median_hex(values: list[str]) -> str | None:
         return None
     middle = [sorted(c)[len(c) // 2] for c in channels]
     return "#%02x%02x%02x" % tuple(middle)
+
+
+def _accumulate(members: list[dict], key: str) -> list[str]:
+    """Every distinct string any frame in the group saw, commonest first.
+
+    Order matters for keywords, and "seen in more frames" is the best
+    available proxy for "actually on the car" rather than misread once.
+    """
+    counts: Counter = Counter()
+    original: dict[str, str] = {}
+    for member in members:
+        seen = member.get(key) or []
+        if isinstance(seen, str):
+            seen = [seen]
+        for value in seen:
+            text = str(value).strip()
+            if not text:
+                continue
+            counts[text.lower()] += 1
+            original.setdefault(text.lower(), text)
+    return [original[k] for k, _ in counts.most_common()]
 
 
 def _vote(values: list[str | None]) -> tuple[str | None, float]:
@@ -293,6 +444,15 @@ def consensus(members: list[dict]) -> Consensus:
     if swatches:
         out.colour_hex = _median_hex(swatches)
 
+    # Sponsor and livery text is *accumulated*, not voted. Each frame only
+    # sees the panels facing the camera: one shot of a purple Falcon read
+    # "CV Performance" off the door, the next read the number off the boot,
+    # and neither is wrong. Taking a majority here would throw away whichever
+    # side of the car was photographed less.
+    out.team, _ = _vote([m.get("team") for m in members])
+    out.sponsors = _accumulate(members, "sponsors")
+    out.livery_text = _accumulate(members, "livery_text")
+
     for field_name in ("plate", "race_number"):
         best, best_conf = None, 0.0
         conf_key = "plate_conf" if field_name == "plate" else "number_conf"
@@ -317,7 +477,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
 
     rows = conn.execute(
         """SELECT d.id, d.crop_path, d.attributes, d.signature, d.colour_hex,
-                  d.cls, i.id AS image_id
+                  d.cls, d.plate, i.id AS image_id
              FROM detections d JOIN images i ON i.id = d.image_id
             WHERE i.job_id = ? AND d.rejected = 0
             ORDER BY i.id, d.id""",
@@ -348,15 +508,34 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
         parsed["colour_hex"] = row["colour_hex"]
         attributes[row["id"]] = parsed
         signatures.append((row["id"], sig, row["image_id"], row["colour_hex"],
-                           row["cls"], parsed.get("make")))
+                           row["cls"], parsed.get("make"), row["plate"]))
 
     assignment = cluster(signatures)
     members: dict[int, list[int]] = {}
     for det_id, key in assignment.items():
         members.setdefault(key, []).append(det_id)
 
+    # One text-only model call per group, not per frame, and only where the
+    # group actually disagreed with itself. See normalise.py -- the answer is
+    # checked back against what was read before any of it is believed.
+    tidy_names = bool(settings and getattr(settings, "normalise_names", False)
+                      and getattr(settings, "use_vlm", False))
+    name_cache: dict = {}
+
     for key, ids in members.items():
-        agreed = consensus([attributes.get(i, {}) for i in ids])
+        group_members = [attributes.get(i, {}) for i in ids]
+        agreed = consensus(group_members)
+        if tidy_names:
+            readings = normalise.readings_of(group_members)
+            tidied = normalise.canonical(readings, settings, cache=name_cache)
+            if tidied.make:
+                agreed.make = tidied.make
+                # The model belongs to the make it was chosen with. Keeping a
+                # previous vote's model against a new make is how "Ford
+                # Ninja H2" happens.
+                agreed.model = tidied.model
+            elif tidied.model:
+                agreed.model = tidied.model
         for det_id in ids:
             current = attributes.get(det_id, {})
             # What this frame's reader said is a measurement and is never
@@ -382,6 +561,14 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                 current["plate_conf"] = 0.0     # inherited, not read here
             if agreed.race_number and not current.get("race_number"):
                 current["race_number"] = agreed.race_number
+            # Accumulated across the group: what one frame saw and another
+            # could not, rather than a majority of what each saw alone.
+            if agreed.team and not current.get("team"):
+                current["team"] = agreed.team
+            if agreed.sponsors:
+                current["sponsors"] = agreed.sponsors
+            if agreed.livery_text:
+                current["livery_text"] = agreed.livery_text
             current["group_disputed"] = agreed.disputed
             conn.execute(
                 # group_colour_hex, never colour_hex. The per-frame sample

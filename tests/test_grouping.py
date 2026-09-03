@@ -109,3 +109,120 @@ class Nameplates(unittest.TestCase):
         from conrod.marques import correct_make
 
         self.assertEqual(correct_make(None, "Commodore"), "Holden")
+
+
+class PlateIsAnIdentity(unittest.TestCase):
+    """A read plate outranks every other grouping signal."""
+
+    SIG_A = "ffff0000:" + ",".join(["0.03"] * 36)
+    SIG_B = "0000ffff:" + ",".join(["0.03"] * 36)
+
+    def test_the_same_plate_groups_crops_that_look_nothing_alike(self):
+        from conrod.grouping import cluster
+
+        # The real case: one purple Falcon side-on in sun and from behind in
+        # shade, forty frames apart, sampled as two different colours.
+        rows = [(1, self.SIG_A, 1, "#4b2d6e", "car", "Ford", "EYU-06S"),
+                (2, self.SIG_B, 41, "#2e1a44", "car", "Ford", "EYU06S")]
+        groups = set(cluster(rows).values())
+        self.assertEqual(len(groups), 1)
+
+    def test_different_plates_stay_apart_however_alike_they_look(self):
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG_A, 1, "#1a729c", "car", "Ford", "ABC12D"),
+                (2, self.SIG_A, 2, "#1a729c", "car", "Ford", "XYZ99Z")]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+
+class MisreadPlates(unittest.TestCase):
+    """One character apart is one plate, not two vehicles.
+
+    The measured case: a blue Ford read as 43111J across eleven frames and
+    73111J across three more. Because a plate is identity, the mismatch was
+    proof of *different* vehicles, so one car became several -- and the
+    frames that read the car correctly never got to outvote the frames the
+    vision model had called a Holden.
+    """
+
+    SIG = "ffff0000:" + ",".join(["0.03"] * 36)
+    OTHER = "0000ffff:" + ",".join(["0.03"] * 36)
+
+    def test_a_confusable_character_does_not_split_a_vehicle(self):
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", "Ford", "43111J"),
+                (2, self.SIG, 2, "#2c426c", "car", "Ford", "73111J")]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+    def test_a_near_plate_outranks_a_disagreeing_make(self):
+        """The circularity this was written for.
+
+        The model called the same car a Ford in one frame and a Holden in the
+        next. The make gate then refused the merge, which preserved the wrong
+        answer. A measured plate beats the model's opinion.
+        """
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", "Ford", "43111J"),
+                (2, self.SIG, 2, "#2c426c", "car", "Holden", "73111J")]
+        self.assertEqual(len(set(cluster(rows).values())), 1)
+
+    def test_it_does_not_override_the_paint(self):
+        """A near plate is evidence, not a licence to merge anything.
+
+        Colour is measured off the crop, so unlike the make it is not the
+        model's opinion and does not get overruled.
+        """
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", "Ford", "43111J"),
+                (2, self.SIG, 2, "#c0392b", "car", "Ford", "73111J")]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_two_genuinely_different_plates_still_split(self):
+        from conrod.grouping import cluster
+
+        rows = [(1, self.SIG, 1, "#2b3f67", "car", "Ford", "43111J"),
+                (2, self.SIG, 2, "#2b3f67", "car", "Ford", "98222K")]
+        self.assertEqual(len(set(cluster(rows).values())), 2)
+
+    def test_only_confusable_characters_count(self):
+        """43111J against 45111J differs by a character no reader confuses."""
+        from conrod.grouping import _near_plate
+
+        self.assertTrue(_near_plate("43111J", "73111J"))    # 4 <-> 7
+        self.assertTrue(_near_plate("8BC123", "BBC123"))    # 8 <-> B
+        self.assertFalse(_near_plate("43111J", "45111J"))   # 3 <-> 5
+        self.assertFalse(_near_plate("43111J", "43111"))    # different lengths
+        self.assertFalse(_near_plate("43111J", "73112J"))   # two apart
+
+
+class Accumulation(unittest.TestCase):
+    """What one frame saw and another could not."""
+
+    # The two frames of the purple Falcon: one read the team off the door,
+    # the other read the number off the boot.
+    PAIR = [
+        {"make": "Ford", "model": "Falcon FG", "colour": "Purple",
+         "plate": "EYU06S", "plate_conf": 0.94, "team": "CV Performance",
+         "sponsors": ["CV Performance"], "colour_hex": "#4b2d6e"},
+        {"make": "Ford", "model": "FG Falcon XR8", "colour": "blue",
+         "plate": "EYU06S", "plate_conf": 0.6, "race_number": "06",
+         "number_conf": 0.70, "sponsors": ["FPV"], "colour_hex": "#2e1a44"},
+    ]
+
+    def test_the_number_seen_in_one_frame_reaches_the_group(self):
+        self.assertEqual(consensus(self.PAIR).race_number, "06")
+
+    def test_the_team_seen_in_one_frame_reaches_the_group(self):
+        self.assertEqual(consensus(self.PAIR).team, "CV Performance")
+
+    def test_sponsors_are_pooled_rather_than_voted(self):
+        # A majority vote would keep one and discard the other, when both are
+        # really on the car and each frame only saw the side facing it.
+        self.assertEqual(set(consensus(self.PAIR).sponsors),
+                         {"CV Performance", "FPV"})
+
+    def test_the_most_confident_plate_read_wins(self):
+        self.assertEqual(consensus(self.PAIR).plate, "EYU06S")
