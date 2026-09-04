@@ -76,8 +76,9 @@ def _reader_check(key: str, label: str, wanted: bool,
     return Check(
         key, label, False,
         "not installed: " + ", ".join(f"{name} ({does})" for name, does in missing)
-        + ". Nothing will be read off a plate until it is there —"
-        " pip install -r requirements.txt",
+        + ". Nothing will be read off a plate until it is there. The "
+        "packaged app ships with these; running from source needs "
+        "`pip install -r requirements.txt`.",
         required=False)
 
 
@@ -266,21 +267,30 @@ def download_grouping_model(settings: Settings, on_progress=None) -> bool:
     Resumable and verified -- see similarity.download. Measured on a slow
     link at about 18 KB/s with two dropped connections, which is exactly the
     case a one-shot download handles by leaving a truncated file behind.
+
+    Reports the way every other fixer here does -- one dict, "status" and
+    "percent". It used to take two positional arguments instead, which the
+    caller in server.py does not pass: it raised on the first progress tick,
+    every single time, so this model could not be installed at all. The
+    failure was invisible too, and grouping simply fell back to the cruder
+    clusterer, which made a broken installer look like a weak feature.
     """
     from . import similarity
 
     def tick(done: int, total: int) -> None:
         if on_progress:
-            share = (done / total) if total else 0.0
-            on_progress(f"{done // 1_000_000} of {total // 1_000_000} MB",
-                        share)
+            on_progress({"status": f"{done // 1_000_000} of "
+                                   f"{total // 1_000_000} MB",
+                         "percent": (100.0 * done / total) if total else 0.0})
 
     for attempt in range(4):
         if similarity.download(tick):
+            if on_progress:
+                on_progress({"status": "done", "percent": 100})
             return True
         if on_progress:
-            on_progress(f"the download stopped short; trying again "
-                        f"({attempt + 1} of 4)", None)
+            on_progress({"status": f"the download stopped short; trying again "
+                                   f"({attempt + 1} of 4)"})
     return similarity.is_ready()
 
 

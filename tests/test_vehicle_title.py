@@ -14,6 +14,7 @@ answer rather than a stale or unset one.
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -66,13 +67,24 @@ class TheKindComesFromTheDetectorNotTheAnalysis(unittest.TestCase):
         self.code = (Path(conrod.__file__) / "..").resolve()
         self.source = (self.code / "server.py").read_text(encoding="utf-8")
 
+    def _body(self, name: str) -> str:
+        """One function's source, ending where the next one starts.
+
+        Bounded by the next `def` at module level rather than by a character
+        count. A fixed slice made this fail the moment anything was added
+        above the line it checks -- the assertion was right and the window
+        was arbitrary.
+        """
+        start = self.source.index(f"def {name}(")
+        rest = self.source[start:]
+        end = re.search(r"\n(?:@app\.|def |class )", rest[1:])
+        return rest[:end.start() + 1] if end else rest
+
     def test_the_listing_endpoint_prefers_the_detections_own_class(self) -> None:
-        body = self.source[self.source.index("def detections("):]
-        self.assertIn('analysis.kind = item["cls"]', body[:3500])
+        self.assertIn('analysis.kind = item["cls"]', self._body("detections"))
 
     def test_the_update_endpoint_prefers_the_detections_own_class(self) -> None:
-        body = self.source[self.source.index("def update_detection("):]
-        self.assertIn('analysis.kind = row["cls"]', body[:1000])
+        self.assertIn('analysis.kind = row["cls"]', self._body("update_detection"))
 
 
 if __name__ == "__main__":

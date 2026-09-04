@@ -445,6 +445,16 @@ STAR_BANDS = ((0.958, 5), (0.825, 4), (0.728, 3), (0.606, 2), (0.0, 1))
 
 LABEL_GOOD, LABEL_FAIR, LABEL_POOR = "Green", "Yellow", "Red"
 
+# The one frame of a pass worth keeping, and the only label that is not
+# about focus. It wins over the others because it is a stronger statement:
+# green says this frame is sharp, blue says this is *the* sharp one of the
+# twelve you shot of that car.
+#
+# A colour rather than a flag because a flag does not survive the trip.
+# Lightroom's Pick flag lives in the catalogue and is not written to a
+# sidecar; xmp:Label is, and every catalogue reads it.
+LABEL_PICK = "Blue"
+
 # The good/fair/poor wording, kept on the same footing as the stars so the
 # card cannot say "good" about a frame it is giving two stars to -- which is
 # exactly what it did when these were tuned against a scale that no longer

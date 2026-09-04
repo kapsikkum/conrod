@@ -1637,6 +1637,7 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.cull_reason, d.clipped, d.rating, d.rating_verdict, d.stars,
        d.predicted_stars,
        d.panning, d.background, d.sharp_end, d.uncertain, d.bystander,
+       d.burst_pick,
        i.path AS image_path, i.id AS image_id, i.camera, i.burst_key,
        -- Whether "which car is the subject" is even a question for this
        -- frame. One vehicle in it and there is nothing to choose between.
@@ -1685,17 +1686,21 @@ ORDERINGS = {
     "best": f"({_RANK}) IS NULL, ({_RANK}) DESC, d.stars IS NULL, d.rating DESC, d.id ASC",
     "worst": f"({_RANK}) IS NULL, ({_RANK}) ASC, d.stars IS NULL, d.rating ASC, d.id ASC",
     "frame": "i.id ASC, d.id ASC",
+    # Shooting order, but the keeper of each pass at the head of its own
+    # pass. Reads down the shoot the way it happened with the answer first.
+    "pick": "COALESCE(d.burst_pick, 0) DESC, i.burst_key ASC, i.id ASC, d.id ASC",
 }
 
 
 @app.get("/api/jobs/{job_id}/detections")
 def detections(
     job_id: int,
-    view: str = Query("review", pattern="^(review|all|number|plate|rejected)$"),
+    view: str = Query("review",
+                      pattern="^(review|all|number|plate|rejected|picks)$"),
     number: str | None = None,
     plate: str | None = None,
     search: str | None = None,
-    sort: str = Query("review", pattern="^(review|best|worst|frame)$"),
+    sort: str = Query("review", pattern="^(review|best|worst|frame|pick)$"),
     min_stars: int | None = Query(None, ge=1, le=5),
     limit: int = 120,
     offset: int = 0,
@@ -1710,6 +1715,12 @@ def detections(
             " :thresh) = 1"
         )
         params["thresh"] = settings.ocr_accept_confidence
+    elif view == "picks":
+        # One frame per car per pass -- the shortlist. Deliberately not
+        # "and not rejected": picking already skips rejected frames, so a
+        # pick that is now rejected means it was rejected by hand after the
+        # pick was made, and hiding that would hide the disagreement.
+        clauses.append("COALESCE(d.burst_pick, 0) = 1")
     elif view == "number":
         if not number:
             raise HTTPException(400, "view=number needs a number")
@@ -1907,6 +1918,20 @@ def group_cars(job_id: int) -> dict:
 def regroup(job_id: int) -> dict:
     """The old name for group_cars, kept so an older window still works."""
     return group_cars(job_id)
+
+
+@app.post("/api/jobs/{job_id}/pick")
+def pick_of_pass(job_id: int) -> dict:
+    """Mark the one frame of each pass worth keeping.
+
+    Separate from the cull that produced the ratings, because it is worth
+    re-running on its own: after grouping has told it which frames are one
+    car, and after any star given by hand has changed what "best" means.
+    Reads no photographs.
+    """
+    from . import pipeline
+
+    return pipeline.pick_of_pass(job_id, _state["settings"])
 
 
 @app.post("/api/detections/{det_id}")

@@ -306,10 +306,6 @@
         colour and team. Without it the app still reads plates, numbers and text.
       </p>
       <ul class="checks" id="check-list"></ul>
-      <div id="fix-progress" class="progress-box" hidden>
-        <div class="bar"><div class="fill" id="fix-fill"></div></div>
-        <p class="muted mono" id="fix-status"></p>
-      </div>
 
       <div class="version-box">
         <div class="version-row">
@@ -338,6 +334,8 @@
         <div class="tabs sub" id="view-tabs">
           <button data-view="review" class="active">To review</button>
           <button data-view="all">All</button>
+          <button data-view="picks"
+                  title="One frame per car per pass — the keeper of each pan, and nothing else.">Keepers</button>
           <button data-view="rejected">Rejected</button>
         </div>
         <input id="search" placeholder="Search make, team, plate…" spellcheck="false">
@@ -347,11 +345,14 @@
           <option value="best">Best rated</option>
           <option value="worst">Worst rated</option>
           <option value="frame">Shooting order</option>
+          <option value="pick">Keeper of each pass first</option>
         </select>
         <div class="spacer"></div>
         <button id="btn-keys" class="ghost icon" title="Keyboard shortcuts">⌨</button>
         <button id="btn-group" class="ghost"
                 title="Sort this album's frames into one pile per car, by what the crops look like. No photograph is re-read and no model is asked to name anything.">Group cars</button>
+        <button id="btn-keepers" class="ghost"
+                title="Work out which frame of each pass is the keeper. Reads no photographs.">Pick keepers</button>
         <button id="btn-rescan" class="ghost"
                 title="Read the photographs again and redo detection and identification for this album.">Rescan</button>
         <button id="btn-dry" class="ghost">Preview keywords</button>

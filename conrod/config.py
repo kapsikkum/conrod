@@ -282,6 +282,18 @@ class Settings:
     # kept, and the Rejected view can put back anything that should not have
     # gone.
     cull_blurred: bool = True
+
+    # Mark the one frame of each pass worth keeping, and write it out as a
+    # colour label. A pan is a dozen frames of one car and the cull scores
+    # each of them alone, so it hands back six near-identical keepers; this
+    # is what says which of the six. See pipeline.pick_of_pass.
+    #
+    # A colour rather than a flag because Lightroom's Pick flag lives in the
+    # catalogue and never reaches a sidecar. Blue is free -- green, yellow
+    # and red are the cull's own verdicts.
+    mark_burst_picks: bool = True
+    pick_label: str = "Blue"
+
     identify_make_model: bool = True
     identify_colour: bool = True
     identify_team: bool = True

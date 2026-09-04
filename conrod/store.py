@@ -148,6 +148,13 @@ _MIGRATIONS = [
     # sorting is SQL: the order-by has to be able to reach it.
     ("detections", "predicted_stars", "INTEGER"),
 
+    # 1 on the one frame of a pass that is worth keeping. A pan is a dozen
+    # frames of one car and the cull judges each of them alone, so it hands
+    # back six near-identical keepers; this is which of them is the keeper.
+    # Stored rather than computed on read for the same reason as above --
+    # the review grid filters and sorts on it, and that happens in SQL.
+    ("detections", "burst_pick", "INTEGER"),
+
     ("images", "sharpness", "REAL"),
     ("images", "rating", "REAL"),
     ("images", "rating_verdict", "TEXT"),

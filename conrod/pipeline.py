@@ -168,12 +168,15 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
     if settings.respect_culling:
         found = len(files)
-        on_progress({"stage": "cull", "done": 0, "total": found,
-                     "message": f"checking ratings and labels on {found} frames"})
+        # "ratings", not "cull": this reads the stars and labels already on
+        # the frames to decide what to skip. Nothing is culled here, and
+        # calling it the cull put the same word on two different passes.
+        on_progress({"stage": "ratings", "done": 0, "total": found,
+                     "message": f"reading ratings and labels on {found} frames"})
 
         def cull_progress(done: int, total: int) -> None:
-            on_progress({"stage": "cull", "done": done, "total": total,
-                         "message": f"checked {done}/{total} frames"})
+            on_progress({"stage": "ratings", "done": done, "total": total,
+                         "message": f"read {done}/{total} frames"})
 
         with ExifTool() as tool:
             files, skipped = culling.filter_frames(files, settings, tool,
@@ -448,6 +451,20 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         if not analyse:
             # Detected, rated and culled. Grouping is deliberately not run:
             # it settles on a name, and nothing has proposed one yet.
+            #
+            # Picking the keeper of each pass is run, because it is the
+            # other half of culling and needs no name: it asks which of
+            # these twelve frames of one car is the one, which is a
+            # question about the numbers already stored.
+            if settings.mark_burst_picks:
+                try:
+                    picked = pick_of_pass(job_id, settings,
+                                          on_progress=on_progress)
+                    on_progress({"stage": "culled", "done": 0, "total": 0,
+                                 "message": f"{picked['picks']} keepers across "
+                                            f"{picked['passes']} passes"})
+                except Exception as exc:
+                    errors.append(f"picking: {exc}")
             store.set_job_status(conn, job_id, "culled")
             conn.commit()
             kept = total_detections - culled
@@ -682,6 +699,94 @@ def embed_missing(job_id: int | None, settings: Settings, *,
         conn.close()
 
 
+def pick_of_pass(job_id: int, settings: Settings, *,
+                 on_progress: Progress = _noop) -> dict:
+    """Mark the one frame of each pass worth keeping.
+
+    The cull judges every frame on its own, which is the right question to
+    ask of a frame and the wrong one to ask of a pan. Measured on a real
+    Falcon meet: 240 bursts, a median of thirteen frames each, and after the
+    cull a median of *six* surviving frames per burst -- six near-identical
+    keepers of one car, several of them in the same star band. Written out
+    to XMP that is six copies of one photograph at four stars, which is
+    exactly the pile the cull was meant to remove.
+
+    Nothing here is new evidence. The frames of a pass were already fully
+    ordered: ``detections.rating`` is a float, not a star band, and
+    ``images.burst_key`` already says which frames are one pass. All this
+    does is compare them to each other, which nothing did.
+
+    The unit is the *car in the pass*, not the pass. 91% of bursts on that
+    album contain a frame with two or more vehicles in it -- a burst is a
+    stretch of time, and two cars nose to tail give one burst and two
+    answers. So this keys on (burst, group), and falls back to the burst
+    alone where grouping has not run.
+
+    One pick each, and worth being honest about the cost: the gap between
+    the best frame of a pass and the runner-up is a median of 0.025 where
+    the spread across the whole pass is 0.590, and in 36% of passes the top
+    two are within 0.01. In those the choice is very nearly arbitrary. It is
+    at least *stable* -- ties break on the earliest frame, so running this
+    again picks the same one -- and the runner-up is not touched: it keeps
+    its rating and its own label, and is one click away in the grid.
+
+    Re-runnable, like every other pass here. Reads no photographs.
+    """
+    conn = store.connect()
+    try:
+        rows = conn.execute(
+            """SELECT d.id, d.rating, d.sharpness, d.group_key,
+                      i.id AS image_id, i.burst_key
+                 FROM detections d JOIN images i ON i.id = d.image_id
+                WHERE i.job_id = ?
+                  AND COALESCE(d.rejected, 0) = 0
+                  AND COALESCE(d.bystander, 0) = 0
+                  AND i.burst_key IS NOT NULL
+                ORDER BY i.id, d.id""",
+            (job_id,),
+        ).fetchall()
+
+        best: dict[tuple, tuple] = {}
+        for row in rows:
+            # Where grouping has run, one entry per car per pass; where it
+            # has not, the pass is the best unit available. Not None as the
+            # group: two ungrouped cars in one burst would then share a key
+            # and one of them would lose its keeper silently.
+            unit = (row["burst_key"], row["group_key"])
+            # The float, not the star band. The bands are what put six
+            # frames on the same number in the first place, so ranking by
+            # them would reproduce the tie this exists to break.
+            score = row["rating"]
+            if score is None:
+                score = row["sharpness"]
+            if score is None:
+                continue
+            # Strictly greater, so an equal score leaves the earlier frame
+            # in place. That is what makes a re-run pick the same frame.
+            if unit not in best or score > best[unit][0]:
+                best[unit] = (score, row["id"])
+
+        picks = {det_id for _, det_id in best.values()}
+        conn.execute(
+            """UPDATE detections SET burst_pick = NULL
+                WHERE image_id IN (SELECT id FROM images WHERE job_id = ?)""",
+            (job_id,))
+        for det_id in picks:
+            conn.execute("UPDATE detections SET burst_pick = 1 WHERE id = ?",
+                         (det_id,))
+        conn.commit()
+
+        stats = {"passes": len(best), "picks": len(picks),
+                 "considered": len(rows)}
+        on_progress({"stage": "grouping", "done": len(picks),
+                     "total": len(best),
+                     "message": f"{len(picks)} keepers from {len(rows)} frames "
+                                f"across {len(best)} passes"})
+        return stats
+    finally:
+        conn.close()
+
+
 def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
              should_stop: Callable[[], bool] | None = None,
              wait_if_paused: Callable[[], None] | None = None) -> JobSummary:
@@ -872,10 +977,19 @@ def _prepare_previews(files: Iterable[Path], on_progress: Progress,
 
     on_progress({"stage": "preview", "done": 0, "total": len(raws),
                  "message": f"extracting previews from {len(raws)} RAW files"})
+    def turning(done: int, total: int) -> None:
+        # Its own message, not a continuation of the extraction count. Two
+        # passes sharing one counter is what let this claim to be finished
+        # for twelve minutes while it was still working.
+        on_progress({"stage": "preview", "done": done, "total": total,
+                     "message": f"turning previews the right way up "
+                                f"{done}/{total}"})
+
     previews = extract_previews(raws, CACHE_DIR / "previews",
                                 on_progress=report,
                                 workers=max(1, settings.preview_workers),
-                                should_stop=should_stop)
+                                should_stop=should_stop,
+                                on_orient=turning)
     on_progress({"stage": "preview", "done": len(previews), "total": len(raws),
                  "message": f"extracted {len(previews)}/{len(raws)} previews"})
     return previews
@@ -1201,8 +1315,12 @@ def _existing_marks(files, rows, on_progress=_noop, should_stop=None) -> dict:
         return out
 
     def tick(done: int, of: int) -> None:
-        on_progress({"stage": "cameras", "done": done, "total": of,
-                     "message": f"checked {done}/{of} sidecars for ratings"})
+        # Its own stage. Reported as "cameras" it looked like the camera
+        # read had restarted from zero -- three passes sharing one label
+        # and one counter is why "it stopped" was hard to tell from "it
+        # moved on".
+        on_progress({"stage": "ratings", "done": done, "total": of,
+                     "message": f"reading your ratings {done}/{of}"})
 
     try:
         with ExifTool() as tool:
@@ -1320,12 +1438,50 @@ SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
        COALESCE(d.rating, i.rating) AS rating,
        COALESCE(d.rating_verdict, i.rating_verdict) AS rating_verdict,
        d.panning AS panning,
-       d.stars AS stars, d.bystander AS bystander
+       d.stars AS stars, d.bystander AS bystander,
+       d.burst_pick AS burst_pick
   FROM images i
   LEFT JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
  ORDER BY i.id, d.id
 """
+
+
+def verdict_for(entry: dict, settings: Settings) -> tuple:
+    """The star and the colour one photograph goes out with.
+
+    Three sources, each overruling the one before it:
+
+      the cull      how sharp its best vehicle was
+      a hand rating the photographer's own star, which is an answer where
+                    the measure is a proposal
+      the pick      whether this is the keeper of its pass
+
+    Only the colour changes at the last step. The keeper of a pass is not a
+    better photograph than the frame beside it -- the gap between the best
+    frame of a pan and the runner-up is a median of 0.025 -- it is the one
+    worth opening first, and a colour says that where a star would be
+    claiming something the measurement does not support.
+
+    Pulled out of write_job so it can be tested without an ExifTool and a
+    folder of RAWs behind it.
+    """
+    rating = label = None
+    if entry.get("best") is not None:
+        verdict = sharpness_mod.rating_for(
+            entry["best"], settings.sharp_at, settings.blurred_below)
+        rating = sharpness_mod.stars_for(entry["best"])
+        label = sharpness_mod.label_for(verdict)
+    if entry.get("by_hand") is not None:
+        rating = entry["by_hand"]
+        # The colour follows the stars they gave, so a frame starred in
+        # review does not stay red in the catalogue.
+        label = sharpness_mod.label_for(
+            "good" if rating >= 3 else
+            "fair" if rating == 2 else "poor")
+    if entry.get("pick") and getattr(settings, "mark_burst_picks", True):
+        label = getattr(settings, "pick_label", sharpness_mod.LABEL_PICK)
+    return rating, label
 
 
 def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = None,
@@ -1338,7 +1494,7 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
             entry = by_image.setdefault(
                 row["image_id"], {"path": Path(row["path"]), "analyses": [],
                                   "best": None, "panning": False,
-                                  "by_hand": None})
+                                  "by_hand": None, "pick": False})
             # A vehicle in the frame that is not what the frame is of says
             # nothing about it: not its keywords, not its rating, not the
             # stars. Rejecting is a judgement about the photograph; this is
@@ -1363,25 +1519,16 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
                 if entry["by_hand"] is None or row["stars"] > entry["by_hand"]:
                     entry["by_hand"] = row["stars"]
             entry["panning"] = entry["panning"] or bool(row["panning"])
+            # One car in the frame being the keeper of its pass makes the
+            # whole photograph the keeper -- there is only one file to mark.
+            entry["pick"] = entry["pick"] or bool(row["burst_pick"])
 
         written = failed = skipped = 0
         with ExifTool() as tool:
             for index, (image_id, entry) in enumerate(by_image.items(), start=1):
                 path, analyses = entry["path"], entry["analyses"]
                 words = keywords_mod.for_frame(analyses, settings, number_map)
-                rating = label = None
-                if entry["best"] is not None:
-                    verdict = sharpness_mod.rating_for(
-                        entry["best"], settings.sharp_at, settings.blurred_below)
-                    rating = sharpness_mod.stars_for(entry["best"])
-                    label = sharpness_mod.label_for(verdict)
-                if entry["by_hand"] is not None:
-                    rating = entry["by_hand"]
-                    # The colour follows the stars they gave, so a frame
-                    # starred in review does not stay red in the catalogue.
-                    label = sharpness_mod.label_for(
-                        "good" if rating >= 3 else
-                        "fair" if rating == 2 else "poor")
+                rating, label = verdict_for(entry, settings)
                 if not words and rating is None:
                     skipped += 1
                     continue

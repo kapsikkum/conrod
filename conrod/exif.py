@@ -116,6 +116,7 @@ def extract_previews(
     workers: int = 4,
     chunk: int = 24,
     should_stop: Callable[[], bool] | None = None,
+    on_orient: Callable[[int, int], None] | None = None,
 ) -> dict[Path, Path]:
     """Pull the embedded JPEG preview out of each RAW file.
 
@@ -189,20 +190,29 @@ def extract_previews(
             if candidate.exists() and candidate.stat().st_size > 0:
                 extracted[f] = candidate
 
-        _apply_orientation(exe, extracted, workers=workers)
+        _apply_orientation(exe, extracted, workers=workers,
+                           on_progress=on_orient)
         result.update(extracted)
 
     return result
 
 
 def _apply_orientation(exe: str, extracted: dict[Path, Path],
-                       workers: int = 4) -> None:
+                       workers: int = 4,
+                       on_progress: Callable[[int, int], None] | None = None,
+                       ) -> None:
     """Rotate previews to match the orientation recorded in the RAW.
 
     An embedded preview is stored in sensor order and carries no orientation
     tag of its own, so a portrait frame arrives on its side and every detector
     downstream sees a sideways car. The tag lives on the RAW, not the JPEG, so
     it has to be read separately and baked into the cached preview.
+
+    Reports, because it used to be the silent half of a visible stage. On a
+    6,221-frame shoot extraction finished in about two minutes and then this
+    ran for twelve more, while the bar it shared read "6221/6221, about 0s
+    left" the entire time. Silence would have been bad; claiming to be
+    finished was worse.
     """
     if not extracted:
         return
@@ -217,7 +227,9 @@ def _apply_orientation(exe: str, extracted: dict[Path, Path],
         rows = tool.read_tags(todo, ["Orientation#"])
 
     by_source = {Path(r.get("SourceFile", "")).resolve(): r for r in rows}
-    for src in todo:
+    for turned, src in enumerate(todo, start=1):
+        if on_progress and (turned % 50 == 0 or turned == len(todo)):
+            on_progress(turned, len(todo))
         jpg = extracted[src]
         row = by_source.get(src.resolve(), {})
         try:

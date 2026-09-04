@@ -507,6 +507,16 @@ aside {
 .card .focus.soft,  .card .focus.fair { color: var(--warn2); }
 .card .focus.blurred, .card .focus.poor { color: var(--bad); }
 .card .focus.panning { color: var(--scan); border-color: #1c4a3c; top: 32px; }
+/* The keeper of a pass. Blue because blue is the label it writes, so the
+   grid and the catalogue say the same thing without anyone having to learn
+   a mapping between them. Sits under the panned badge, which it usually
+   accompanies -- a keeper of a pan is a panned frame by definition. */
+.card .focus.keeper {
+  color: #dbeafe; background: rgba(37,99,235,.85); border-color: #3b82f6;
+  top: 56px;
+}
+.card .focus.keeper + .focus,
+.card:not(:has(.focus.panning)) .focus.keeper { top: 32px; }
 /* A rating the photographer gave, told apart from one the cull measured.
    They mean different things: one is a proposal, the other is the answer,
    and Write XMP uses the second. */
@@ -1141,3 +1151,19 @@ button.danger:hover { color: #ff7b7b; border-color: var(--bad); }
   font-variant-numeric: tabular-nums; font-weight: 600;
 }
 .cache-what { flex: 1; line-height: 1.35; }
+
+/* Install progress, inside the check being installed. It was one shared
+   strip at the foot of the list, which on a seven-row page is a screen away
+   from the button that was pressed. */
+.checks .fix-line { margin-top: .45rem; }
+.checks .fix-bar {
+  height: 3px; border-radius: 2px; overflow: hidden;
+  background: rgba(255,255,255,.08);
+}
+.checks .fix-bar i {
+  display: block; height: 100%; width: 0;
+  background: var(--accent); transition: width .3s ease;
+}
+.checks .fix-said { font-size: 11px; margin-top: .3rem; }
+.checks .fix-line.failed .fix-bar i { background: var(--bad); width: 100%; }
+.checks .fix-line.failed .fix-said { color: var(--bad); }

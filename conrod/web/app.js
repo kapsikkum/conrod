@@ -257,13 +257,34 @@ async function loadSetup() {
         el("div", { className: "why", textContent: check.detail || "" }))
     );
     if (!check.ok && check.fix) {
+      // The progress bar and the reason live in the row being installed.
+      // They used to be one shared strip at the foot of the page, a screen
+      // away from the button that was pressed -- and it was hidden whenever
+      // nothing was active, so a failure appeared for 900ms and then the
+      // list re-rendered over it. Pressing Install on a model that could
+      // not install looked exactly like pressing a dead button.
+      row.dataset.fix = check.fix;
+      const line = el("div", { className: "fix-line", hidden: true },
+        el("div", { className: "fix-bar" }, el("i", {})),
+        el("div", { className: "fix-said muted" }));
+      row.querySelector(".body").append(line);
       const button = el("button", { className: "primary", textContent: "Install" });
       button.onclick = async () => {
         button.disabled = true;
-        await api("/api/setup/fix", {
-          method: "POST", body: JSON.stringify({ name: check.fix }),
-        });
-        pollFix();
+        line.hidden = false;
+        line.querySelector(".fix-said").textContent = "starting…";
+        line.classList.remove("failed");
+        try {
+          await api("/api/setup/fix", {
+            method: "POST", body: JSON.stringify({ name: check.fix }),
+          });
+        } catch (err) {
+          line.classList.add("failed");
+          line.querySelector(".fix-said").textContent = String(err.message || err);
+          button.disabled = false;
+          return;
+        }
+        pollFix(check.fix);
       };
       row.append(button);
     } else if (!check.ok && check.link) {
@@ -273,22 +294,36 @@ async function loadSetup() {
     return row;
   }));
 
-  if (data.fix && data.fix.active) pollFix();
+  if (data.fix && data.fix.active) pollFix(data.fix.name);
 }
 
 let fixTimer;
-async function pollFix() {
+async function pollFix(name) {
   clearInterval(fixTimer);
-  $("#fix-progress").hidden = false;
+  const row = name ? $(`[data-fix="${name}"]`) : null;
+  const line = row && row.querySelector(".fix-line");
+  if (line) line.hidden = false;
   fixTimer = setInterval(async () => {
-    const data = await api("/api/setup");
+    const data = await api("/api/setup").catch(() => null);
+    if (!data) return;
     const fix = data.fix || {};
-    $("#fix-fill").style.width = `${fix.percent || 0}%`;
-    $("#fix-status").textContent = fix.status || "";
-    if (!fix.active) {
-      clearInterval(fixTimer);
-      setTimeout(() => { $("#fix-progress").hidden = true; loadSetup(); }, 900);
+    if (line) {
+      line.querySelector(".fix-bar i").style.width = `${fix.percent || 0}%`;
+      line.querySelector(".fix-said").textContent = fix.status || "";
     }
+    if (fix.active) return;
+    clearInterval(fixTimer);
+    // A failure stays on screen. Re-rendering the list would wipe the one
+    // sentence that says what went wrong, and the row would go back to
+    // looking like it had never been pressed.
+    const failed = (fix.status || "").startsWith("failed");
+    if (failed && line) {
+      line.classList.add("failed");
+      const button = row.querySelector("button");
+      if (button) { button.disabled = false; button.textContent = "Try again"; }
+      return;
+    }
+    setTimeout(loadSetup, 600);
   }, 700);
 }
 
@@ -1324,14 +1359,29 @@ function formatSeconds(seconds) {
 
 /* ── review ───────────────────────────────────────────────── */
 
+// Every action on the Review bar needs an album to act on. With none they
+// stayed live over an empty grid reading "No albums yet", so the only thing
+// they could do was fail.
+const ALBUM_ACTIONS = ["#btn-group", "#btn-keepers", "#btn-rescan",
+                       "#btn-dry", "#btn-write"];
+
+function enableAlbumActions(on) {
+  for (const id of ALBUM_ACTIONS) {
+    const button = $(id);
+    if (button) button.disabled = !on;
+  }
+}
+
 async function refreshReview() {
   const jobs = await api("/api/jobs");
   if (!jobs.length) {
     $("#empty").hidden = false;
     $("#empty").textContent = "No albums yet. Run a scan from the Scan tab.";
     $("#grid").replaceChildren();
+    enableAlbumActions(false);
     return;
   }
+  enableAlbumActions(true);
   const select = $("#job-select");
   select.replaceChildren(...jobs.map((j) =>
     el("option", { value: j.id, textContent: `${j.label || j.root} — ${j.image_count}` })));
@@ -1891,6 +1941,13 @@ function galleryCard(item) {
   if (item.panning) {
     frame.append(el("span", { className: "focus panning", textContent: "panned",
       title: "Subject sharp against a blurred background — kept, never auto-culled" }));
+  }
+  // The keeper of its pass. Deliberately loud: on a pan of a dozen frames
+  // this is the whole answer, and the eleven cards beside it look the same.
+  if (item.burst_pick) {
+    frame.append(el("span", { className: "focus keeper", textContent: "keeper",
+      title: "The sharpest frame of this car's pass. Written out as a blue "
+           + "label, so Lightroom can filter to one frame per pan." }));
   }
   if (item.cull_reason) {
     frame.append(el("div", { className: "culled", textContent: item.cull_reason }));
@@ -2557,6 +2614,28 @@ $("#btn-group").onclick = async () => {
   }
 };
 
+// Which frame of each pass to keep. Worth its own button rather than only
+// running at the end of a cull: it wants re-running once grouping has said
+// which frames are one car, and again after any star given by hand has
+// changed what "best" means in a pass.
+$("#btn-keepers").onclick = async () => {
+  const button = $("#btn-keepers");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Picking…";
+  try {
+    const out = await api(`/api/jobs/${state.jobId}/pick`, { method: "POST" });
+    toast(`${out.picks} keepers from ${out.considered} frames `
+          + `across ${out.passes} passes`);
+    refreshReview();
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+};
+
 // The other half of the rename: something that actually rescans.
 $("#btn-rescan").onclick = async () => {
   const album = state.album || {};
@@ -2573,9 +2652,16 @@ $("#btn-rescan").onclick = async () => {
 };
 
 $("#btn-dry").onclick = async () => {
-  const r = await api(`/api/jobs/${state.jobId}/write`, {
-    method: "POST", body: JSON.stringify({ dry_run: true }) });
-  toast(`${r.frames} frames would be keyworded`);
+  // The only action on this bar that used to have no net: a failed dry run
+  // rejected its promise and the photographer saw nothing at all, which is
+  // indistinguishable from the button not being wired up.
+  try {
+    const r = await api(`/api/jobs/${state.jobId}/write`, {
+      method: "POST", body: JSON.stringify({ dry_run: true }) });
+    toast(`${r.frames} frames would be keyworded`);
+  } catch (err) {
+    toast(`Could not work out what would be written: ${err.message}`);
+  }
 };
 
 $("#btn-write").onclick = async () => {
@@ -2583,11 +2669,23 @@ $("#btn-write").onclick = async () => {
   // keywords: the cull's verdict goes out as a star rating and a colour
   // label, and a dialog that does not mention them is asking for consent to
   // something else.
+  // The last line used to be a flat promise. It is only true at the
+  // default: overwrite_rating exists precisely to turn it off, and in the
+  // one case where the promise matters it was wrong. A consent dialog about
+  // writing to someone's photographs has to say what will actually happen.
+  const willOverwrite = [];
+  if (settingsCache.overwrite_rating) willOverwrite.push("ratings");
+  if (settingsCache.overwrite_label) willOverwrite.push("colour labels");
+  const caveat = willOverwrite.length
+    ? `WARNING: existing ${willOverwrite.join(" and ")} WILL be overwritten `
+      + `(turn off "Overwrite" in Settings to keep them).`
+    : "A rating or label you have already set is never overwritten.";
   if (!confirm(
     "Write to XMP sidecars (RAW) and into the files themselves (JPEG)?\n\n"
     + "  • keywords and caption\n"
-    + "  • a star rating and a colour label from the cull\n\n"
-    + "A rating or label you have already set is never overwritten.")) return;
+    + "  • a star rating and a colour label from the cull\n"
+    + "  • a blue label on the keeper of each pass\n\n"
+    + caveat)) return;
   const button = $("#btn-write");
   button.disabled = true; button.textContent = "Writing…";
   try {
