@@ -251,6 +251,32 @@
         <span class="muted" id="settings-note"></span>
       </div>
 
+      <div class="known-zone">
+        <h3>Cars you have met</h3>
+        <p class="muted">
+          What each plate turned out to be, kept across every album. A plate
+          read today is very often a car that was worked out months ago, and
+          the vision model disagrees with itself about a fifth of the frames
+          of one burst &mdash; so a remembered answer is often the steadier
+          of the two. It only ever fills blanks: whatever is read off the
+          frame in front of it always wins.
+        </p>
+        <div class="actions-row">
+          <input id="known-search" placeholder="plate, make, model or team"
+                 spellcheck="false">
+          <button id="btn-known-seed" class="ghost"
+                  title="Fill the list from albums that have already been identified. Runs the same merge, so it can be pressed twice.">Build from my albums</button>
+          <button id="btn-known-export" class="ghost">Export CSV</button>
+          <label for="known-import" class="filebtn">Import CSV…</label>
+          <input type="file" id="known-import" accept=".csv,text/csv" hidden>
+          <span class="muted" id="known-note"></span>
+        </div>
+        <div id="known-table" class="known-table"></div>
+        <div class="actions-row">
+          <button id="known-more" class="ghost" hidden>Show more</button>
+        </div>
+      </div>
+
       <div class="danger-zone">
         <p>
           Your photographs are not touched by anything here &mdash; nothing

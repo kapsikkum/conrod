@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS detections (
     rejected      INTEGER NOT NULL DEFAULT 0
 );
 
+-- Cars this photographer has already met, keyed by plate. Not scoped to a
+-- job: the point is that the same cars turn up at the same meets, so what
+-- one album worked out is what the next one starts from. See registry.py.
+CREATE TABLE IF NOT EXISTS known_vehicles (
+    plate       TEXT PRIMARY KEY,
+    make        TEXT,
+    model       TEXT,
+    colour      TEXT,
+    body_type   TEXT,
+    team        TEXT,
+    sponsors    TEXT,          -- comma separated, as a CSV column would be
+    race_number TEXT,
+    updated_at  REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_images_job    ON images(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_det_image     ON detections(image_id);
 CREATE INDEX IF NOT EXISTS idx_det_number    ON detections(number);

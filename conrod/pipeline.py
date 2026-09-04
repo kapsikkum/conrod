@@ -30,6 +30,7 @@ from . import grouping
 from . import sharpness as sharpness_mod
 from . import similarity
 from . import taste
+from . import registry
 from . import store, vlm, vlm_providers
 from .analyze import VehicleAnalysis, analyze
 from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
@@ -1355,6 +1356,9 @@ def _analysis_worker(work, settings: Settings, counters: dict,
     """
     conn = store.connect()
     client = httpx.Client(timeout=settings.vlm_timeout)
+    # Read once, not per crop. It is a few thousand short rows and these
+    # workers are already contending for this database.
+    known = registry.load(conn) if settings.use_known_vehicles else {}
     try:
         while True:
             item = work.get()
@@ -1366,7 +1370,8 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                 with Image.open(crop_path) as crop:
                     crop.load()
                     analysis = analyze(crop, settings, is_bike=is_bike, kind=kind,
-                                       client=client, native=native)
+                                       client=client, native=native,
+                                       known=known)
                     # Sampled from the crop rather than taken from the model's
                     # word for it, so the review grid can show the paint.
                     # Never worth failing a whole detection over.
@@ -1383,6 +1388,18 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                     except Exception:
                         vector = None
                 store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
+                # And back the other way, as the cars go past: a plate that
+                # has now been worked out is one the next album starts from.
+                # Kept in memory too, so a car seen early in a shoot fills in
+                # its own later frames without waiting for the next run.
+                if settings.use_known_vehicles and analysis.plate:
+                    try:
+                        if registry.remember(conn, analysis):
+                            known[registry.normalise(analysis.plate)] = {
+                                f: getattr(analysis, f, None)
+                                for f in registry.FIELDS}
+                    except Exception as exc:
+                        errors.append(f"remember {analysis.plate}: {exc}")
                 if vector is not None:
                     store.set_embedding(conn, det_id, similarity.pack(vector))
                 identified = bool(analysis.race_number or analysis.plate

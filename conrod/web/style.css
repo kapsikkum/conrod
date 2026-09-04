@@ -1167,3 +1167,27 @@ button.danger:hover { color: #ff7b7b; border-color: var(--bad); }
 .checks .fix-said { font-size: 11px; margin-top: .3rem; }
 .checks .fix-line.failed .fix-bar i { background: var(--bad); width: 100%; }
 .checks .fix-line.failed .fix-said { color: var(--bad); }
+
+/* Cars you have met. A grid rather than a list of cards: it is a table of
+   short values being corrected, and the columns are what make a wrong one
+   easy to spot next to its neighbours. */
+.known-zone { margin-top: 1.5rem; }
+.known-table {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 26rem; overflow-y: auto; margin: .6rem 0;
+}
+.known-row {
+  display: grid; gap: 4px; align-items: center;
+  grid-template-columns: 7rem repeat(6, minmax(5rem, 1fr)) 5rem 4.5rem;
+}
+.known-row input {
+  width: 100%; padding: 3px 6px; font-size: 12px;
+  background: rgba(255,255,255,.03); border: 1px solid transparent;
+  border-radius: 4px; color: var(--text);
+}
+.known-row input:hover  { border-color: rgba(255,255,255,.12); }
+.known-row input:focus  { border-color: var(--accent); outline: none; }
+.known-row input[readonly] { background: none; color: var(--muted); }
+.known-head { font-size: 10px; text-transform: uppercase;
+              letter-spacing: .05em; color: var(--muted); padding-bottom: 2px; }
+.known-plate { font-weight: 600; }

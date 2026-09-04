@@ -1920,6 +1920,116 @@ def regroup(job_id: int) -> dict:
     return group_cars(job_id)
 
 
+# --- known vehicles ---------------------------------------------------------
+
+class KnownVehicle(BaseModel):
+    plate: str
+    make: str | None = None
+    model: str | None = None
+    colour: str | None = None
+    body_type: str | None = None
+    team: str | None = None
+    sponsors: str | None = None
+    race_number: str | None = None
+
+
+class RegistryCsv(BaseModel):
+    text: str
+
+
+@app.get("/api/known")
+def known_vehicles(search: str | None = None, limit: int = 200,
+                   offset: int = 0) -> dict:
+    """Cars this photographer has already met, keyed by plate."""
+    from . import registry
+
+    clause, args = "", []
+    if search:
+        like = f"%{search.strip()}%"
+        clause = ("WHERE plate LIKE ? OR IFNULL(make,'') LIKE ? "
+                  "OR IFNULL(model,'') LIKE ? OR IFNULL(team,'') LIKE ?")
+        args = [like, like, like, like]
+    with store.session() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM known_vehicles {clause}", args).fetchone()[0]
+        rows = conn.execute(
+            f"""SELECT plate, {', '.join(registry.FIELDS)}, updated_at
+                  FROM known_vehicles {clause}
+                 ORDER BY plate LIMIT ? OFFSET ?""",
+            [*args, limit, offset]).fetchall()
+    return {"total": total, "items": [dict(r) for r in rows]}
+
+
+@app.post("/api/known")
+def save_known_vehicle(body: KnownVehicle) -> dict:
+    """Add or correct one row by hand. What is typed wins."""
+    from . import registry
+
+    plate = registry.normalise(body.plate)
+    if not plate:
+        raise HTTPException(400, "a row needs a plate")
+    given = {f: (getattr(body, f) or "").strip() or None
+             for f in registry.FIELDS}
+    with store.session() as conn:
+        conn.execute(
+            f"""INSERT INTO known_vehicles (plate, {', '.join(registry.FIELDS)},
+                                            updated_at)
+                VALUES (?{', ?' * len(registry.FIELDS)}, ?)
+                ON CONFLICT(plate) DO UPDATE SET
+                {', '.join(f'{f} = excluded.{f}' for f in registry.FIELDS)},
+                updated_at = excluded.updated_at""",
+            (plate, *(given[f] for f in registry.FIELDS), time.time()))
+    return {"ok": True, "plate": plate}
+
+
+@app.delete("/api/known/{plate}")
+def forget_known_vehicle(plate: str) -> dict:
+    from . import registry
+
+    with store.session() as conn:
+        gone = registry.forget(conn, plate)
+    if not gone:
+        raise HTTPException(404, "no such plate")
+    return {"ok": True}
+
+
+@app.post("/api/known/seed")
+def seed_known_vehicles(job_id: int | None = None) -> dict:
+    """Build the registry out of albums already identified.
+
+    Without this it starts empty on a machine that has been shooting for
+    months, and the answers are all sitting in the database already.
+    """
+    from . import registry
+
+    with store.session() as conn:
+        return registry.seed(conn, job_id)
+
+
+@app.get("/api/known/csv")
+def known_vehicles_csv():
+    from . import registry
+
+    from fastapi.responses import PlainTextResponse
+
+    with store.session() as conn:
+        text = registry.to_csv(conn)
+    return PlainTextResponse(
+        text, media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="vehicles.csv"'})
+
+
+@app.post("/api/known/csv")
+def import_known_vehicles(body: RegistryCsv) -> dict:
+    from . import registry
+
+    with store.session() as conn:
+        try:
+            return registry.from_csv(conn, body.text)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+
 @app.post("/api/jobs/{job_id}/rescore")
 def rescore_album(job_id: int) -> dict:
     """Measure every stored crop again.

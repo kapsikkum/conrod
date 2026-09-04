@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 import httpx
 from PIL import Image
 
-from . import ocr, plates, vlm
+from . import ocr, plates, registry, vlm
 from .config import Settings
 
 
@@ -127,8 +127,14 @@ class VehicleAnalysis:
 
 def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
             kind: str = "car", client: httpx.Client | None = None,
-            native: Image.Image | None = None) -> VehicleAnalysis:
-    """Read everything readable off one vehicle crop."""
+            native: Image.Image | None = None,
+            known: dict | None = None) -> VehicleAnalysis:
+    """Read everything readable off one vehicle crop.
+
+    ``known`` is the plate registry -- cars this photographer has met before.
+    It is consulted last and only fills blanks: what was read off this frame
+    always wins over what the same plate turned out to be on another day.
+    """
     analysis = VehicleAnalysis(kind=kind, is_bike=is_bike)
 
     # 1. Registration, and any number roundels the same detector picked up.
@@ -237,6 +243,18 @@ def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
             analysis.team_corroborated = _corroborated(analysis.team, found)
         except Exception as exc:
             _log_step_failure("text read", exc)
+
+    # Last, and only into the gaps. The same cars come back to the same
+    # meets, so a plate read today is very often a car that was worked out
+    # months ago -- and the vision model disagrees with itself about a fifth
+    # of the frames of one burst, so a remembered answer is frequently the
+    # steadier of the two. It still does not get to overrule the frame in
+    # front of it: see registry.py.
+    if known:
+        try:
+            registry.fill(analysis, known)
+        except Exception as exc:
+            _log_step_failure("known vehicles", exc)
 
     return analysis
 

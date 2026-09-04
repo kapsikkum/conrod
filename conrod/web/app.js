@@ -76,7 +76,9 @@ function show(screen) {
     b.classList.toggle("active", b.dataset.screen === screen));
   if (screen === "home") loadHome();
   if (screen === "setup") { loadSetup(); checkUpdate(); }
-  if (screen === "settings") { loadSettings(); loadCacheSurvey(); }
+  if (screen === "settings") {
+    loadSettings(); loadCacheSurvey(); loadKnown();
+  }
   if (screen === "album") loadAlbum();
   if (screen === "review") refreshReview();
   // Coming to the Scan screen always means "I want to add a folder". The
@@ -563,6 +565,158 @@ $("#btn-learn").onclick = async () => {
   } finally {
     button.disabled = false;
     button.textContent = was;
+  }
+};
+
+/* ── cars you have met ────────────────────────────────────────
+   A plate is a key. What a car turned out to be is kept against its plate
+   and reused the next time the plate turns up, across every album.
+
+   Editable in place, because the point of remembering something is being
+   able to correct it: the model reads "Ford Falcon" off a car that is
+   actually an FPV, and without a way to fix that the mistake follows the
+   plate around for ever. */
+// Wait until the typing stops. Searching a registry of a few thousand
+// plates on every keystroke is a request per character for an answer only
+// the last one wants.
+function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
+}
+
+const KNOWN_COLUMNS = ["plate", "make", "model", "colour", "body_type",
+                       "team", "sponsors", "race_number"];
+const KNOWN_PAGE = 200;
+const knownState = { offset: 0, total: 0, search: "" };
+
+function knownLabel(column) {
+  return column === "body_type" ? "Body"
+       : column === "race_number" ? "Number"
+       : column.charAt(0).toUpperCase() + column.slice(1);
+}
+
+async function loadKnown(append = false) {
+  const box = $("#known-table");
+  if (!box) return;
+  if (!append) { knownState.offset = 0; box.replaceChildren(); }
+  let data;
+  try {
+    data = await api(`/api/known?limit=${KNOWN_PAGE}&offset=${knownState.offset}`
+      + (knownState.search ? `&search=${encodeURIComponent(knownState.search)}` : ""));
+  } catch (err) {
+    box.textContent = String(err.message || err);
+    return;
+  }
+  knownState.total = data.total;
+  $("#known-note").textContent = data.total
+    ? `${data.total.toLocaleString()} plate${data.total === 1 ? "" : "s"}`
+    : "Nothing yet — it fills itself in as cars are identified.";
+
+  if (!append) {
+    const head = el("div", { className: "known-row known-head" });
+    for (const column of KNOWN_COLUMNS) {
+      head.append(el("span", { textContent: knownLabel(column) }));
+    }
+    head.append(el("span", { textContent: "" }));
+    box.append(head);
+  }
+
+  for (const item of data.items) {
+    const row = el("div", { className: "known-row" });
+    for (const column of KNOWN_COLUMNS) {
+      const cell = el("input", {
+        value: item[column] || "",
+        // The plate is the key, so changing it would be creating a
+        // different car rather than correcting this one. Delete and re-add
+        // is the honest way to do that.
+        readOnly: column === "plate",
+        className: column === "plate" ? "known-plate mono" : "",
+      });
+      cell.onchange = async () => {
+        const patch = { plate: item.plate };
+        for (const c of KNOWN_COLUMNS) {
+          patch[c] = row.querySelector(`input:nth-of-type(${
+            KNOWN_COLUMNS.indexOf(c) + 1})`)?.value || "";
+        }
+        patch.plate = item.plate;
+        try {
+          await api("/api/known", { method: "POST", body: JSON.stringify(patch) });
+          $("#known-note").textContent = `${item.plate} saved`;
+        } catch (err) {
+          $("#known-note").textContent = String(err.message || err);
+        }
+      };
+      row.append(cell);
+    }
+    const drop = el("button", { className: "ghost small", textContent: "Forget" });
+    drop.onclick = async () => {
+      if (!confirm(`Forget everything known about ${item.plate}?`)) return;
+      try {
+        await api(`/api/known/${encodeURIComponent(item.plate)}`,
+                  { method: "DELETE" });
+        row.remove();
+      } catch (err) { toast(err.message); }
+    };
+    row.append(drop);
+    box.append(row);
+  }
+
+  knownState.offset += data.items.length;
+  const more = $("#known-more");
+  if (more) more.hidden = knownState.offset >= knownState.total;
+}
+
+$("#known-search").oninput = debounce(() => {
+  knownState.search = $("#known-search").value.trim();
+  loadKnown();
+}, 250);
+
+$("#known-more").onclick = () => loadKnown(true);
+
+$("#btn-known-seed").onclick = async () => {
+  const button = $("#btn-known-seed");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Reading…";
+  try {
+    const out = await api("/api/known/seed", { method: "POST" });
+    toast(`${out.written.toLocaleString()} plates learned from `
+          + `${out.looked_at.toLocaleString()} identified vehicles — `
+          + `${out.known.toLocaleString()} known in all`);
+    loadKnown();
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+};
+
+$("#btn-known-export").onclick = () => {
+  // Straight to the endpoint rather than building a blob: the browser gets
+  // a Content-Disposition and saves it, and there is no copy of the whole
+  // registry sitting in memory to get out of date.
+  window.location.href = "/api/known/csv";
+};
+
+$("#known-import").onchange = async (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const out = await api("/api/known/csv",
+                          { method: "POST", body: JSON.stringify({ text }) });
+    toast(`${out.written.toLocaleString()} rows loaded`
+          + (out.skipped ? `, ${out.skipped} skipped with no plate` : "")
+          + ` — ${out.known.toLocaleString()} known in all`);
+    loadKnown();
+  } catch (err) {
+    toast(`Could not read that file: ${err.message || err}`);
+  } finally {
+    event.target.value = "";
   }
 };
 

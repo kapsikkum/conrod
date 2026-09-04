@@ -294,6 +294,13 @@ class Settings:
     mark_burst_picks: bool = True
     pick_label: str = "Blue"
 
+    # Remember what each plate turned out to be, and start from that the
+    # next time the plate turns up. The same cars come back to the same
+    # meets, and the vision model disagrees with itself about a fifth of the
+    # frames of one burst -- so a remembered answer is often the steadier of
+    # the two. It only ever fills blanks; see registry.py.
+    use_known_vehicles: bool = True
+
     identify_make_model: bool = True
     identify_colour: bool = True
     identify_team: bool = True
