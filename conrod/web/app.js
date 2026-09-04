@@ -1675,8 +1675,13 @@ function stackName(key, members) {
   if (number) bits.push(`#${number}`);
   if (plate) bits.push(plate);
   if (attrs.team) bits.push(attrs.team);
-  else if (identified(attrs)) bits.push("Independent");
   bits.push(name);
+  // After the name, not before it. The team slot leads the title because a
+  // team is how a race car is known; "Independent" is the absence of one,
+  // and leading with it made every card on a club day open with the same
+  // word and truncated the actual car off the end -- "Independent · Blue
+  // Ford …" where the useful half was the half that got cut.
+  if (privateer(attrs)) bits.push("independent");
   return bits.join(" · ");
 }
 
@@ -1692,6 +1697,19 @@ function identified(attrs) {
   return !!(attrs && (attrs.make || attrs.colour || attrs.body_type || attrs.team
     || (attrs.sponsors && attrs.sponsors.length)
     || (attrs.livery_text && attrs.livery_text.length)));
+}
+
+// Whether "no team" is worth saying out loud.
+//
+// It is a statement about a *competition* entry: this car is running, and it
+// is running for nobody. Said about a road car at a Sunday meet it is not
+// wrong so much as meaningless -- independent of what? -- and it was being
+// said about all of them, because the old test was `identified(attrs)` and
+// the vision model returns a colour for very nearly everything. On one real
+// album that put the word on 115 of the 119 cars it had managed to read,
+// where only 13 were competition cars at all.
+function privateer(attrs) {
+  return !!(attrs && attrs.is_competition && !attrs.team);
 }
 
 /* ── stacks and the gallery ────────────────────────────────────
@@ -2007,8 +2025,8 @@ function galleryCard(item) {
   }));
   if (!attrs.team) {
     teamRow.append(el("span", { className: "val muted-note",
-      textContent: identified(attrs) ? "Independent" : "",
-      title: "No team name was read -- a privateer, or none shown" }));
+      textContent: privateer(attrs) ? "Independent" : "",
+      title: "Running, and not for a team -- a privateer, or none shown" }));
   }
   facts.append(teamRow);
 
@@ -2262,7 +2280,7 @@ function renderFrame() {
     single: true, placeholder: "team or entrant",
     onChange: (list) => { attrs.team = list[0] || null; saveAttrs({ team: list[0] || "" }); },
   });
-  if (!attrs.team && identified(attrs)) {
+  if (privateer(attrs)) {
     out.lastChild.append(el("span", { className: "val muted-note",
                                       textContent: "Independent" }));
   }
