@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS known_vehicles (
     team        TEXT,
     sponsors    TEXT,          -- comma separated, as a CSV column would be
     race_number TEXT,
+    -- Other spellings of this plate seen on the same car, comma separated.
+    -- Not guesses: grouping joins 43111J to 73111J only on visual evidence
+    -- inside one burst, so these are readings of a plate this car was
+    -- actually wearing. That makes a lookup on a misread safe here in a way
+    -- that fuzzy-matching an arbitrary plate never is.
+    aliases     TEXT,
     updated_at  REAL
 );
 
@@ -169,6 +175,9 @@ _MIGRATIONS = [
     # Stored rather than computed on read for the same reason as above --
     # the review grid filters and sorts on it, and that happens in SQL.
     ("detections", "burst_pick", "INTEGER"),
+
+    # Other readings of the same car's plate. See known_vehicles.
+    ("known_vehicles", "aliases", "TEXT"),
 
     ("images", "sharpness", "REAL"),
     ("images", "rating", "REAL"),

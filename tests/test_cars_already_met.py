@@ -181,6 +181,142 @@ class SeedingFromAlbumsAlreadyDone(_Registry):
         self.assertEqual(registry.seed(self.conn)["written"], 1)
 
 
+class OneCarNotOneFrame(_Registry):
+    """Seeding a frame at a time was the first version, and it was wrong.
+
+    One real group of seventeen frames of a single XE Falcon wagon had the
+    model read as Escort, Falcon, Cortina, Mustang, Granada, "Falcon XE
+    Wagon", "XE Falcon Wagon" and "Audi 100". Two of those frames also
+    carried a plate -- 73111J five times and 43111J once -- so seeding per
+    frame produced two cars, one of them a Granada, out of one wagon.
+
+    Grouping had already resolved both halves of that and said so:
+    group_make "Ford", group_model empty, every candidate listed in
+    group_disputed. This trusts that verdict.
+    """
+
+    def _car(self, group, frames):
+        """One vehicle group. Each frame is (plate, attributes)."""
+        job = store.create_job(self.conn, Path("C:/shoot"), "meet", {})
+        for n, (plate, attrs) in enumerate(frames):
+            path = Path(f"C:/shoot/{group}-{n}.CR3")
+            store.add_images(self.conn, job, [path])
+            image_id = self.conn.execute(
+                "SELECT id FROM images WHERE path=?", (str(path),)).fetchone()[0]
+            det = store.add_detection(self.conn, image_id, (0, 0, 10, 10),
+                                      "car", 0.9, "C:/crops/00.jpg")
+            import json as _json
+            self.conn.execute(
+                "UPDATE detections SET plate=?, attributes=?, group_key=? "
+                "WHERE id=?", (plate, _json.dumps(attrs), group, det))
+        self.conn.commit()
+
+    def test_a_misread_plate_does_not_become_a_second_car(self) -> None:
+        self._car(2, [
+            ("73111J", {"group_make": "Ford", "group_model": None,
+                        "model": "Falcon XE Wagon", "colour": "blue"}),
+            ("73111J", {"group_make": "Ford", "group_model": None,
+                        "model": "XE Falcon Wagon", "colour": "blue"}),
+            ("43111J", {"group_make": "Ford", "group_model": None,
+                        "model": "Granada", "colour": "blue"}),
+        ])
+        registry.seed(self.conn)
+        self.assertEqual(registry.count(self.conn), 1)
+
+    def test_the_plate_most_frames_read_is_the_key(self) -> None:
+        self._car(2, [("73111J", {"colour": "blue"}),
+                      ("73111J", {"colour": "blue"}),
+                      ("43111J", {"colour": "blue"})])
+        registry.seed(self.conn)
+        row = self.conn.execute(
+            "SELECT plate, aliases FROM known_vehicles").fetchone()
+        self.assertEqual(row["plate"], "73111J")
+        self.assertEqual(row["aliases"], "43111J")
+
+    def test_the_misread_still_finds_the_car(self) -> None:
+        """Which is the point of keeping it. Still an exact lookup -- the
+        alias is a plate this car was seen wearing, not a guess made at
+        lookup time."""
+        self._car(2, [("73111J", {"make": "Ford", "colour": "blue"}),
+                      ("73111J", {"make": "Ford", "colour": "blue"}),
+                      ("43111J", {"make": "Ford", "colour": "blue"})])
+        registry.seed(self.conn)
+        known = registry.load(self.conn)
+        car = VehicleAnalysis(plate="43111J")
+        self.assertTrue(registry.fill(car, known))
+        self.assertEqual(car.make, "Ford")
+
+    def test_a_model_the_frames_disagreed_about_is_left_blank(self) -> None:
+        """"Granada" would have been a lie with a provenance. An empty
+        column is a car whose model is still an open question, which is
+        what grouping actually concluded."""
+        self._car(2, [
+            ("73111J", {"group_make": "Ford", "group_model": None,
+                        "model": "Falcon XE Wagon"}),
+            ("43111J", {"group_make": "Ford", "group_model": None,
+                        "model": "Granada"}),
+        ])
+        registry.seed(self.conn)
+        row = self.conn.execute(
+            "SELECT make, model FROM known_vehicles").fetchone()
+        self.assertEqual(row["make"], "Ford")
+        self.assertIsNone(row["model"])
+
+    def test_a_model_they_agreed_on_is_kept(self) -> None:
+        self._car(3, [("ABC123", {"group_make": "Subaru",
+                                  "group_model": "WRX STI"})])
+        registry.seed(self.conn)
+        row = self.conn.execute(
+            "SELECT make, model FROM known_vehicles").fetchone()
+        self.assertEqual(row["model"], "WRX STI")
+
+    def test_colour_is_a_plain_majority(self) -> None:
+        """Safe for colour in a way it is not for the model: "blue" eleven
+        times and "navy" once is one car described twice, where Escort and
+        Mustang are two claims about what it is."""
+        self._car(4, [("ABC123", {"colour": "blue"}),
+                      ("ABC123", {"colour": "blue"}),
+                      ("ABC123", {"colour": "navy"})])
+        registry.seed(self.conn)
+        self.assertEqual(self.conn.execute(
+            "SELECT colour FROM known_vehicles").fetchone()["colour"], "blue")
+
+    def test_an_over_merged_group_cannot_poison_the_registry(self) -> None:
+        """Grouping is looser across bursts than within one, and on a real
+        album it put EVL54L, 270SUS, 54L, EIL5AL and MAY054 on one car --
+        five different registrations. Inside a burst that costs one pile and
+        the crops are there to argue with; written down here it would hand
+        one car's identity to four others on every future album.
+        """
+        self._car(5, [("EVL54L", {"make": "Ford"}),
+                      ("EVL54L", {"make": "Ford"}),
+                      ("MAY054", {"make": "Ford"}),
+                      ("270SUS", {"make": "Ford"}),
+                      ("54L", {"make": "Ford"})])
+        registry.seed(self.conn)
+        row = self.conn.execute(
+            "SELECT plate, aliases FROM known_vehicles").fetchone()
+        self.assertEqual(row["plate"], "EVL54L")
+        self.assertIsNone(row["aliases"])
+
+    def test_an_ungrouped_album_is_still_seeded_frame_by_frame(self) -> None:
+        """Nobody has pressed Group cars, so there is no verdict to trust
+        and one reading beats nothing."""
+        job = store.create_job(self.conn, Path("C:/shoot"), "meet", {})
+        path = Path("C:/shoot/loose.CR3")
+        store.add_images(self.conn, job, [path])
+        image_id = self.conn.execute(
+            "SELECT id FROM images WHERE path=?", (str(path),)).fetchone()[0]
+        det = store.add_detection(self.conn, image_id, (0, 0, 10, 10),
+                                  "car", 0.9, "C:/crops/00.jpg")
+        self.conn.execute(
+            'UPDATE detections SET plate=?, attributes=? WHERE id=?',
+            ("ZZZ999", '{"make": "Holden"}', det))
+        self.conn.commit()
+        registry.seed(self.conn)
+        self.assertEqual(registry.load(self.conn)["ZZZ999"]["make"], "Holden")
+
+
 class EditingItSomewhereElse(_Registry):
     def test_a_round_trip_keeps_everything(self) -> None:
         self._know("39432J", make="Ford", model="Falcon FG XR6",

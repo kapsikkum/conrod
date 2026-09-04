@@ -28,6 +28,7 @@ simply misses, which is the failure that does no damage.
 
 from __future__ import annotations
 
+import collections
 import csv
 import io
 import json
@@ -60,7 +61,13 @@ def normalise(plate: str | None) -> str:
 
 
 def load(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Every known car, keyed by its normalised plate.
+    """Every known car, keyed by its normalised plate and by its aliases.
+
+    An alias is another reading of the same car's plate -- 43111J where
+    eighteen frames said 73111J -- established by grouping from what the
+    crops look like, inside one burst. So looking one up is not fuzzy
+    matching: it is a plate this car was observed to be wearing, and the
+    lookup is still exact.
 
     Read once at the start of a run rather than queried per detection: it is
     a few thousand short rows at most, and the analysis workers are already
@@ -69,13 +76,18 @@ def load(conn: sqlite3.Connection) -> dict[str, dict]:
     known: dict[str, dict] = {}
     try:
         rows = conn.execute(
-            f"SELECT plate, {', '.join(FIELDS)} FROM known_vehicles").fetchall()
+            f"SELECT plate, {', '.join(FIELDS)}, aliases "
+            "FROM known_vehicles").fetchall()
     except sqlite3.OperationalError:      # table not created yet
         return known
     for row in rows:
         entry = {field: row[field] for field in FIELDS}
         entry["sponsors"] = _split(entry.get("sponsors"))
         known[normalise(row["plate"])] = entry
+        for alias in _split(row["aliases"] if "aliases" in row.keys() else None):
+            # The real plate wins if a misread of one car happens to be
+            # another car's actual registration.
+            known.setdefault(normalise(alias), entry)
     return known
 
 
@@ -128,55 +140,173 @@ def remember(conn: sqlite3.Connection, analysis) -> bool:
     if not any(fresh.values()):
         return False
 
+    # Other readings of this same car's plate, where the caller knows of
+    # any. Only grouping does: it establishes them from what the crops look
+    # like, so they are observations rather than guesses.
+    aliases = {normalise(a) for a in _split(getattr(analysis, "aliases", None))}
+    aliases.discard(plate)
+    aliases.discard("")
+
     existing = conn.execute(
-        f"SELECT {', '.join(FIELDS)} FROM known_vehicles WHERE plate = ?",
-        (plate,)).fetchone()
+        f"SELECT {', '.join(FIELDS)}, aliases FROM known_vehicles "
+        "WHERE plate = ?", (plate,)).fetchone()
     if existing is None:
         conn.execute(
-            f"""INSERT INTO known_vehicles (plate, {', '.join(FIELDS)}, updated_at)
-                VALUES (?{', ?' * len(FIELDS)}, ?)""",
-            (plate, *(fresh[f] for f in FIELDS), time.time()))
+            f"""INSERT INTO known_vehicles (plate, {', '.join(FIELDS)},
+                                            aliases, updated_at)
+                VALUES (?{', ?' * len(FIELDS)}, ?, ?)""",
+            (plate, *(fresh[f] for f in FIELDS),
+             ", ".join(sorted(aliases)) or None, time.time()))
         return True
 
     merged = {f: (existing[f] or fresh[f]) for f in FIELDS}
-    if all(merged[f] == existing[f] for f in FIELDS):
+    both = aliases | {normalise(a) for a in _split(existing["aliases"])}
+    both.discard(plate)
+    both.discard("")
+    kept = ", ".join(sorted(both)) or None
+    if (all(merged[f] == existing[f] for f in FIELDS)
+            and kept == (existing["aliases"] or None)):
         return False
     conn.execute(
         f"""UPDATE known_vehicles
-               SET {', '.join(f'{f} = ?' for f in FIELDS)}, updated_at = ?
+               SET {', '.join(f'{f} = ?' for f in FIELDS)},
+                   aliases = ?, updated_at = ?
              WHERE plate = ?""",
-        (*(merged[f] for f in FIELDS), time.time(), plate))
+        (*(merged[f] for f in FIELDS), kept, time.time(), plate))
     return True
 
 
 def seed(conn: sqlite3.Connection, job_id: int | None = None) -> dict:
-    """Build the registry out of what has already been identified.
+    """Build the registry out of albums that have already been identified.
 
-    An album that has been through identification already holds the answers;
-    this is what stops the registry starting empty on a machine that has been
-    shooting for months. Runs the same merge as remember(), so it can be
-    re-run and cannot blank anything.
+    Per *car*, not per frame, and that distinction is the whole of it. One
+    real group of seventeen frames of a single XE Falcon wagon had the model
+    read as Escort, Falcon, Cortina, Mustang, Granada, "Falcon XE Wagon",
+    "XE Falcon Wagon" and "Audi 100" -- one car, eight answers. Seeding a
+    frame at a time takes whichever of those happened to be attached to a
+    frame that also carried a plate, and writes it down as fact.
+
+    Grouping has already done this work and done it honestly: it publishes
+    ``group_make`` and ``group_model`` where the frames agreed, and leaves
+    them empty with the candidates in ``group_disputed`` where they did not.
+    So this trusts that verdict and stores nothing where grouping declined
+    to reach one. An empty column is a car whose model is still an open
+    question, which is true; "Granada" would have been a lie with a
+    provenance.
+
+    The other spellings of the plate go in as aliases, so the misread that
+    grouping already resolved is resolved here too rather than becoming a
+    second car -- which is exactly what the first version of this did.
+
+    Ungrouped detections are still seeded one at a time: an album nobody has
+    pressed Group cars on has no verdict to trust, and one reading is better
+    than nothing.
     """
     where = "WHERE i.job_id = ?" if job_id is not None else ""
     args = (job_id,) if job_id is not None else ()
     rows = conn.execute(
-        f"""SELECT d.plate, d.attributes, d.number
+        f"""SELECT d.plate, d.attributes, d.number, d.group_key
               FROM detections d JOIN images i ON i.id = d.image_id
               {where} {'AND' if where else 'WHERE'} d.plate IS NOT NULL
                 AND d.plate != '' AND d.attributes IS NOT NULL
                 AND d.attributes != ''""", args).fetchall()
 
-    added = 0
+    cars: dict = {}
+    loose: list = []
     for row in rows:
         try:
             parsed = json.loads(row["attributes"])
         except (TypeError, ValueError):
             continue
-        entry = _Reading(row["plate"], parsed, row["number"])
-        if remember(conn, entry):
+        if row["group_key"] is None:
+            loose.append(_Reading(row["plate"], parsed, row["number"]))
+        else:
+            cars.setdefault(row["group_key"], []).append((row, parsed))
+
+    added = 0
+    for members in cars.values():
+        reading = _agreed(members)
+        if reading and remember(conn, reading):
             added += 1
-    return {"looked_at": len(rows), "written": added,
-            "known": count(conn)}
+    for reading in loose:
+        if remember(conn, reading):
+            added += 1
+    return {"looked_at": len(rows), "cars": len(cars) + len(loose),
+            "written": added, "known": count(conn)}
+
+
+def _agreed(members: list) -> "_Reading | None":
+    """One car's settled identity, out of every frame of it.
+
+    Make and model come from grouping's own vote and are left blank where it
+    could not settle. Everything else is a plain majority of the frames that
+    offered a value -- which is safe for colour and body type in a way it is
+    not for the model, because "blue" read eleven times and "navy" once is
+    one car described twice, where Escort and Mustang are two different
+    claims about what it is.
+    """
+    plates = collections.Counter()
+    for row, _parsed in members:
+        key = normalise(row["plate"])
+        if key:
+            plates[key] += 1
+    if not plates:
+        return None
+    # The plate most of the frames read. The rest are readings of the same
+    # car's plate, so they become the ways of finding it.
+    (best, _count), = plates.most_common(1)
+    # Only the ones that are plausibly the same plate misread -- one
+    # confusable character, same length, which is grouping's own test.
+    #
+    # Grouping is looser than that across bursts, and on a real album it
+    # over-merged: one car ended up holding EVL54L, 270SUS, 54L, EIL5AL and
+    # MAY054, which are five different registrations. Inside a burst that
+    # costs one pile and the crops are there to argue with. Written into the
+    # registry it would be permanent, and it would hand one car's identity
+    # to four others on every future album. So the registry keeps only the
+    # readings it can see are readings of this plate.
+    aliases = [plate for plate in plates
+               if plate != best and _near_plate(plate, best)]
+
+    first = members[0][1]
+    reading = _Reading(best, {}, None)
+    reading.aliases = aliases
+    # Grouping's verdict, which is None when the frames disagreed.
+    reading.make = first.get("group_make") or _majority(members, "make")
+    reading.model = first.get("group_model")
+    for field in ("colour", "body_type", "team", "race_number"):
+        setattr(reading, field, _majority(members, field))
+    reading.sponsors = _majority(members, "sponsors")
+    return reading
+
+
+def _near_plate(a: str, b: str) -> bool:
+    """Whether these are one plate read two ways.
+
+    Grouping's own test, reached lazily so that reading the registry does
+    not drag in numpy and the similarity model behind it.
+    """
+    from .grouping import _near_plate as near
+
+    return near(a, b)
+
+
+def _majority(members: list, field: str):
+    """The value most of this car's frames gave for one field."""
+    votes = collections.Counter()
+    for _row, parsed in members:
+        value = parsed.get(field)
+        if isinstance(value, list):
+            for item in value:
+                if item:
+                    votes[str(item).strip()] += 1
+        elif value:
+            votes[str(value).strip()] += 1
+    if not votes:
+        return None
+    if field == "sponsors":
+        return [name for name, _n in votes.most_common()]
+    return votes.most_common(1)[0][0]
 
 
 def count(conn: sqlite3.Connection) -> int:
@@ -279,6 +409,7 @@ class _Reading:
 
     def __init__(self, plate, parsed: dict, number=None):
         self.plate = plate
+        self.aliases: list = []
         for field in FIELDS:
             setattr(self, field, parsed.get(field))
         if not getattr(self, "race_number", None):
