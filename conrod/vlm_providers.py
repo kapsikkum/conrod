@@ -45,10 +45,70 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:ge
 # hammering while the others back off -- so one 429 holds all of them.
 
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504, 529}
+
+# A rate limit is not a failure. It is the provider saying "not yet", and the
+# right answer is to wait, not to give up on the frame and move on -- moving
+# on means the shoot comes back with holes in it that look exactly like
+# frames the model had nothing to say about. These are therefore waited out
+# for as long as they last, and do not spend the retry budget, which is
+# there for things that might actually be broken.
+RATE_LIMIT_STATUSES = {429, 529}
+
+# The longest single backoff we invent for ourselves. A retry-after from the
+# provider is obeyed as given, however long it is: it is a fact about when
+# the limit lifts, not a guess, and capping it just means asking again too
+# early and being refused again.
 MAX_WAIT = 60.0
+
+# Checked while waiting, so Stop still stops during a long rate limit rather
+# than after it. Set by the pipeline; nothing here waits uninterruptibly.
+_stop_check = None
+
+# How long a single sleep runs before the stop flag is looked at again.
+WAIT_SLICE = 0.5
 
 _gate = threading.Lock()
 _not_before = 0.0
+
+
+class Stopped(BaseException):
+    """The scan was stopped while waiting for a rate limit to lift.
+
+    Deliberately off the Exception branch, the way KeyboardInterrupt is. Every
+    reader in analyze() is wrapped in its own `except Exception` so that one
+    of them failing cannot blank a whole detection -- which is right, and
+    which would also quietly turn "the photographer pressed Stop" into "the
+    vision model could not read this frame", logged once per crop, for as
+    many crops as were still queued.
+    """
+
+
+def set_stop_check(check) -> None:
+    """Give the waiters a way to notice that the scan was stopped."""
+    global _stop_check
+    _stop_check = check
+
+
+def _sleep(seconds: float) -> None:
+    """Sleep, looking up often enough to notice a Stop.
+
+    Sliced only when there is a stop check to run. Slicing exists to notice a
+    Stop and nothing else, so without one it is a loop that wakes up hundreds
+    of times to ask a question nobody is answering.
+    """
+    if seconds <= 0:
+        return
+    if _stop_check is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        if _stop_check():
+            raise Stopped("stopped while waiting for the provider")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(WAIT_SLICE, left))
 
 
 def _hold_off(seconds: float) -> None:
@@ -61,20 +121,21 @@ def _hold_off(seconds: float) -> None:
 def _wait_turn() -> None:
     with _gate:
         delay = _not_before - time.monotonic()
-    if delay > 0:
-        time.sleep(delay)
+    _sleep(delay)
 
 
 def _retry_after(response: httpx.Response, attempt: int) -> float:
     """How long the provider asked for, or a backed-off guess."""
     header = response.headers.get("retry-after")
     if header:
+        # Taken at face value, uncapped. The provider is stating when the
+        # limit lifts; clamping that to a minute only buys another refusal.
         try:
-            return min(MAX_WAIT, max(0.0, float(header)))
+            return max(0.0, float(header))
         except ValueError:
             try:                                    # an HTTP date
                 when = email.utils.parsedate_to_datetime(header)
-                return min(MAX_WAIT, max(0.0, when.timestamp() - time.time()))
+                return max(0.0, when.timestamp() - time.time())
             except (TypeError, ValueError):
                 pass
     # Jittered, so several workers refused at once do not all come back in
@@ -83,10 +144,25 @@ def _retry_after(response: httpx.Response, attempt: int) -> float:
 
 
 def _send(send, settings: Settings, what: str) -> httpx.Response:
-    """Make the request, waiting out rate limits rather than failing on one."""
+    """Make the request, waiting out rate limits rather than failing on one.
+
+    A rate limit is waited out however long it takes. It used to spend one of
+    four retries, so a provider that was busy for ten minutes cost the frame:
+    the call gave up, the reader logged a failure, and the scan carried on
+    and left a car unnamed. That hole is indistinguishable afterwards from a
+    frame the model genuinely could not read, which is the worst property a
+    hole can have. Stop still works throughout -- every wait here is
+    interruptible.
+
+    The retry budget still applies to timeouts, transport errors and 5xx
+    answers that are not "slow down", because those may mean something is
+    actually broken and waiting forever on them helps nobody.
+    """
     attempts = max(1, getattr(settings, "vlm_max_retries", 4))
     last: Exception | None = None
-    for attempt in range(attempts):
+    spent = 0                 # retries spent on things that might be broken
+    waited = 0.0              # total time held up by rate limits
+    while True:
         _wait_turn()
         try:
             response = send()
@@ -94,21 +170,33 @@ def _send(send, settings: Settings, what: str) -> httpx.Response:
             return response
         except httpx.HTTPStatusError as exc:
             last = exc
-            if exc.response.status_code not in RETRY_STATUSES:
+            status = exc.response.status_code
+            if status not in RETRY_STATUSES:
                 raise
-            if attempt == attempts - 1:
-                break
-            wait = _retry_after(exc.response, attempt)
+            limited = status in RATE_LIMIT_STATUSES
+            if not limited:
+                spent += 1
+                if spent >= attempts:
+                    break
+            wait = _retry_after(exc.response, spent)
             _hold_off(wait)
-            _note(f"{what} is rate limiting; waiting {wait:.0f}s "
-                  f"(attempt {attempt + 1} of {attempts})")
+            if limited:
+                waited += wait
+                _note(f"{what} is rate limiting; waiting {wait:.0f}s "
+                      f"({waited / 60:.0f} min so far). The scan is paused, "
+                      f"not skipping frames.")
+            else:
+                _note(f"{what} returned {status}; waiting {wait:.0f}s "
+                      f"(attempt {spent} of {attempts})")
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             last = exc
-            if attempt == attempts - 1:
+            spent += 1
+            if spent >= attempts:
                 break
-            wait = _retry_after(httpx.Response(503), attempt)
+            wait = _retry_after(httpx.Response(503), spent)
             _hold_off(wait)
-            _note(f"{what} did not answer ({exc}); waiting {wait:.0f}s")
+            _note(f"{what} did not answer ({exc}); waiting {wait:.0f}s "
+                  f"(attempt {spent} of {attempts})")
     raise last if last else RuntimeError(f"{what} could not be reached")
 
 

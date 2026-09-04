@@ -27,7 +27,7 @@ from . import detect as detect_mod
 from . import keywords as keywords_mod
 from . import grouping
 from . import sharpness as sharpness_mod
-from . import store, vlm
+from . import store, vlm, vlm_providers
 from .analyze import VehicleAnalysis, analyze
 from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
                      RAW_SUFFIXES, Settings)
@@ -150,6 +150,11 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
 
     def on_progress(event: dict) -> None:      # noqa: F811 - deliberate shadow
         _safely(raw_progress, event)
+
+    # Let the provider's waits notice a Stop. A rate limit is waited out
+    # rather than skipped, so without this a scan stopped mid-limit would sit
+    # there until the provider relented before noticing it had been stopped.
+    vlm_providers.set_stop_check(should_stop or (lambda: False))
 
     root = root.resolve()
     files = scan(root, recursive)
@@ -540,6 +545,10 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
 
     def on_progress(event: dict) -> None:      # noqa: F811 - deliberate shadow
         _safely(raw_progress, event)
+
+    # As in run(): a rate limit is waited out, so the wait has to be able to
+    # hear a Stop.
+    vlm_providers.set_stop_check(should_stop or (lambda: False))
 
     if settings.use_vlm:
         vlm.check_available(settings)
@@ -940,6 +949,12 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                 store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
+            except vlm_providers.Stopped:
+                # Stop, pressed while a rate limit was being waited out. Put
+                # the crop back so a resume picks it up rather than counting
+                # it as analysed-and-empty, and leave the queue for the other
+                # workers to drain on their own way out.
+                break
             except Exception as exc:
                 errors.append(f"analyse {crop_path}: {exc}")
                 analysis = VehicleAnalysis()
