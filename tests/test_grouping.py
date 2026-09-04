@@ -472,6 +472,7 @@ class SecondLookThroughConsolidate(unittest.TestCase):
             "CREATE TABLE detections (id INTEGER PRIMARY KEY, image_id INT,"
             " crop_path TEXT, attributes TEXT, signature TEXT, colour_hex TEXT,"
             " cls TEXT, plate TEXT, sharpness REAL, rejected INT DEFAULT 0,"
+            " bystander INT DEFAULT 0,"
             " group_key TEXT, group_size INT, group_agreement REAL,"
             " group_colour_hex TEXT);")
         sig = "ffff0000:" + ",".join(["0.03"] * 36)

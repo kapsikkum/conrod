@@ -42,9 +42,26 @@ from PIL import Image
 # them, few enough that each still holds real detail at thumbnail sizes.
 TILE_GRID = 6
 
-# The background is measured on a finer grid, because the crop is padded by
-# less than a fifth and a coarse tile almost always catches some of the car.
-BACKGROUND_GRID = 16
+# The background is measured in tiles the same size as the subject's, not on
+# a grid of its own. This used to be a fixed sixteen, which sounds harmless
+# and was not: the per-tile figure is gradient energy over contrast squared,
+# and that ratio depends on tile size. A small tile holds a higher fraction
+# of whatever edge is in it, so a fine grid reports a systematically higher
+# number than a coarse one for the same content, and comparing a 16-grid
+# background against a 6-grid subject compares two different scales.
+#
+# It made the background of a panning shot score *above* its subject --
+# median margin -0.126 where a held pan is supposed to run well positive --
+# so pan detection had been dead for as long as it had existed: two frames
+# in 1,720 of a shoot that is almost entirely panning. Sized to match, the
+# same frames run +0.223 and 72 of 120 read as pans.
+#
+# The fixed grid was introduced because the crop is padded by less than a
+# fifth, so a coarse tile almost always catches some of the car and nothing
+# survives the overlap rule. That is still true and is still the constraint:
+# where too few tiles survive the background is reported as unmeasured,
+# which is honest, rather than measured on a scale that does not match.
+BACKGROUND_MIN_TILES = 2
 
 # Which tile speaks for the crop. The maximum is too eager -- one specular
 # highlight or a sharp-edged sticker on an otherwise soft car will hit it --
@@ -61,9 +78,20 @@ TILE_PERCENTILE = 80
 # never useful.
 MIN_TILE_CONTRAST = 1.5
 
-# The crop is resized so the measure means the same thing on a 300px crop and
-# a 3000px one. Without it a big crop scores higher for being big.
-WORKING_EDGE = 512
+# How big the crop is when it is measured. Resized so the measure means the
+# same thing on a 300px crop and a 3000px one; without it a big crop scores
+# higher for being big. Raised from 512, which was
+# quietly the largest fault in the cull: a saved crop runs to 2048px, so the
+# vehicle inside it was being shrunk by four before anything looked at it,
+# and a smear of twenty pixels came back as five. Two real frames of one
+# shoot settle it -- a cleanly held pan scored 0.545 and a badly tracked one
+# where the whole car is smeared scored 0.552, so the cull ranked the
+# unusable frame above the keeper. Measured at 1024 the same pair separates
+# by a factor of 1.29 the right way round.
+#
+# The cost is four times the pixels of a step that took about sixteen
+# milliseconds, against a vision model that takes seconds. Worth it.
+WORKING_EDGE = 1024
 
 
 # How much sharper the subject has to be than what is behind it before the
@@ -266,17 +294,19 @@ def _background_score(data: np.ndarray, inner) -> float:
     they hold both the car and what is behind it, and on a pan that is the
     one place the two cannot be told apart.
 
-    On a finer grid than the subject uses, and for a reason found by running
-    it: the crop is padded by less than a fifth, so on a six by six grid
-    almost every tile touches the vehicle, nothing survives the overlap rule
-    and the background comes back unmeasured on every frame. That silently
-    turned off pan detection altogether -- it was reporting "no background"
-    for all seventeen vehicles of a test shoot.
+    In tiles the size of the subject's, so that the two numbers mean the
+    same thing and can be subtracted -- see BACKGROUND_MIN_TILES for what
+    went wrong when they were not.
     """
     x1, y1, x2, y2 = inner
     height, width = data.shape
-    rows = np.array_split(np.arange(height), BACKGROUND_GRID)
-    cols = np.array_split(np.arange(width), BACKGROUND_GRID)
+    # The subject's own tile size, in pixels, which is the unit the two
+    # scores have to share.
+    tile_px = max(y2 - y1, x2 - x1) / TILE_GRID
+    if tile_px <= 0:
+        return -1.0
+    rows = np.array_split(np.arange(height), max(2, round(height / tile_px)))
+    cols = np.array_split(np.arange(width), max(2, round(width / tile_px)))
     energy = _focus_map(data)
 
     scores: list[float] = []
@@ -295,7 +325,7 @@ def _background_score(data: np.ndarray, inner) -> float:
             scores.append(float(energy[r0:r1, c0:c1].mean())
                           / (contrast * contrast))
 
-    if len(scores) < 2:
+    if len(scores) < BACKGROUND_MIN_TILES:
         return -1.0
     return _normalise(float(np.percentile(scores, TILE_PERCENTILE)))
 
@@ -333,12 +363,22 @@ def _bands(subject: np.ndarray):
     return bands, "top" if first > last else "bottom"
 
 
-# Measured across Gaussian blurs of a detailed target: a crisp crop lands
-# near 4.0 and one blurred past saving near 0.15, with the useful judgements
-# spread between. The spacing is close to logarithmic, so the scale is too --
-# a hyperbola put everything from crisp to visibly soft inside four points of
-# each other and made the score useless for sorting.
-RAW_BLURRED, RAW_SHARP = 0.15, 4.0
+# Measured across Gaussian blurs of a real vehicle crop, at WORKING_EDGE:
+# crisp lands at 0.82, one pixel of blur at 0.68, three at 0.34, and by eight
+# it is 0.10 and past saving. The spacing is close to logarithmic, so the
+# scale is too -- a hyperbola put everything from crisp to visibly soft
+# inside four points of each other and made the score useless for sorting.
+#
+# Re-derived when WORKING_EDGE changed. These constants are a statement about
+# how much focus energy survives a given blur at a given resolution, so they
+# do not carry across a change of scale: left at 0.15/4.0 the whole shoot
+# collapsed into the bottom third of the range.
+#
+# The floor is where a frame stops being worth ranking rather than where it
+# stops being an image. Putting it at the twelve-pixel mark instead pinned
+# two frames in five at exactly zero, which throws away the ordering that
+# sorting worst-first depends on.
+RAW_BLURRED, RAW_SHARP = 0.10, 0.85
 
 
 def _normalise(raw: float) -> float:
@@ -376,12 +416,46 @@ def rating_for(score: float, sharp_at: float, blurred_below: float) -> str:
 # so it has to arrive as stars and a colour label rather than as a private
 # score in a private database.
 #
-# Five stars is deliberately never given automatically. A machine that has
-# measured focus and framing has not seen the picture -- whether the moment
-# is any good is the photographer's, and the top of the scale is left for it.
-STAR_BANDS = ((0.72, 4), (0.52, 3), (0.34, 2), (0.0, 1))
+# Where the subject rating lands on the one-to-five scale.
+#
+# The measure used to stop at four, on the grounds that whether the moment
+# is any good is not a focus measurement. True, but it is the photographer's
+# scale and they can always overrule it -- so the cull gives its honest
+# opinion across the whole range rather than holding one back.
+#
+# Fitted against 944 frames of one Bathurst weekend that the photographer
+# rated by hand, one to five, rather than against a synthetic target. The
+# floors are the points that reproduce their own spread -- 62% of the shoot
+# on one star, 19% on two, 9% on three, 7% on four and 2% on five -- which
+# is a harsher standard than any curve fitted to a blur ladder produced, and
+# it is theirs.
+#
+# On those 944 frames this agrees exactly 60% of the time and lands within
+# one star 89% of the time, against 58% and 88% for the measure it replaces.
+# The honest reading of that gap is that it is small: most of what a cull
+# can contribute is already in the ordering, and the remaining disagreement
+# is not blur. Whether a frame is worth keeping also turns on which car it
+# is and what the light was doing, and a focus measure cannot see either --
+# so these bands are a first pass to sort by, not a verdict.
+#
+# Absolute thresholds rather than a per-album ranking, deliberately: a frame
+# should not change rating because of what else is in the album with it, and
+# two albums should be comparable. Fitted on one album, then fixed.
+STAR_BANDS = ((0.958, 5), (0.825, 4), (0.728, 3), (0.606, 2), (0.0, 1))
 
 LABEL_GOOD, LABEL_FAIR, LABEL_POOR = "Green", "Yellow", "Red"
+
+# The good/fair/poor wording, kept on the same footing as the stars so the
+# card cannot say "good" about a frame it is giving two stars to -- which is
+# exactly what it did when these were tuned against a scale that no longer
+# exists. Good is the four-star floor, poor is anything under two.
+#
+# They live in config beside the setting they are the default for, because
+# config is imported long before there is any reason to pay for numpy and
+# Pillow. FOCUS_SCALE is bumped whenever the scale above is re-derived, and
+# Settings.load uses it to retire hand-set thresholds that were about the
+# old one.
+from .config import BLURRED_BELOW, FOCUS_SCALE, SHARP_AT  # noqa: E402,F401
 
 
 def stars_for(rating: float) -> int:
@@ -410,8 +484,9 @@ def rate(image: Image.Image, settings=None, box=None) -> Sharpness:
     result = measure(image, box)
     if not result and result.score <= 0:
         return result
-    sharp_at = getattr(settings, "sharp_at", 0.62) if settings else 0.62
-    blurred_below = getattr(settings, "blurred_below", 0.40) if settings else 0.40
+    sharp_at = getattr(settings, "sharp_at", SHARP_AT) if settings else SHARP_AT
+    blurred_below = (getattr(settings, "blurred_below", BLURRED_BELOW)
+                     if settings else BLURRED_BELOW)
     result.verdict = verdict_for(result.score, sharp_at, blurred_below)
     return result
 

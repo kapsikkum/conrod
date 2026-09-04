@@ -109,6 +109,10 @@ _MIGRATIONS = [
     # own column rather than written over `rating` so that re-culling an
     # album cannot quietly erase the photographer's own pass.
     ("detections", "stars", "INTEGER"),
+    # A vehicle that is in the photograph but is not what the photograph is
+    # of. Distinct from rejected: rejecting is a judgement about the frame,
+    # this is a statement about which car in it is the subject.
+    ("detections", "bystander", "INTEGER"),
 
     # Where the sharpness is, rather than how much of it there is. A held pan
     # has a sharp subject against a smeared background, and judged on the
@@ -120,6 +124,13 @@ _MIGRATIONS = [
     # The cull was a close call and a person should see the frame. Culled all
     # the same -- the alternative is a shoot that quietly loses its panners.
     ("detections", "uncertain", "INTEGER"),
+
+    # What the file already said before Conrod ever looked at it. A shoot
+    # that has been through Lightroom once arrives with the photographer's
+    # own opinion on it, and the cull has no business either ignoring that
+    # or overwriting it.
+    ("images", "rating_in_file", "INTEGER"),
+    ("images", "label_in_file", "TEXT"),
 ]
 
 
@@ -214,7 +225,16 @@ def list_jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                  WHERE i2.job_id = j.id) AS detection_count,
                (SELECT COUNT(*) FROM images i3
                  WHERE i3.job_id = j.id AND i3.status != 'detected')
-                 AS unfinished_count
+                 AS unfinished_count,
+               -- Whether grouping has ever run on this album. Grouping is
+               -- the last step of a full scan, so an album that was culled
+               -- and stopped has none, and the review screen needs to say
+               -- that rather than let every frame of one car look like a
+               -- separate vehicle nobody grouped.
+               (SELECT COUNT(*) FROM detections d2
+                  JOIN images i4 ON i4.id = d2.image_id
+                 WHERE i4.job_id = j.id AND d2.group_key IS NOT NULL)
+                 AS grouped_count
           FROM jobs j ORDER BY j.id DESC
         """
     ).fetchall()
@@ -317,6 +337,36 @@ def set_frame_origin(conn: sqlite3.Connection, job_id: int,
         "UPDATE images SET camera=?, burst_key=?, taken_at=? WHERE id=?", rows)
     conn.commit()
     return len(rows)
+
+
+def set_existing_marks(conn: sqlite3.Connection, job_id: int,
+                       marks: dict) -> int:
+    """Record the rating and colour label each file already carried.
+
+    ``marks`` is keyed by path, holding ``(rating, label)``. Matched on a
+    normalised path for the same reason set_frame_origin is: exiftool hands
+    back forward slashes and the database holds what Windows gave us.
+
+    A rating of zero is not a rating. Every camera writes 0 into the field
+    for "not rated", so treating it as a deliberate one star would put a
+    floor under the whole shoot and quietly outvote the cull on every frame.
+    """
+    known = {_path_key(row["path"]): row["id"] for row in conn.execute(
+        "SELECT id, path FROM images WHERE job_id=?", (job_id,))}
+
+    rows = []
+    for path, (rating, label) in marks.items():
+        image_id = known.get(_path_key(path))
+        if image_id is None:
+            continue
+        stars = rating if isinstance(rating, int) and 1 <= rating <= 5 else None
+        rows.append((stars, (label or "").strip() or None, image_id))
+    if not rows:
+        return 0
+    conn.executemany(
+        "UPDATE images SET rating_in_file=?, label_in_file=? WHERE id=?", rows)
+    conn.commit()
+    return sum(1 for row in rows if row[0] is not None)
 
 
 def _path_key(path) -> str:

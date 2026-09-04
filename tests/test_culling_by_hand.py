@@ -102,6 +102,14 @@ class SortingByStar(unittest.TestCase):
         conn = self._album([(1, 0.95, None), (2, 0.10, 5)])
         self.assertEqual(self._order(conn, "best")[0], 2)
 
+    def test_a_judgement_outranks_a_calculation_of_the_same_number(self) -> None:
+        """Once the measure could reach five as well, a frame someone
+        starred tied with a sharp one that had merely been calculated to the
+        same value -- and lost the tiebreak on raw sharpness."""
+        conn = self._album([(1, 0.99, None), (2, 0.40, 5)])
+        self.assertEqual(sharpness.stars_for(0.99), 5)
+        self.assertEqual(self._order(conn, "best")[0], 2)
+
     def test_unrated_frames_go_last_in_both_directions(self) -> None:
         """An unrated frame is not a bad one. Sorting worst-first must not
         bury the ones nothing has looked at yet under the rejects."""
@@ -121,6 +129,57 @@ class SortingByStar(unittest.TestCase):
                        if getattr(m, "pattern", None))
         self.assertEqual(set(server.ORDERINGS),
                          set(pattern.strip("^$()").split("|")))
+
+
+class FilteringByStar(unittest.TestCase):
+    """"3 stars and up" as a filter, the way Aftershoot's toolbar has it --
+    not only a sort order to scroll through until the rating drops off.
+    Built on the same effective-stars expression the sort already uses, so
+    a card showing 4 stars and a filter set to 3+ can never disagree about
+    whether it belongs."""
+
+    def _album(self, rows):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE detections (id INTEGER PRIMARY KEY,"
+                     " rating REAL, stars INTEGER)")
+        conn.executemany("INSERT INTO detections VALUES (?,?,?)", rows)
+        return conn
+
+    def _at_least(self, conn, n):
+        rank = server._RANK.replace("d.", "")
+        sql = f"SELECT id FROM detections d WHERE ({rank}) >= ? ORDER BY id"
+        return [r["id"] for r in conn.execute(sql, (n,))]
+
+    def test_only_frames_at_or_above_the_floor_pass(self) -> None:
+        conn = self._album([(1, None, 2), (2, None, 3), (3, None, 5)])
+        self.assertEqual(self._at_least(conn, 3), [2, 3])
+
+    def test_a_measured_rating_counts_the_same_as_a_hand_rating(self) -> None:
+        """The filter reads the same effective-stars value the card shows
+        and the sort uses -- a frame the cull rated highly must not be
+        invisible to a high floor just because nobody starred it by hand."""
+        conn = self._album([(n, floor, None) for n, (floor, _)
+                            in enumerate(sharpness.STAR_BANDS, start=1)])
+        top_stars = max(stars for _, stars in sharpness.STAR_BANDS)
+        top_row = next(n for n, (_, stars) in
+                       enumerate(sharpness.STAR_BANDS, start=1) if stars == top_stars)
+        self.assertIn(top_row, self._at_least(conn, top_stars))
+
+    def test_unrated_frames_never_pass_any_floor(self) -> None:
+        conn = self._album([(1, None, None)])
+        for n in range(1, 6):
+            self.assertEqual(self._at_least(conn, n), [])
+
+    def test_the_endpoint_rejects_a_floor_off_the_scale(self) -> None:
+        import inspect
+
+        signature = inspect.signature(server.detections)
+        query = signature.parameters["min_stars"].default
+        bounds = {getattr(m, "ge", None): True for m in query.metadata}
+        self.assertIn(1, bounds)
+        bounds = {getattr(m, "le", None): True for m in query.metadata}
+        self.assertIn(5, bounds)
 
 
 class WritingWhatWasChosen(unittest.TestCase):
@@ -173,6 +232,64 @@ class TheKeyboard(unittest.TestCase):
         photograph either way, and U puts it back."""
         cut = self.code[self.code.index("async function cutCard"):][:400]
         self.assertNotIn("confirm(", cut)
+
+
+class TheFullFrameDialog(unittest.TestCase):
+    """The zoomed-in view is where a soft or borderline frame actually gets
+    judged, so a person had to close it and go hunting for the small card
+    behind it just to cull the thing they were already looking at."""
+
+    def setUp(self):
+        import conrod
+
+        self.code = (Path(conrod.__file__).parent / "web" / "app.js").read_text(
+            encoding="utf-8")
+        self.html = (Path(conrod.__file__).parent / "web" / "index.html").read_text(
+            encoding="utf-8")
+
+    def test_the_dialog_carries_reject_and_star_controls(self) -> None:
+        self.assertIn('id="frame-reject"', self.html)
+        self.assertIn('id="frame-stars"', self.html)
+
+    def test_opening_a_frame_remembers_which_card_it_came_from(self) -> None:
+        """Both views draw off the same card node, through the same
+        setStars/cutCard, so the dialog and the grid behind it can never
+        disagree about a vehicle's state."""
+        opening = self.code[self.code.index("function openFrame(node)"):][:400]
+        self.assertIn("state.dialogNode = node", opening)
+
+    def test_the_arrows_walk_the_vehicles_other_frames(self) -> None:
+        """Culling a twenty-five frame burst used to mean open, judge,
+        close, click the next, twenty-five times over."""
+        self.assertIn("function stepFrame(by)", self.code)
+        handler = self.code[self.code.index('document.addEventListener("keydown"'):]
+        self.assertIn("stepFrame(1)", handler[:2500])
+        self.assertIn("stepFrame(-1)", handler[:2500])
+
+    def test_it_says_where_you_are_in_the_burst(self) -> None:
+        render = self.code[self.code.index("function renderFrame()"):]
+        self.assertIn("of ${all.length}", render)
+
+    def test_star_and_reject_buttons_call_the_one_true_functions(self) -> None:
+        body = self.code[self.code.index("function renderFrame()"):][:3500]
+        self.assertIn("setStars(node", body)
+        self.assertIn("cutCard(node", body)
+
+    def test_jk_do_not_move_the_cursor_behind_a_dialog_the_person_cannot_see(
+        self,
+    ) -> None:
+        """j/k used to move state.cursor regardless of what was on screen --
+        harmless in the grid, but from inside the dialog it meant the next X
+        could cull a vehicle nobody was looking at."""
+        handler = self.code[self.code.index('document.addEventListener("keydown"'):]
+        self.assertIn("!dialogOpen && (key", handler[:2000])
+
+    def test_closing_the_dialog_forgets_the_card(self) -> None:
+        """Every way out -- the button, the backdrop, Escape -- has to clear
+        it, or a stale reference could let a keystroke reach a card that is
+        no longer the one on screen."""
+        self.assertIn('addEventListener("close", () => { state.dialogNode = null; })',
+                      self.code)
 
 
 if __name__ == "__main__":

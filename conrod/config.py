@@ -31,6 +31,15 @@ MODEL_DIR = DATA_ROOT / "models"
 CACHE_DIR = DATA_ROOT / "cache"
 DB_PATH = DATA_ROOT / "conrod.db"
 SETTINGS_PATH = DATA_ROOT / "settings.json"
+
+# Where "good" and "poor" sit on the focus scale, and which version of that
+# scale they were placed against. Defined here rather than in sharpness so
+# that reading settings does not drag in numpy and Pillow; the reasoning for
+# the numbers, and the scale itself, are in sharpness.
+# Aligned with the star bands so the wording cannot disagree with the
+# stars: good is the four-star floor, poor is anything under two.
+SHARP_AT, BLURRED_BELOW = 0.825, 0.606
+FOCUS_SCALE = 3
 # A windowed build has no console, so this is the only place a crash before the
 # window opens can leave a trace. See _ensure_streams in main.py.
 LOG_PATH = DATA_ROOT / "conrod.log"
@@ -158,8 +167,27 @@ class Settings:
 
     # --- vision-language model ---
     use_vlm: bool = True
+    # "ollama" runs locally and needs nothing else; "openai", "anthropic" and
+    # "gemini" send crops to that provider's API and need vlm_api_key. In
+    # every case vlm_model means whichever model name that provider expects
+    # -- "qwen2.5vl:7b" for Ollama, "gpt-4o" for OpenAI, and so on.
+    vlm_provider: str = "ollama"
     vlm_model: str = "qwen2.5vl:7b"
     vlm_host: str = "http://127.0.0.1:11434"
+    vlm_api_key: str = ""
+    # Anthropic takes two kinds of credential on two different headers, and
+    # they cannot be told apart reliably enough to guess: a console API key
+    # goes on x-api-key, a Claude Code OAuth token on Authorization: Bearer.
+    # Sending both would mean putting the credential on the wire twice.
+    # "auto" reads it off the token's own prefix, which is distinct enough
+    # to be reliable; the other two force it. A fixed default of "api-key"
+    # could not be told apart from someone having chosen "api-key", so a
+    # Claude Code token went out on the wrong header and came back 401.
+    anthropic_key_kind: str = "auto"         # auto | api-key | claude-code
+    # How many times a cloud call is retried when the provider is rate
+    # limiting or briefly unavailable. A shoot is thousands of crops and
+    # every provider meters them, so 429 is part of a normal scan.
+    vlm_max_retries: int = 4
     vlm_timeout: float = 180.0
     vlm_input_edge: int = 1568
     # After grouping, reconcile a group's disagreeing readings into one
@@ -183,16 +211,42 @@ class Settings:
     # smooth painted panel -- so thresholds picked on synthetic images called
     # four per cent of a shoot sharp and forty per cent unusable.
     #
-    # Placed by looking at the pictures at each decile. Below 0.25 the
-    # subject is genuinely gone; above 0.52 it is crisp. The wide band
-    # between them is where the good panning shots live, and calling those
-    # anything worse than "soft" would throw away the keepers.
+    # Placed by looking at the pictures at each decile: below the lower one
+    # the subject is genuinely gone, above the upper one it is crisp. The
+    # wide band between them is where the good panning shots live, and
+    # calling those anything worse than "soft" would throw away the keepers.
+    #
+    # Both come from sharpness, so that recalibrating the scale moves the
+    # wording with it instead of leaving the card calling a two-star frame
+    # "good".
     #
     # Still a per-shooter number: it depends on the lens, the light and how
     # you pan. The raw score is stored beside the verdict, so a shoot can be
     # re-sorted on a new threshold without re-reading a single file.
-    sharp_at: float = 0.52
-    blurred_below: float = 0.25
+    sharp_at: float = SHARP_AT
+    blurred_below: float = BLURRED_BELOW
+
+    # Which scale the two numbers above were set against. Not shown in
+    # settings; see FOCUS_SCALE.
+    focus_scale: int = FOCUS_SCALE
+
+    # Below how many stars a frame rejects itself, or 0 for never. The cull
+    # already has an opinion about every frame; this is the photographer
+    # saying how much of that opinion to act on without being asked.
+    #
+    # Two by default, so the one-star frames go without being asked about.
+    # On the shoot these bands were fitted to that is 62% of the take, which
+    # sounds drastic until you look at them -- and nothing is deleted or
+    # written to a file, so the Rejected view puts back anything it should
+    # not have taken.
+    auto_reject_below_stars: int = 2
+
+    # Read the rating and colour label the files already carry, and treat a
+    # rating found there as the photographer's own -- because it is. A shoot
+    # that has been through Lightroom once arrives already culled in part,
+    # and a second opinion that cannot see the first is worth less than one
+    # that can.
+    import_existing_ratings: bool = True
 
     # Cut the frames that are gone before they are identified rather than
     # after. Sharpness costs about sixteen milliseconds a crop and the vision
@@ -300,6 +354,17 @@ class Settings:
         for key, value in stored.items():
             if key in known:
                 setattr(settings, key, value)
+
+        # A threshold is a number about a scale. When the scale is re-derived
+        # the old number still loads and still looks deliberate, but it now
+        # means something the photographer never asked for -- 0.52 meant
+        # "crisp" on the scale before this one and means "barely two stars"
+        # on this one. Retiring the pair is the honest move; they are two
+        # sliders to set again, against a cull that is telling the truth.
+        if stored.get("focus_scale") != FOCUS_SCALE:
+            settings.sharp_at = SHARP_AT
+            settings.blurred_below = BLURRED_BELOW
+            settings.focus_scale = FOCUS_SCALE
         return settings
 
     def apply(self, updates: dict) -> "Settings":

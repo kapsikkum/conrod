@@ -26,6 +26,28 @@ from . import ocr, plates, vlm
 from .config import Settings
 
 
+def _log_step_failure(step: str, exc: Exception) -> None:
+    """One reader crashing must not blank the other three, and it must not
+    vanish silently either -- the only net used to be _analysis_worker's own
+    catch-all, which discarded plate through team the moment any one reader
+    tripped, and never wrote down why. Sixteen consecutive detections came
+    back with nothing at all -- not just no plate, no make or colour either
+    -- and there was no record anywhere of what had actually failed."""
+    try:
+        import time
+        import traceback
+
+        from .config import LOG_PATH
+
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as fh:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            fh.write(f"\n--- {step} failed {stamp}: {exc} ---\n")
+            traceback.print_exc(file=fh)
+    except Exception:
+        pass
+
+
 @dataclass
 class VehicleAnalysis:
     # what it is
@@ -55,6 +77,9 @@ class VehicleAnalysis:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
     @classmethod
     def from_json(cls, raw: str | None) -> "VehicleAnalysis":
@@ -86,7 +111,20 @@ class VehicleAnalysis:
         colour = self.colour or ""
         colour = colour[:1].upper() + colour[1:]
         bits = [b for b in (colour, make, model) if b]
-        label = " ".join(bits) if bits else self.kind
+        if bits:
+            label = " ".join(bits)
+        elif self.plate or self.race_number:
+            # Something identifies this vehicle even though nothing named
+            # it. Capitalised, so it reads as the detector's own
+            # classification rather than as a typo next to everything
+            # else on the card.
+            label = self.kind.capitalize()
+        else:
+            # Nothing at all was read. A bare "Car" here used to be
+            # indistinguishable from a real identification -- there was no
+            # way to tell "this is a Car" from "nothing has looked at this
+            # yet" without opening the frame.
+            label = f"{self.kind.capitalize()}, not identified"
         if self.race_number:
             label = f"#{self.race_number} {label}"
         return label
@@ -103,8 +141,12 @@ def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
     #    cannot resolve the characters, so this needs its own detector.
     roundel_numbers: list[tuple[str, float]] = []
     if settings.read_plates:
-        reading, roundel_numbers = plates.scan_regions(crop, settings,
-                                                       native=native)
+        try:
+            reading, roundel_numbers = plates.scan_regions(crop, settings,
+                                                           native=native)
+        except Exception as exc:
+            _log_step_failure("plate read", exc)
+            reading, roundel_numbers = plates.PlateReading(), []
         if reading.text:
             analysis.plate = reading.text
             analysis.plate_state = reading.state
@@ -114,33 +156,41 @@ def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
     #    from a localised, upscaled region rather than the entire car.
     ocr_number = ocr.Reading(None, 0.0)
     if settings.read_numbers:
-        if roundel_numbers:
-            token, score = roundel_numbers[0]
-            ocr_number = ocr.Reading(token, min(1.0, score + 0.15), "roundel")
-        else:
-            ocr_number = ocr.read_number(crop, settings)
-        # A registration read as a number would be wrong in a way that is hard
-        # to spot later, so anything plate-shaped is discarded here.
-        if ocr_number.number and (
-            ocr_number.number == analysis.plate
-            or plates.looks_like_plate(ocr_number.number)
-        ):
+        try:
+            if roundel_numbers:
+                token, score = roundel_numbers[0]
+                ocr_number = ocr.Reading(token, min(1.0, score + 0.15), "roundel")
+            else:
+                ocr_number = ocr.read_number(crop, settings)
+            # A registration read as a number would be wrong in a way that is
+            # hard to spot later, so anything plate-shaped is discarded here.
+            if ocr_number.number and (
+                ocr_number.number == analysis.plate
+                or plates.looks_like_plate(ocr_number.number)
+            ):
+                ocr_number = ocr.Reading(None, 0.0)
+        except Exception as exc:
+            _log_step_failure("number read", exc)
             ocr_number = ocr.Reading(None, 0.0)
 
     # 3. The semantic pass.
     described = vlm.VehicleDescription()
     if settings.use_vlm:
-        described = vlm.describe(crop, settings, is_bike=is_bike, client=client)
-        analysis.vlm_conf = described.confidence
-        if settings.identify_make_model:
-            analysis.make, analysis.model = described.make, described.model
-            analysis.body_type = described.body_type
-        if settings.identify_colour:
-            analysis.colour = described.colour
-        if settings.identify_team:
-            analysis.team = described.team
-            analysis.sponsors = described.sponsors
-        analysis.is_competition = described.is_competition
+        try:
+            described = vlm.describe(crop, settings, is_bike=is_bike, client=client)
+            analysis.vlm_conf = described.confidence
+            if settings.identify_make_model:
+                analysis.make, analysis.model = described.make, described.model
+                analysis.body_type = described.body_type
+            if settings.identify_colour:
+                analysis.colour = described.colour
+            if settings.identify_team:
+                analysis.team = described.team
+                analysis.sponsors = described.sponsors
+            analysis.is_competition = described.is_competition
+        except Exception as exc:
+            _log_step_failure("vehicle description", exc)
+            described = vlm.VehicleDescription()
 
     # 4. Reconcile the number.
     vlm_number = described.race_number
@@ -159,35 +209,39 @@ def analyze(crop: Image.Image, settings: Settings, *, is_bike: bool = False,
 
     # 5. Free text, minus anything already captured as a field.
     if settings.read_text:
-        claimed = {
-            *(s.upper() for s in analysis.sponsors),
-            *(t.upper() for t in (analysis.team,) if t),
-        }
-        if analysis.plate:
-            claimed.add(analysis.plate.upper())
-        if analysis.plate_state:
-            claimed.add(analysis.plate_state.upper())
-        if analysis.race_number:
-            claimed.add(analysis.race_number.upper())
+        try:
+            claimed = {
+                *(s.upper() for s in analysis.sponsors),
+                *(t.upper() for t in (analysis.team,) if t),
+            }
+            if analysis.plate:
+                claimed.add(analysis.plate.upper())
+            if analysis.plate_state:
+                claimed.add(analysis.plate_state.upper())
+            if analysis.race_number:
+                claimed.add(analysis.race_number.upper())
 
-        seen = {"".join(c for c in s if c.isalnum()) for s in claimed}
-        found = ocr.visible_text(crop, settings, exclude=seen)
-        # The model's livery reading and OCR's often overlap; keep the union.
-        merged: list[str] = []
-        for item in list(described.livery_text) + found:
-            key = "".join(c for c in item.upper() if c.isalnum())
-            if key and key not in seen:
-                seen.add(key)
-                merged.append(item)
-        analysis.text = merged[: settings.max_text_items]
+            seen = {"".join(c for c in s if c.isalnum()) for s in claimed}
+            found = ocr.visible_text(crop, settings, exclude=seen)
+            # The model's livery reading and OCR's often overlap; keep the union.
+            merged: list[str] = []
+            for item in list(described.livery_text) + found:
+                key = "".join(c for c in item.upper() if c.isalnum())
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(item)
+            analysis.text = merged[: settings.max_text_items]
 
-        # The model will occasionally invent a team from OCR noise — a Mini at
-        # Bathurst produced "Nosso" out of the garbled tokens "Nos8e"/"No886".
-        # A team name that no read text supports is kept but marked, so the
-        # review UI can surface it instead of writing fiction into XMP.
-        # Only OCR counts as evidence. The model's own livery_text would
-        # happily "confirm" its own invention, which proves nothing.
-        analysis.team_corroborated = _corroborated(analysis.team, found)
+            # The model will occasionally invent a team from OCR noise — a Mini
+            # at Bathurst produced "Nosso" out of the garbled tokens
+            # "Nos8e"/"No886". A team name that no read text supports is kept
+            # but marked, so the review UI can surface it instead of writing
+            # fiction into XMP. Only OCR counts as evidence. The model's own
+            # livery_text would happily "confirm" its own invention, which
+            # proves nothing.
+            analysis.team_corroborated = _corroborated(analysis.team, found)
+        except Exception as exc:
+            _log_step_failure("text read", exc)
 
     return analysis
 

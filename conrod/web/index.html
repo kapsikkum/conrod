@@ -45,12 +45,53 @@
   <section class="screen" id="screen-home">
     <div class="home">
       <div class="home-main">
-        <div class="rail-card" style="display:flex;align-items:center;gap:18px">
-          <div style="flex:1">
-            <h4>Scan a shoot</h4>
-            <p>Point it at a folder. It finds the vehicles, reads numbers,
-               plates and liveries, and writes XMP.</p>
-            <button class="primary" data-goto="scan">+ New scan</button>
+        <div class="new-scan" id="new-scan-card">
+          <div class="new-scan-head">
+            <div>
+              <h4>Scan a shoot</h4>
+              <p>Point it at a folder. It finds the vehicles, reads numbers,
+                 plates and liveries, and writes XMP.</p>
+            </div>
+            <button class="primary" id="btn-new-scan">+ New scan</button>
+          </div>
+          <div id="indexing-line" class="indexing-line" hidden></div>
+          <div class="new-scan-body" id="scan-setup-body" hidden>
+    <div class="field-row">
+      <input id="scan-path" placeholder="D:\Personal Work\2026\09\01" spellcheck="false">
+      <button id="btn-pick" class="ghost">Browse…</button>
+      <button id="btn-count" class="ghost">Count frames</button>
+    </div>
+    <div class="field-row"><input id="scan-label" placeholder="Name for this album (optional)"></div>
+    <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
+    <label class="check-line"><input type="checkbox" id="scan-watch"> Keep watching this folder
+      <span class="muted">— frames that arrive later join the same album</span></label>
+
+    <div class="field-row entry-row">
+      <label for="scan-entries" class="filebtn">Entry list…</label>
+      <input type="file" id="scan-entries" accept=".csv,text/csv" hidden>
+      <span class="muted" id="entries-status">No entry list — numbers are written on their own</span>
+    </div>
+    <p class="muted" id="scan-count"></p>
+
+    <div id="browser" class="browser" hidden>
+      <div class="browser-head">
+        <button id="browse-up" class="ghost">↑ Up</button>
+        <span id="browse-here" class="muted"></span>
+        <button id="browse-use" class="primary">Use this folder</button>
+        <button id="browse-close" class="ghost">Close</button>
+      </div>
+      <ul id="browse-list"></ul>
+    </div>
+
+    <div class="actions-row">
+      <button id="btn-add" class="primary"
+              title="Find the frames and their previews. Nothing is detected or identified yet.">Add album</button>
+      <button id="btn-scan" class="ghost"
+              title="Index, cull and identify in one go, the way it used to work.">Scan it all now</button>
+      <span class="muted busy-note" id="scan-busy-note" hidden>
+        A scan is already running — you can still add the album and cull it after.
+      </span>
+    </div>
           </div>
         </div>
         <div class="section-label"><span>Albums</span><span id="job-count"></span></div>
@@ -121,8 +162,9 @@
           <div class="do-icon">◆</div>
           <div class="do-text">
             <h4>Identify Album</h4>
-            <p>Name make, model, colour, team and numbers on what survived
-               the cull. This is the slow one.</p>
+            <p>Name make, model, colour, team and numbers. On an album you
+               have not culled it finds the cars first and keeps every one
+               of them. This is the slow one.</p>
           </div>
           <div class="do-go">›</div>
         </div>
@@ -147,40 +189,11 @@
 
   <!-- ──────────────────────────── SCAN ─────────────────────────── -->
   <section class="screen" id="screen-scan" hidden>
-    <div class="pane wide" id="scan-setup-pane">
-      <h2>Scan a folder</h2>
-      <div class="field-row">
-        <input id="scan-path" placeholder="D:\Personal Work\2026\09\01" spellcheck="false">
-        <button id="btn-pick" class="ghost">Browse…</button>
-        <button id="btn-count" class="ghost">Count frames</button>
-      </div>
-      <div class="field-row"><input id="scan-label" placeholder="Name for this album (optional)"></div>
-      <label class="check-line"><input type="checkbox" id="scan-recursive" checked> Include subfolders</label>
-      <label class="check-line"><input type="checkbox" id="scan-watch"> Keep watching this folder
-        <span class="muted">— frames that arrive later join the same album</span></label>
-
-      <div class="field-row entry-row">
-        <label for="scan-entries" class="filebtn">Entry list…</label>
-        <input type="file" id="scan-entries" accept=".csv,text/csv" hidden>
-        <span class="muted" id="entries-status">No entry list — numbers are written on their own</span>
-      </div>
-      <p class="muted" id="scan-count"></p>
-
-      <div id="browser" class="browser" hidden>
-        <div class="browser-head">
-          <button id="browse-up" class="ghost">↑ Up</button>
-          <span id="browse-here" class="muted"></span>
-          <button id="browse-use" class="primary">Use this folder</button>
-          <button id="browse-close" class="ghost">Close</button>
-        </div>
-        <ul id="browse-list"></ul>
-      </div>
-
-      <div class="actions-row">
-        <button id="btn-add" class="primary"
-                title="Find the frames and their previews. Nothing is detected or identified yet.">Add album</button>
-        <button id="btn-scan" class="ghost"
-                title="Index, cull and identify in one go, the way it used to work.">Scan it all now</button>
+    <div class="pane wide" id="scan-idle">
+      <div class="idle-note">
+        <h2>Nothing is running</h2>
+        <p class="lede">Add an album to start scanning.</p>
+        <button class="primary" data-goto="home">Go to albums</button>
       </div>
     </div>
 
@@ -235,6 +248,28 @@
         <button id="btn-reset-settings" class="ghost">Reset to defaults</button>
         <span class="muted" id="settings-note"></span>
       </div>
+
+      <div class="danger-zone">
+        <h3>Start again</h3>
+        <p>
+          Your photographs are not touched by either of these &mdash; nothing
+          Conrod decides is ever written to a file until you press Write XMP.
+          Your settings and entry list are kept.
+        </p>
+        <p>
+          <strong>Detections and identifications</strong> throws away every
+          car Conrod found and everything it read off them, and keeps the
+          albums indexed so a re-run does not have to read your files again.
+          <br>
+          <strong>Everything</strong> forgets the albums as well.
+        </p>
+        <div class="actions-row">
+          <button id="btn-reset-detections" class="danger">
+            Reset detections &amp; identifications</button>
+          <button id="btn-reset-all" class="danger">Reset everything</button>
+          <span class="muted" id="reset-note"></span>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -278,30 +313,35 @@
       <div class="toolbar">
         <select id="job-select" aria-label="Album"></select>
         <div class="tabs sub" id="view-tabs">
-          <button data-view="review" class="active">Needs review</button>
-          <button data-view="number">By number</button>
-          <button data-view="plate">Plates</button>
+          <button data-view="review" class="active">To review</button>
           <button data-view="all">All</button>
           <button data-view="rejected">Rejected</button>
         </div>
         <input id="search" placeholder="Search make, team, plate…" spellcheck="false">
+        <div id="star-filter" class="star-filter" role="group" aria-label="Filter by star rating"></div>
         <select id="sort" aria-label="Sort" title="Order the grid">
-          <option value="review">Needs review first</option>
-          <option value="best">Best rated first</option>
-          <option value="worst">Worst rated first</option>
+          <option value="review">Least sure first</option>
+          <option value="best">Best rated</option>
+          <option value="worst">Worst rated</option>
           <option value="frame">Shooting order</option>
         </select>
         <div class="spacer"></div>
-        <button id="btn-keys" class="ghost" title="Keyboard shortcuts">⌨</button>
+        <button id="btn-keys" class="ghost icon" title="Keyboard shortcuts">⌨</button>
         <button id="btn-regroup" class="ghost"
                 title="Group this album's vehicles again from the stored crops. No photo is re-read.">Regroup</button>
         <button id="btn-dry" class="ghost">Preview keywords</button>
         <button id="btn-write" class="primary">Write XMP</button>
       </div>
       <main>
-        <aside id="sidebar" hidden>
-          <h3>Numbers</h3>
+        <aside id="sidebar">
+          <div class="facet-tabs" id="facet-tabs">
+            <button data-facet="number" class="active">Numbers</button>
+            <button data-facet="plate">Plates</button>
+          </div>
+          <button id="facet-clear" class="ghost small" hidden>Clear filter</button>
           <ul id="number-list"></ul>
+          <ul id="plate-list" hidden></ul>
+          <p class="muted facet-empty" id="facet-empty" hidden></p>
         </aside>
         <div id="grid-wrap">
           <div id="bulk-bar" hidden>
@@ -314,7 +354,7 @@
           <div id="review-note" class="review-note" hidden></div>
           <div id="grid"></div>
           <div id="empty" class="empty" hidden></div>
-          <button id="more" hidden class="ghost">Load more</button>
+          <div id="more" class="more-sentinel" hidden></div>
         </div>
       </main>
     </div>
@@ -322,9 +362,29 @@
 </div>
 
 <dialog id="frame-dialog">
-  <img id="frame-img" alt="Full frame">
-  <p id="frame-caption" class="muted"></p>
-  <button id="frame-close" class="ghost">Close</button>
+  <div class="frame-view">
+    <div class="frame-stage-big">
+      <img id="frame-img" alt="Full frame">
+      <button id="frame-prev" class="frame-step prev" title="Previous frame (←)">‹</button>
+      <button id="frame-next" class="frame-step next" title="Next frame (→)">›</button>
+    </div>
+
+    <aside class="frame-side">
+      <div class="frame-side-head">
+        <h3 id="frame-title"></h3>
+        <button id="frame-close" class="ghost small">Close</button>
+      </div>
+      <div id="frame-readout" class="readout"></div>
+      <p id="frame-caption" class="muted mono"></p>
+      <div class="frame-side-foot">
+        <div id="frame-stars" class="stars-control" role="group" aria-label="Star rating"></div>
+        <button id="frame-clear" class="ghost small" title="Back to the cull's own rating">Clear</button>
+        <div class="spacer"></div>
+        <button id="frame-reject" class="ghost danger cut">Reject</button>
+      </div>
+      <p class="muted frame-pos" id="frame-pos"></p>
+    </aside>
+  </div>
 </dialog>
 
 <div id="toast" role="status" aria-live="polite"></div>
