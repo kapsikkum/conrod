@@ -1595,16 +1595,33 @@ class DetectionUpdate(BaseModel):
     stars: int | None = Field(default=None, ge=0, le=5)
 
 
+@app.post("/api/jobs/{job_id}/group")
+def group_cars(job_id: int) -> dict:
+    """Sort an album into one pile per car.
+
+    Works from the stored crops, so it does not re-read a single photograph,
+    and does not call the vision model at all -- which frames show one car is
+    a question about what the crops look like, and the similarity model
+    answers it without a metered API in the loop.
+
+    An album scanned before the similarity model existed has no embeddings,
+    so they are filled in first. That is the slow part, it happens once, and
+    without it grouping quietly falls back to the much cruder measure and
+    nobody is told why the piles are wrong.
+    """
+    from . import grouping, pipeline
+
+    looked = pipeline.embed_missing(job_id, _state["settings"])
+    with store.session() as conn:
+        out = grouping.consolidate(conn, job_id, _state["settings"])
+    out["looked"] = looked
+    return out
+
+
 @app.post("/api/jobs/{job_id}/regroup")
 def regroup(job_id: int) -> dict:
-    """Re-run grouping after corrections in review.
-
-    Works from the stored crops, so it does not re-read a single photo.
-    """
-    from . import grouping
-
-    with store.session() as conn:
-        return grouping.consolidate(conn, job_id, _state["settings"])
+    """The old name for group_cars, kept so an older window still works."""
+    return group_cars(job_id)
 
 
 @app.post("/api/detections/{det_id}")

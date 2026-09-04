@@ -128,6 +128,24 @@ def inspect(settings: Settings) -> Environment:
         (("rapidocr_onnxruntime", "reading numbers and livery text"),),
         "PaddleOCR models on onnxruntime"))
 
+    # --- telling one car from another ---
+    #
+    # Not required. Without it grouping falls back to a difference hash and a
+    # colour histogram, which were measured on a real burst and found to
+    # overlap almost completely between the same car and different ones --
+    # so the fallback works and works badly, and that is worth saying rather
+    # than leaving someone to wonder why their stacks are wrong.
+    from . import similarity
+
+    ready = similarity.is_ready()
+    env.checks.append(Check(
+        "grouping", "Car grouping model", ready,
+        f"{similarity.MODEL_NAME}" if ready
+        else f"not installed — {similarity.MODEL_BYTES // 1_000_000} MB to "
+             "download. Until it is here, cars are grouped on a much cruder "
+             "measure of what a crop looks like.",
+        required=False, fix=None if ready else "download_grouping_model"))
+
     # --- The vision model: optional, but this is the good part ---
     if not settings.use_vlm:
         env.checks.append(Check("vlm", "Vision model", True,
@@ -242,6 +260,30 @@ def download_weights(settings: Settings, on_progress=None) -> bool:
 _fix_lock = threading.Lock()
 
 
+def download_grouping_model(settings: Settings, on_progress=None) -> bool:
+    """Fetch the similarity model, reporting as it goes.
+
+    Resumable and verified -- see similarity.download. Measured on a slow
+    link at about 18 KB/s with two dropped connections, which is exactly the
+    case a one-shot download handles by leaving a truncated file behind.
+    """
+    from . import similarity
+
+    def tick(done: int, total: int) -> None:
+        if on_progress:
+            share = (done / total) if total else 0.0
+            on_progress(f"{done // 1_000_000} of {total // 1_000_000} MB",
+                        share)
+
+    for attempt in range(4):
+        if similarity.download(tick):
+            return True
+        if on_progress:
+            on_progress(f"the download stopped short; trying again "
+                        f"({attempt + 1} of 4)", None)
+    return similarity.is_ready()
+
+
 def apply_fix(name: str, settings: Settings, on_progress=None) -> bool:
     """Run one repair action. Serialised — these are all large downloads."""
     if not _fix_lock.acquire(blocking=False):
@@ -251,6 +293,8 @@ def apply_fix(name: str, settings: Settings, on_progress=None) -> bool:
             return pull_model(settings, on_progress)
         if name == "download_weights":
             return download_weights(settings, on_progress)
+        if name == "download_grouping_model":
+            return download_grouping_model(settings, on_progress)
         raise ValueError(f"unknown fix: {name}")
     finally:
         _fix_lock.release()

@@ -131,6 +131,12 @@ _MIGRATIONS = [
     # or overwriting it.
     ("images", "rating_in_file", "INTEGER"),
     ("images", "label_in_file", "TEXT"),
+
+    # What the crop looks like to the similarity model, as text. Kept beside
+    # the detection so grouping can be re-run over a whole shoot without
+    # opening a single crop again -- which is what makes "Group cars" cheap
+    # enough to press after every correction.
+    ("detections", "embedding", "TEXT"),
 ]
 
 
@@ -414,3 +420,10 @@ def unread_detections(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row
             ORDER BY d.id""",
         (job_id,),
     ).fetchall()
+
+
+def set_embedding(conn: sqlite3.Connection, det_id: int, packed: str) -> None:
+    """What the crop looks like to the similarity model."""
+    conn.execute("UPDATE detections SET embedding=? WHERE id=?",
+                 (packed, det_id))
+    conn.commit()

@@ -457,7 +457,14 @@ class SecondLookIsArbitration(unittest.TestCase):
 
 
 class SecondLookThroughConsolidate(unittest.TestCase):
-    """The guard driven through consolidate(), not just its helper."""
+    """The guard driven through consolidate(), not just its helper.
+
+    Asked for explicitly with tidy=True. Grouping no longer calls the vision
+    model of its own accord: pressing Group cars used to be able to sit for
+    an hour behind a rate limit, answering a question the crops already
+    answer. The guard itself still has to hold wherever the second look is
+    used, which is what this checks.
+    """
 
     def _run(self, answer, readers):
         import json, sqlite3
@@ -471,7 +478,8 @@ class SecondLookThroughConsolidate(unittest.TestCase):
             "CREATE TABLE images (id INTEGER PRIMARY KEY, job_id INT, burst_key INT);"
             "CREATE TABLE detections (id INTEGER PRIMARY KEY, image_id INT,"
             " crop_path TEXT, attributes TEXT, signature TEXT, colour_hex TEXT,"
-            " cls TEXT, plate TEXT, sharpness REAL, rejected INT DEFAULT 0,"
+            " cls TEXT, plate TEXT, sharpness REAL, embedding TEXT,"
+            " rejected INT DEFAULT 0,"
             " bystander INT DEFAULT 0,"
             " group_key TEXT, group_size INT, group_agreement REAL,"
             " group_colour_hex TEXT);")
@@ -494,7 +502,7 @@ class SecondLookThroughConsolidate(unittest.TestCase):
         with mock.patch.object(grouping, "_second_look", return_value=answer),              mock.patch.object(grouping.normalise, "canonical",
                                return_value=grouping.normalise.Canonical(
                                    make=None, model=None)):
-            grouping.consolidate(conn, 1, settings)
+            grouping.consolidate(conn, 1, settings, tidy=True)
         return [json.loads(r["attributes"])
                 for r in conn.execute("SELECT attributes FROM detections")]
 

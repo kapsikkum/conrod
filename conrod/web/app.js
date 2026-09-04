@@ -2348,24 +2348,44 @@ $("#bulk-clear").onclick = () => {
    no photo reads -- which makes it the way an album already scanned picks up
    an improvement to grouping without a rescan. The endpoint existed from the
    start and nothing in the interface ever called it. */
-$("#btn-regroup").onclick = async () => {
-  const button = $("#btn-regroup");
+// Sorts the album into one pile per car. Renamed from "Regroup", which said
+// what the code did rather than what the photographer wanted, and which was
+// routinely read as "rescan".
+$("#btn-group").onclick = async () => {
+  const button = $("#btn-group");
   const was = button.textContent;
   button.disabled = true;
   button.textContent = "Grouping…";
   try {
-    const out = await api(`/api/jobs/${state.jobId}/regroup`, { method: "POST" });
+    const out = await api(`/api/jobs/${state.jobId}/group`, { method: "POST" });
     // Redraw first, then report. Toasting before the refresh meant a failure
     // anywhere in redrawing the grid replaced the result with its own error,
     // so a regroup that worked looked like one that had not.
     try { await refreshReview(); } catch {}
-    toast(`${out.vehicles} vehicles in ${out.groups} groups`);
+    toast(out.looked
+      ? `${out.vehicles} vehicles in ${out.groups} piles (looked at ${out.looked} new crops)`
+      : `${out.vehicles} vehicles in ${out.groups} piles`);
   } catch (err) {
     toast(err.message);
   } finally {
     button.disabled = false;
     button.textContent = was;
   }
+};
+
+// The other half of the rename: something that actually rescans.
+$("#btn-rescan").onclick = async () => {
+  const album = state.album || {};
+  if (!confirm(
+      "Read the photographs again and redo this album?\n\n"
+      + "Everything found before is thrown away and the scan starts over. "
+      + "Star ratings you gave by hand are kept.\n\n"
+      + "Your photographs are not touched.")) return;
+  try {
+    await api("/api/reset/detections?job_id=" + state.jobId, { method: "POST" });
+    await runStage({ id: state.jobId, root: album.root, label: album.label },
+                   "all");
+  } catch (err) { toast(err.message); }
 };
 
 $("#btn-dry").onclick = async () => {

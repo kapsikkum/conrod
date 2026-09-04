@@ -49,7 +49,12 @@ hiddenimports = [
 hiddenimports += collect_submodules("rapidocr_onnxruntime")
 # Imported lazily inside a function, and its absence is silent: the app runs
 # and simply never reads a plate. Named explicitly so it cannot go missing.
-hiddenimports += ["open_image_models", "fast_plate_ocr"]
+# onnxruntime named outright rather than left to arrive with the plate
+# packages. similarity imports it lazily inside a function, which is
+# invisible to PyInstaller's analysis, so grouping would have depended
+# on plate reading happening to be installed for a reason nobody could
+# have guessed from the traceback.
+hiddenimports += ["onnxruntime", "open_image_models", "fast_plate_ocr"]
 hiddenimports += collect_submodules("open_image_models")
 hiddenimports += collect_submodules("fast_plate_ocr")
 datas += collect_data_files("fast_plate_ocr", include_py_files=False)

@@ -27,6 +27,7 @@ from . import detect as detect_mod
 from . import keywords as keywords_mod
 from . import grouping
 from . import sharpness as sharpness_mod
+from . import similarity
 from . import store, vlm, vlm_providers
 from .analyze import VehicleAnalysis, analyze
 from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
@@ -529,6 +530,59 @@ def rescore(job_id: int | None, settings: Settings, *,
         conn.close()
 
 
+def embed_missing(job_id: int | None, settings: Settings, *,
+                  on_progress: Progress = _noop,
+                  should_stop: Callable[[], bool] | None = None) -> int:
+    """Give every stored crop an embedding, for albums scanned before there
+    were any.
+
+    Works from the crops, so it re-reads no photographs. Skips detections
+    that already have one, which makes it safe to run again after a scan
+    that was stopped part way.
+    """
+    if not similarity.is_ready():
+        on_progress({"stage": "grouping",
+                     "message": "the car grouping model is not installed yet"})
+        return 0
+
+    where = "WHERE i.job_id = ?" if job_id is not None else ""
+    args = (job_id,) if job_id is not None else ()
+    conn = store.connect()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT d.id, d.crop_path FROM detections d
+                  JOIN images i ON i.id = d.image_id
+                 {where} {'AND' if where else 'WHERE'} d.crop_path IS NOT NULL
+                   AND (d.embedding IS NULL OR d.embedding = '')""", args)]
+        total = len(rows)
+        on_progress({"stage": "grouping", "done": 0, "total": total,
+                     "message": f"looking at {total} crops"})
+        done = 0
+        for row in rows:
+            if should_stop and should_stop():
+                break
+            try:
+                with Image.open(row["crop_path"]) as crop:
+                    crop.load()
+                    vector = similarity.embed(crop)
+            except Exception:
+                vector = None
+            done += 1
+            if vector is not None:
+                conn.execute("UPDATE detections SET embedding=? WHERE id=?",
+                             (similarity.pack(vector), row["id"]))
+            if done % 100 == 0:
+                conn.commit()
+                on_progress({"stage": "grouping", "done": done, "total": total,
+                             "message": f"looked at {done}/{total} crops"})
+        conn.commit()
+        on_progress({"stage": "grouping", "done": done, "total": total,
+                     "message": f"looked at {done} crops"})
+        return done
+    finally:
+        conn.close()
+
+
 def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
              should_stop: Callable[[], bool] | None = None,
              wait_if_paused: Callable[[], None] | None = None) -> JobSummary:
@@ -993,7 +1047,17 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                         swatch = colour_mod.dominant(crop)
                     except Exception:
                         swatch = None
+                    # What the crop looks like to the similarity model, taken
+                    # while it is already open and decoded. Grouping needs it
+                    # for every detection, and re-opening two thousand crops
+                    # later to get it is the expensive way round.
+                    try:
+                        vector = similarity.embed(crop)
+                    except Exception:
+                        vector = None
                 store.set_analysis(conn, det_id, analysis, colour_hex=swatch)
+                if vector is not None:
+                    store.set_embedding(conn, det_id, similarity.pack(vector))
                 identified = bool(analysis.race_number or analysis.plate
                                   or analysis.make)
             except vlm_providers.Stopped:

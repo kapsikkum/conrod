@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
-from . import marques, normalise
+from . import marques, normalise, similarity
 
 HASH_EDGE = 8          # 8x9 grey samples -> 64 bits of shape
 HUE_BINS = 12
@@ -91,6 +91,137 @@ class Group:
     make: str | None = None
     plates: set = field(default_factory=set)
     bursts: set = field(default_factory=set)
+    # Every member's embedding, so a candidate is compared against the whole
+    # group rather than against one representative. A car turning through a
+    # corner does not look like its own first frame by the end of the burst,
+    # but it looks like the frame before it all the way through.
+    vectors: list = field(default_factory=list)
+
+
+# How alike two crops have to look before they are called the same car.
+#
+# Measured on 45 bursts of a real shoot, taking frames adjacent in a burst as
+# the same car and frames from different bursts as different ones. Same car
+# runs a median 0.951; different cars run a median 0.450 and a 99th
+# percentile of 0.869. The two barely overlap, which is the whole reason for
+# using an embedding rather than a difference hash.
+#
+#   0.85   keeps 86% of same-car pairs, wrongly merges 2.11%
+#   0.90   keeps 80%,                   wrongly merges 0.24%
+#   0.95   keeps 51%,                   wrongly merges 0.03%
+#
+# Strict on purpose, at 0.90. A stack holding two cars is a worse mistake
+# than one car appearing as two stacks: the photographer can merge two piles
+# at a glance, where finding the one wrong frame inside a pile of forty is
+# work. Errors also compound here, because a crop joins a group by matching
+# any member of it, so one wrong merge widens what the group will accept next.
+#
+# The "keeps" figures understate it. A candidate is compared against every
+# member rather than only the frame beside it, so a crop that drifts away
+# from its immediate neighbour part way through a corner can still match an
+# earlier one and stay in the group.
+SAME_CAR = 0.90
+
+
+def cluster_by_look(rows: list[tuple], *, same_car: float = SAME_CAR
+                    ) -> dict[int, int]:
+    """Assign each detection to a vehicle. Returns detection id -> group key.
+
+    Rows are (detection id, embedding, frame index, burst key, plate).
+
+    Two rules, and deliberately only two:
+
+      * Within one burst, crops that look alike are the same car. A burst is
+        one unbroken run of the shutter at one subject, so this is asking a
+        much easier question than "is this the same car as one three minutes
+        ago in different light" -- and it is the question a photographer is
+        actually asking when they want a pile per car.
+      * Across bursts, only a plate joins them. Not resemblance: two silver
+        hatchbacks on different passes look far more alike than the same car
+        does from the front and from behind, so similarity across bursts
+        merges the wrong things confidently. A plate is an identity rather
+        than a resemblance, and it is matched allowing for the characters a
+        reader confuses, because one misread in eighteen frames should not
+        split a car in two.
+
+    What is gone from here, on purpose: the vision model's guess at the make
+    used to gate merges, which made grouping depend on the thing grouping
+    exists to correct -- one blue Falcon read as a Fiesta, an Astra, a
+    Commodore and a Mustang, and the make gate then refused to merge the very
+    frames that would have outvoted the wrong ones.
+    """
+    import numpy as np
+
+    groups: list[Group] = []
+    assignment: dict[int, int] = {}
+    by_burst: dict = {}
+    for row in rows:
+        det_id, vector, frame_index = row[0], row[1], row[2]
+        burst = row[3] if len(row) > 3 else None
+        plate = _tidy_plate(row[4]) if len(row) > 4 else None
+        if vector is None:
+            continue
+        by_burst.setdefault(burst, []).append((det_id, vector, frame_index, plate))
+
+    for burst, entries in by_burst.items():
+        in_burst: list[Group] = []
+        for det_id, vector, frame_index, plate in entries:
+            best, best_score = None, 0.0
+            for group in in_burst:
+                # A car cannot be in the same photograph twice.
+                if frame_index in group.frames:
+                    continue
+                # Two plates that are genuinely different settle it outright.
+                if _plate_verdict(plate, group.plates) is False:
+                    continue
+                score = max(float(np.dot(vector, other))
+                            for other in group.vectors)
+                if score > best_score:
+                    best, best_score = group, score
+            if best is not None and best_score >= same_car:
+                _join(best, det_id, frame_index, None, plate, assignment, burst)
+                best.vectors.append(vector)
+                continue
+            group = Group(key=len(groups) + 1, signature="")
+            group.vectors = [vector]
+            groups.append(group)
+            in_burst.append(group)
+            _join(group, det_id, frame_index, None, plate, assignment, burst)
+
+    _merge_on_plates(groups, assignment)
+    return assignment
+
+
+def _merge_on_plates(groups: list["Group"], assignment: dict[int, int]) -> None:
+    """Join groups from different bursts that read the same plate.
+
+    Allowing for confusable characters, because the alternative was measured:
+    one frame of a Jaguar read ZE766 where eighteen read 39432J, and taking
+    plates literally declared six of them a different car.
+    """
+    merged: dict[int, int] = {}
+    for i, group in enumerate(groups):
+        if not group.plates or group.key in merged:
+            continue
+        for other in groups[i + 1:]:
+            if not other.plates or other.key in merged:
+                continue
+            if other.bursts & group.bursts:      # same burst, already decided
+                continue
+            if any(p in group.plates or _nearly_seen(p, group.plates)
+                   for p in other.plates):
+                merged[other.key] = group.key
+                group.plates |= other.plates
+                group.bursts |= other.bursts
+                group.members += other.members
+    if not merged:
+        return
+    for det_id, key in list(assignment.items()):
+        seen = set()
+        while key in merged and key not in seen:
+            seen.add(key)
+            key = merged[key]
+        assignment[det_id] = key
 
 
 def cluster(rows: list[tuple], *, max_bits: int = 14,
@@ -669,11 +800,13 @@ def _second_look(ids: list[int], crops: dict, settings) -> "object":
     return vlm.identify_burst(paths, settings)
 
 
-def consolidate(conn, job_id: int, settings=None) -> dict:
+def consolidate(conn, job_id: int, settings=None, *,
+                tidy: bool = False) -> dict:
     """Group a finished job's vehicles and settle on one identity each.
 
     Runs over the stored crops, so it can be re-run after review without
-    re-reading a single photo. The agreed identity is written back onto each
+    re-reading a single photo, and without calling the vision model at all --
+    see ``tidy``. The agreed identity is written back onto each
     detection, which means keywords, the review grid and the XMP all see the
     same answer without any of them knowing grouping exists.
     """
@@ -681,7 +814,8 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
 
     rows = conn.execute(
         """SELECT d.id, d.crop_path, d.attributes, d.signature, d.colour_hex,
-                  d.cls, d.plate, d.sharpness, i.id AS image_id, i.burst_key
+                  d.cls, d.plate, d.sharpness, d.embedding,
+                  i.id AS image_id, i.burst_key
              FROM detections d JOIN images i ON i.id = d.image_id
             WHERE i.job_id = ? AND d.rejected = 0
               AND COALESCE(d.bystander, 0) = 0
@@ -692,6 +826,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
         return {"groups": 0, "vehicles": 0}
 
     signatures: list[tuple[int, str, int]] = []
+    looks: list[tuple] = []
     attributes: dict[int, dict] = {}
     crops: dict[int, tuple] = {}
     for row in rows:
@@ -713,16 +848,39 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
         signatures.append((row["id"], sig, row["image_id"], row["colour_hex"],
                            row["cls"], parsed.get("make"), row["plate"],
                            row["burst_key"]))
+        looks.append((row["id"], similarity.unpack(row["embedding"]),
+                      row["image_id"], row["burst_key"], row["plate"]))
 
-    assignment = cluster(signatures)
+    # Look first. The embedding answers "is this the same car" far better
+    # than shape and colour ever did, and unlike the old path it does not
+    # need the vision model's guess at the make to gate anything -- which
+    # made grouping depend on the very answers it exists to correct.
+    #
+    # The old signature clusterer is kept as the fallback for an album
+    # scanned before the model existed, or on a machine where it has not
+    # downloaded yet. It is worse, and it is better than refusing to group.
+    usable = sum(1 for row in looks if row[1] is not None)
+    if usable >= max(2, len(looks) // 2):
+        assignment = cluster_by_look(looks)
+    else:
+        assignment = cluster(signatures)
     members: dict[int, list[int]] = {}
     for det_id, key in assignment.items():
         members.setdefault(key, []).append(det_id)
 
-    # One text-only model call per group, not per frame, and only where the
-    # group actually disagreed with itself. See normalise.py -- the answer is
-    # checked back against what was read before any of it is believed.
-    tidy_names = bool(settings and getattr(settings, "normalise_names", False)
+    # Grouping does not call the vision model. It used to, for two things:
+    # tidying group names, and a "second look" at groups that disagreed with
+    # themselves. Both were text or image calls to a metered API, which made
+    # pressing Group cars a thing that could sit for an hour behind a rate
+    # limit -- and it was doing so to answer a question the crops already
+    # answer. Which frames are one car is a visual question, and the
+    # embedding settles it; what that car is called is the vote, which is
+    # arithmetic over what the readers already stored.
+    #
+    # ``tidy`` lets a caller opt back in. Nothing does by default, and the
+    # button in review deliberately does not.
+    tidy_names = bool(tidy and settings
+                      and getattr(settings, "normalise_names", False)
                       and getattr(settings, "use_vlm", False))
     look_again = bool(tidy_names and getattr(settings, "burst_second_look", True))
     name_cache: dict = {}
