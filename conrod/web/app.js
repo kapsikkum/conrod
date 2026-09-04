@@ -42,16 +42,21 @@ const state = {
   sheetOffset: 0,
   lastStage: null,
   sort: "review",
+  minStars: null,
+  items: [],
+  stack: null,            // which vehicle's gallery is open, if any
   cursor: null,
+  dialogNode: null,
   logAt: 0,
   logTimer: null,
   healthTimer: null,
   jobId: null,
   view: "review",
-  number: null,
+  facet: "number",        // which list the sidebar is browsing
+  facetPick: null,        // {kind, value} narrowing the grid, if any
   search: "",
   offset: 0,
-  limit: 120,
+  limit: 500,
   total: 0,
   selected: new Set(),
   scanning: false,          // a close while this is true asks first
@@ -74,6 +79,11 @@ function show(screen) {
   if (screen === "settings") loadSettings();
   if (screen === "album") loadAlbum();
   if (screen === "review") refreshReview();
+  // Coming to the Scan screen always means "I want to add a folder". The
+  // setup pane used to be hidden the moment a scan started and never put
+  // back, so during a run that takes hours -- exactly when the next card
+  // gets added -- this screen showed only the run already going, and there
+  // was no way to reach the form at all.
 }
 
 $$("#main-tabs button").forEach((b) => { b.onclick = () => show(b.dataset.screen); });
@@ -85,6 +95,9 @@ document.addEventListener("click", (e) => {
 /* ── home ─────────────────────────────────────────────────── */
 
 async function loadHome() {
+  // The picker lives here, so whether a scan is already running decides
+  // what it may offer before anyone presses anything.
+  api("/api/scan").then((s) => reflectRunning(s.active)).catch(() => {});
   const jobs = await api("/api/jobs");
   $("#job-count").textContent = jobs.length ? `${jobs.length}` : "";
   $("#home-empty").hidden = jobs.length > 0;
@@ -162,7 +175,6 @@ async function loadHome() {
             path: job.root, label: job.label, recursive: true, resume_job: job.id,
           })});
           show("scan");
-          $("#scan-setup-pane").hidden = true;
           $("#scanner").hidden = false;
           $("#btn-stop").hidden = false;
           $("#btn-pause").hidden = false;
@@ -282,6 +294,14 @@ async function pollFix() {
 
 /* ── settings ─────────────────────────────────────────────── */
 
+const PROVIDER_NAMES = {
+  ollama: "Ollama", openai: "OpenAI", anthropic: "Anthropic", gemini: "Gemini",
+};
+const MODEL_EXAMPLES = {
+  ollama: "qwen2.5vl:7b", openai: "gpt-4o",
+  anthropic: "claude-sonnet-5", gemini: "gemini-2.0-flash",
+};
+
 const SETTING_GROUPS = [
   ["Detection", [
     ["detect_model", "Detector model", "select", ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt"],
@@ -319,9 +339,27 @@ const SETTING_GROUPS = [
   ]],
   ["Vision model", [
     ["use_vlm", "Identify make, model, colour, team", "bool", null,
-      "Needs Ollama. Turning this off makes a scan several times faster."],
-    ["vlm_model", "Model", "text", null, ""],
-    ["vlm_host", "Ollama address", "text", null, ""],
+      "Turning this off makes a scan several times faster."],
+    ["vlm_provider", "Provider", "select", ["ollama", "openai", "anthropic", "gemini"],
+      "Ollama runs locally and sends nothing off the machine. The others send crops to that provider and need a key."],
+    // What a provider wants differs, so the fields below follow the choice
+    // rather than listing all of them and leaving it to be worked out:
+    // asking for an Ollama address while set to Gemini is a question with
+    // no right answer.
+    ["vlm_model", "Model", "text", null,
+      (s) => `The name ${PROVIDER_NAMES[s.vlm_provider] || "the provider"} expects, `
+           + `e.g. ${MODEL_EXAMPLES[s.vlm_provider] || "qwen2.5vl:7b"}.`],
+    ["vlm_host", "Ollama address", "text", null, "Where Ollama is listening.",
+      (s) => s.vlm_provider === "ollama"],
+    ["vlm_api_key", "API key", "password", null,
+      (s) => `Your ${PROVIDER_NAMES[s.vlm_provider]} key. Kept locally, in settings.json.`,
+      (s) => s.vlm_provider && s.vlm_provider !== "ollama"],
+    // Anthropic takes the two kinds of credential on two different headers,
+    // and a good key sent on the wrong one comes back 401 looking like a
+    // bad key -- so it is asked rather than guessed.
+    ["anthropic_key_kind", "Key type", "select", ["auto", "api-key", "claude-code"],
+      "auto reads it off the key. api-key is a console.anthropic.com key (sent as x-api-key); claude-code is a Claude Code token (sent as a bearer token).",
+      (s) => s.vlm_provider === "anthropic"],
     ["vlm_input_edge", "Input size (px)", "number", null, ""],
     ["identify_team", "Read team and sponsors", "bool", null, ""],
   ]],
@@ -330,6 +368,9 @@ const SETTING_GROUPS = [
       "Conrod stays in the notification area and any scan carries on. Quit it from there."],
   ]],
   ["Cull verdict", [
+    ["auto_reject_below_stars", "Auto-reject below", "choice",
+      [[0, "Never"], [2, "2 stars"], [3, "3 stars"], [4, "4 stars"], [5, "5 stars"]],
+      "Rejected as the scan finds them, before anything is spent identifying them. Nothing is deleted and nothing is written to your files — the Rejected view puts any of it back."],
     ["write_rating", "Write the star rating", "bool", null,
       "Stars follow how sharp the vehicle is, not the whole frame."],
     ["overwrite_rating", "Replace ratings I have already given", "bool", null,
@@ -355,9 +396,19 @@ async function loadSettings() {
   const data = await api("/api/settings");
   settingsCache = data.settings;
   const form = $("#settings-form");
+  const conditional = [];
+  const refresh = () => {
+    for (const row of conditional) {
+      row.node.hidden = !row.when(settingsCache);
+      if (row.hintNode && row.hint instanceof Function) {
+        row.hintNode.textContent = row.hint(settingsCache);
+      }
+    }
+  };
+
   form.replaceChildren(...SETTING_GROUPS.map(([title, rows]) => {
     const group = el("div", { className: "setting-group" }, el("h3", { textContent: title }));
-    for (const [key, label, kind, options, hint] of rows) {
+    for (const [key, label, kind, options, hint, when] of rows) {
       const value = settingsCache[key];
       let input;
       if (kind === "bool") {
@@ -368,22 +419,47 @@ async function loadSettings() {
         for (const opt of options) {
           input.append(el("option", { value: opt, textContent: opt, selected: opt === value }));
         }
-        input.onchange = () => { settingsCache[key] = input.value; };
+        input.onchange = () => { settingsCache[key] = input.value; refresh(); };
+      } else if (kind === "choice") {
+        // A select whose options read as words but store something else --
+        // "2 stars" is what the photographer is choosing, 2 is what the
+        // setting holds. The plain "select" above stores the label, which is
+        // right when the two are the same thing and wrong here.
+        input = el("select");
+        for (const [val, text] of options) {
+          input.append(el("option", { value: String(val), textContent: text,
+                                      selected: val === value }));
+        }
+        input.onchange = () => {
+          settingsCache[key] = typeof options[0][0] === "number"
+            ? Number(input.value) : input.value;
+          refresh();
+        };
       } else if (kind === "number") {
         input = el("input", { type: "number", value: String(value ?? ""), step: "any" });
         input.onchange = () => { settingsCache[key] = Number(input.value); };
+      } else if (kind === "password") {
+        input = el("input", { type: "password", value: value ?? "", autocomplete: "off" });
+        input.onchange = () => { settingsCache[key] = input.value; };
       } else {
         input = el("input", { type: "text", value: value ?? "" });
         input.onchange = () => { settingsCache[key] = input.value; };
       }
-      group.append(el("div", { className: "setting" },
-        el("div", {},
-          el("div", { className: "label", textContent: label }),
-          hint ? el("div", { className: "hint", textContent: hint }) : null),
-        input));
+      const hintNode = hint
+        ? el("div", { className: "hint",
+                      textContent: hint instanceof Function ? hint(settingsCache) : hint })
+        : null;
+      const row = el("div", { className: "setting" },
+        el("div", {}, el("div", { className: "label", textContent: label }), hintNode),
+        input);
+      if (when || hint instanceof Function) {
+        conditional.push({ node: row, hint, hintNode, when: when || (() => true) });
+      }
+      group.append(row);
     }
     return group;
   }));
+  refresh();
 
   // The entry list lives alongside the settings it affects.
   const mapGroup = el("div", { className: "setting-group" },
@@ -430,6 +506,65 @@ $("#btn-reset-settings").onclick = async () => {
   toast("Settings reset to defaults");
 };
 
+// Throw away the found cars, keep the albums. The common case by far: a
+// setting changed, or the identification was wrong, and the answer is to run
+// it again rather than to re-read two thousand RAWs first.
+$("#btn-reset-detections").onclick = async () => {
+  const note = $("#reset-note");
+  let found = 0;
+  try {
+    found = (await api("/api/jobs")).reduce(
+      (n, j) => n + (j.detection_count || 0), 0);
+  } catch {
+    // Counting is a courtesy. If it fails the warning still stands.
+  }
+  if (!confirm(
+      `Throw away ${found || "all"} detected vehicles and everything read `
+      + "off them?\n\nThe albums stay indexed, so scanning again does not "
+      + "re-read your photographs.\n\nYour photographs are not touched.")) return;
+  try {
+    const out = await api("/api/reset/detections", { method: "POST" });
+    note.textContent = "";
+    toast(`${out.detections_removed} detections cleared.`);
+    loadHome();
+    show("home");
+  } catch (err) {
+    note.textContent = String(err.message || err);
+  }
+};
+
+// The one irreversible thing in the app, so it says what will go and what
+// will not before it asks, and names the count rather than saying "all".
+$("#btn-reset-all").onclick = async () => {
+  const note = $("#reset-note");
+  let scans = 0, found = 0;
+  try {
+    const jobs = await api("/api/jobs");
+    scans = jobs.length;
+    found = jobs.reduce((n, j) => n + (j.detection_count || 0), 0);
+  } catch {
+    // Counting is a courtesy. If it fails the warning still stands.
+  }
+  if (!scans) { note.textContent = "Nothing to reset."; return; }
+  if (!confirm(
+      `Forget ${scans} scan${scans === 1 ? "" : "s"}`
+      + `${found ? ` and ${found} identified vehicles` : ""}?\n\n`
+      + "Every detection, plate, number and identification goes with them, "
+      + "and they cannot be brought back without scanning again.\n\n"
+      + "Your photographs are not touched.")) return;
+  try {
+    const out = await api("/api/reset", { method: "POST" });
+    note.textContent = "";
+    toast(`Reset. ${out.scans_removed} scan`
+          + `${out.scans_removed === 1 ? "" : "s"} forgotten.`);
+    loadHome();
+    show("home");
+  } catch (err) {
+    // A scan in flight is the expected refusal, and it is worth reading.
+    note.textContent = String(err.message || err);
+  }
+};
+
 /* ── scanning ─────────────────────────────────────────────── */
 
 $("#btn-pick").onclick = async () => {
@@ -456,7 +591,8 @@ async function openBrowser(path) {
   };
   $("#browse-list").replaceChildren(...data.dirs.map((dir) => {
     const name = dir.replace(/\\$/, "").split("\\").pop() || dir;
-    const li = el("li", { textContent: `📁  ${name}` });
+    // The folder icon is drawn by CSS (#browse-list li::before).
+    const li = el("li", { textContent: name, title: dir });
     li.onclick = () => openBrowser(dir);
     return li;
   }));
@@ -497,7 +633,7 @@ async function startScan(stage) {
   if (!path) { toast("Choose a folder first"); return; }
   state.lastStage = stage;
   try {
-    await api("/api/scan", {
+    const res = await api("/api/scan", {
       method: "POST",
       body: JSON.stringify({
         path, label: $("#scan-label").value.trim() || null,
@@ -506,8 +642,19 @@ async function startScan(stage) {
     });
     state.watchWanted = $("#scan-watch").checked
       ? { path, recursive: $("#scan-recursive").checked } : null;
-    $("#scan-setup-pane").hidden = true;
+    // Added alongside a scan that is already running. The run on screen is
+    // not this one, so it keeps its own progress and its own stop button --
+    // this just gets a line saying it is being read.
+    if (res.indexing) {
+      toast("Adding the album while the scan carries on");
+      openNewScan(false);
+      pollScan();
+      return;
+    }
+    openNewScan(false);
+    show("scan");
     $("#scanner").hidden = false;
+    showScanIdle();
     $("#btn-scan-review").hidden = true;
     $("#btn-stop").hidden = false;
     $("#btn-pause").hidden = false;
@@ -532,8 +679,8 @@ async function runStage(job, stage) {
                              resume_job: job.id, stage }),
     });
     show("scan");
-    $("#scan-setup-pane").hidden = true;
     $("#scanner").hidden = false;
+    showScanIdle();
     $("#btn-scan-review").hidden = true;
     $("#btn-stop").hidden = false;
     $("#btn-pause").hidden = false;
@@ -726,27 +873,106 @@ function pollScan() {
     let data;
     try { data = await api("/api/scan"); } catch { return; }
     renderScan(data);
+    renderIndexing(data.indexing);
+    showScanIdle();
+    reflectRunning(data.active);
     // A watch continues an album, and the album does not exist until the
     // pipeline has created it -- so it can only be armed once the scan has
     // reported which job it is filling.
     if (state.watchWanted && data.job_id) armWatch(data.job_id);
-    if (!data.active) {
+
+    // An album added while a scan runs finishes on its own clock. Its own
+    // completion is worth saying; the scan it was added alongside is not
+    // over and must not be reported as though it were.
+    const indexing = data.indexing || {};
+    if (state.indexingWas && !indexing.active) {
+      state.indexingWas = false;
+      if (indexing.error) toast(indexing.error);
+      else {
+        toast(indexing.message || "Album added");
+        if (indexing.job_id) { state.jobId = indexing.job_id; show("album"); }
+      }
+    }
+    state.indexingWas = Boolean(indexing.active);
+
+    if (!data.active && !indexing.active) {
       clearInterval(state.scanTimer);
       $("#btn-stop").hidden = true;
       $("#btn-pause").hidden = true;
-      $("#btn-scan-review").hidden = false;
-      if (data.error) toast(data.error);
-      else toast(data.message || "Scan complete");
-      if (data.job_id) state.jobId = data.job_id;
-      // Reading a folder takes seconds and finds nothing — leaving someone
-      // looking at a finished progress bar, with the two decisions that
-      // matter on another screen. Go to the album instead.
-      if (state.lastStage === "index" && data.job_id && !data.error) {
-        show("album");
+      // Only the run that owns this screen gets the finished-run treatment.
+      // An album indexed alongside it has already had its say above.
+      if (state.lastStage && !$("#scanner").hidden) {
+        $("#btn-scan-review").hidden = false;
+        if (data.error) toast(data.error);
+        else toast(data.message || "Scan complete");
+        if (data.job_id) state.jobId = data.job_id;
+        // Reading a folder takes seconds and finds nothing — leaving someone
+        // looking at a finished progress bar, with the two decisions that
+        // matter on another screen. Go to the album instead.
+        if (state.lastStage === "index" && data.job_id && !data.error) {
+          show("album");
+        }
       }
     }
   }, 500);
 }
+
+// A one-line "this folder is being read" while a scan holds the main
+// progress panel. Deliberately small: it is minutes of disk work, not the
+// hours of GPU time the panel above it is reporting on.
+// The Scan screen is only ever the running job now, so when there is no
+// job it has to say so -- an empty dark panel reads as something that
+// failed to load rather than as nothing to show.
+function showScanIdle() {
+  const running = !$("#scanner").hidden;
+  $("#scan-idle").hidden = running;
+}
+
+/* A second scan cannot start while one is running: the detector and the
+   GPU are single-tenant, and the server refuses it. Saying so on the
+   button is better than letting it be pressed and answering with an
+   error -- adding an album still works, because indexing is neither. */
+function reflectRunning(active) {
+  const scanBtn = $("#btn-scan");
+  if (!scanBtn) return;
+  scanBtn.disabled = Boolean(active);
+  scanBtn.title = active
+    ? "A scan is already running. Add the album now and cull it when that one finishes."
+    : "Index, cull and identify in one go, the way it used to work.";
+  const note = $("#scan-busy-note");
+  if (note) note.hidden = !active;
+}
+
+function renderIndexing(indexing) {
+  const line = $("#indexing-line");
+  if (!line) return;
+  if (!indexing || !indexing.active) { line.hidden = true; return; }
+  line.hidden = false;
+  const done = indexing.done || 0;
+  const total = indexing.total || 0;
+  const where = indexing.label ? `“${indexing.label}”` : "album";
+  line.textContent = total
+    ? `Adding ${where} — ${done.toLocaleString()} of ${total.toLocaleString()} frames`
+    : `Adding ${where} — ${indexing.message || "reading the folder"}`;
+}
+
+/* The picker lives on the home page, in the card that offers it. Pressing
+   "+ New scan" opens it there rather than sending anyone to another
+   screen, and the Scan screen is now only the running job.
+
+   It was briefly a "+ Add another album" button floating under the live
+   scan view: a ghost button on its own in the dark, which is no way to
+   offer the main thing this application does. */
+function openNewScan(open) {
+  const card = $("#new-scan-card");
+  const body = $("#scan-setup-body");
+  body.hidden = !open;
+  card.classList.toggle("open", open);
+  $("#btn-new-scan").textContent = open ? "Close" : "+ New scan";
+  if (open) $("#scan-path").focus();
+  else $("#browser").hidden = true;
+}
+$("#btn-new-scan").onclick = () => openNewScan($("#scan-setup-body").hidden);
 
 /* ── watching a folder ────────────────────────────────────── */
 /* The card still copying while the shoot is packed up. The watch adds the
@@ -941,16 +1167,30 @@ async function refreshReview() {
   // grouping having run and failed, so say which it is.
   const job = jobs.find((j) => j.id === state.jobId) || {};
   const note = $("#review-note");
-  const waiting = job.status === "scanning" || (job.unfinished_count || 0) > 0;
-  note.hidden = !waiting;
-  if (waiting) {
-    const left = job.unfinished_count || 0;
+  const left = job.unfinished_count || 0;
+  // A job's status stays "scanning" until something finishes it, so a cull
+  // that ran to the end still says so with nothing left to do. Counting the
+  // frames rather than trusting the status stopped this reading "Still
+  // scanning — 0 frames to go" indefinitely.
+  if (left > 0) {
+    note.hidden = false;
     note.textContent = `Still scanning — ${left.toLocaleString()} frame`
       + `${left === 1 ? "" : "s"} to go. Vehicles are grouped once the scan `
       + `finishes, so every frame is listed on its own until then.`;
+  } else if (job.status === "scanning" && !job.grouped_count) {
+    // Everything has been looked at, but grouping is the last step of a full
+    // scan and this album has not had it. Say what to press rather than
+    // leaving every frame of one car listed as a separate vehicle.
+    note.hidden = false;
+    note.textContent = "Every frame is listed on its own because this album "
+      + "has not been grouped yet. Press Regroup to gather the frames of each "
+      + "vehicle together.";
+  } else {
+    note.hidden = true;
   }
 
   state.offset = 0;
+  state.stack = null;
   state.selected.clear();
   updateBulkBar();
   await Promise.all([loadSummary(), loadGrid(false)]);
@@ -965,13 +1205,27 @@ async function loadSummary() {
     stat("to review", c.to_review), stat("written", data.images.written));
 
   $("#number-list").replaceChildren(...data.numbers.map((n) => {
-    const li = el("li", { className: state.number === n.number ? "active" : "" },
+    const li = el("li", {},
       el("span", { className: "n", textContent: `#${n.number}` }),
       el("span", { className: "who", textContent: n.who || "" }),
       el("span", { className: "c", textContent: n.frames }));
-    li.onclick = () => { state.number = n.number; setView("number"); };
+    li.dataset.value = n.number;
+    li.onclick = () => pickFacet("number", n.number);
     return li;
   }));
+
+  $("#plate-list").replaceChildren(...(data.plates || []).map((p) => {
+    const li = el("li", {},
+      el("span", { className: "n", textContent: p.plate }),
+      el("span", { className: "c", textContent: p.frames }));
+    li.dataset.value = p.plate;
+    li.onclick = () => pickFacet("plate", p.plate);
+    return li;
+  }));
+
+  $("#facet-empty").hidden = data.numbers.length || (data.plates || []).length;
+  $("#facet-empty").textContent = "Nothing read off this album yet.";
+  renderFacets();
 }
 
 function stat(label, value) {
@@ -981,29 +1235,33 @@ function stat(label, value) {
 async function loadGrid(append = false) {
   // "By number" with nothing chosen yet is a valid state: show the sidebar
   // and wait for a pick rather than asking the server for an impossible view.
-  if (state.view === "number" && !state.number) {
-    $("#grid").replaceChildren();
-    $("#more").hidden = true;
-    $("#empty").hidden = false;
-    $("#empty").textContent = "Pick a number from the list.";
-    return;
-  }
-
   const params = new URLSearchParams({
     view: state.view, limit: state.limit, offset: state.offset,
     sort: state.sort,
   });
-  if (state.view === "number" && state.number) params.set("number", state.number);
+  // A sidebar pick narrows whichever tab is showing. The server's number
+  // and plate views are what actually filter, so a pick selects that view
+  // and the tab decides whether rejected ones come with it.
+  if (state.facetPick) {
+    params.set("view", state.facetPick.kind);
+    params.set(state.facetPick.kind, state.facetPick.value);
+  }
   if (state.search) params.set("search", state.search);
+  if (state.minStars) params.set("min_stars", state.minStars);
 
   const data = await api(`/api/jobs/${state.jobId}/detections?${params}`);
   state.total = data.total;
-  const blocks = groupItems(data.items).map(vehicleBlock);
-  if (append) $("#grid").append(...blocks);
-  else $("#grid").replaceChildren(...blocks);
+  state.items = append ? [...(state.items || []), ...data.items] : data.items;
+  // Loading more while a stack is open would drop the person back out to
+  // the wall of stacks mid-scroll, so the open stack survives the append.
+  renderGrid();
 
-  $("#more").hidden = state.offset + data.items.length >= state.total;
+  renderFoot();
   $("#empty").hidden = state.total > 0;
+  // setTimeout, not requestAnimationFrame: rAF is tied to painting, and
+  // in a pane that is not currently painting it never runs, so the feed
+  // would quietly stop feeding.
+  setTimeout(() => maybeLoadMore(), 0);
   if (!state.total) {
     $("#empty").textContent = state.view === "review"
       ? "Nothing left to review. Write the XMP when you are ready."
@@ -1041,12 +1299,17 @@ async function loadAlbum() {
   // Offer only what this album is actually ready for. An album with no
   // vehicles cannot be identified, and offering it anyway means pressing a
   // button that does nothing and says nothing about why.
-  const indexed = job.status === "indexed";
+  // Culling is optional. An album that has only been indexed can go straight
+  // to being identified -- it finds the cars on the way and keeps all of
+  // them -- so this is offered whenever there is anything to work on at all.
+  // It used to be greyed out until a cull had run, which made "keep
+  // everything and name it" a thing the app could not do.
+  const empty = !found && job.status !== "indexed";
   offer($("#do-cull"), true,
         () => runStage(job, "cull"));
-  offer($("#do-identify"), !indexed && found > 0,
+  offer($("#do-identify"), !empty,
         () => runStage(job, "identify"),
-        indexed ? "Cull the album first — there are no vehicles yet." : "");
+        empty ? "Nothing to identify yet — index the album first." : "");
   offer($("#do-both"), true, () => runStage(job, "all"));
 
   $("#album-review").disabled = !found;
@@ -1117,117 +1380,174 @@ $("#album-more").onclick = async () => {
 $("#album-review").onclick = () => show("review");
 $("#album-write").onclick = () => { show("review"); toast("Review, then Write XMP"); };
 
-// One vehicle, however many frames it appeared in. Detections with no group
-// stand alone, keyed by their own id so they cannot collide with a group key.
+// One vehicle, however many frames it appeared in.
+//
+// A frame nothing has been read off yet is not a vehicle of its own -- it
+// used to become a one-card "group" with an empty header, and a scan that
+// had not finished identifying produced a screen of hundreds of them, each
+// claiming to be a distinct car. They all go to one Unknown stack instead,
+// which is somewhere to go and correct them from rather than noise to
+// scroll past.
+const UNKNOWN = "unknown";
+
 function groupItems(items) {
   const order = [];
   const byKey = new Map();
   for (const item of items) {
-    const key = item.group_size > 1 && item.group_key != null
-      ? `g${item.group_key}` : `d${item.id}`;
+    const named = identified(item.attributes) || item.number || item.plate;
+    const key = !named ? UNKNOWN
+      : item.group_size > 1 && item.group_key != null
+        ? `g${item.group_key}` : `d${item.id}`;
     if (!byKey.has(key)) { byKey.set(key, []); order.push(key); }
     byKey.get(key).push(item);
   }
-  return order.map((key) => byKey.get(key));
+  // Unknown last: it is the leftovers, not the first thing worth looking at.
+  order.sort((a, b) => (a === UNKNOWN) - (b === UNKNOWN));
+  return order.map((key) => ({ key, members: byKey.get(key) }));
 }
 
-// How many sponsors fit on the header before it stops being readable. The
-// rest are still reachable: they go behind a "+N" that lists all of them.
-const SPONSORS_SHOWN = 6;
-
-// The facts the group agreed on, shown once above its frames rather than
-// repeated on every card. Each frame only sees the panels facing the camera,
-// so the header is the accumulated answer and the cards below are evidence.
-function vehicleBlock(members) {
-  const lead = members[0];
-  const section = el("section", { className: "vehicle" });
-
-  const head = el("div", { className: "vehicle-head" });
-  if (lead.colour_hex) {
-    const swatch = el("span", { className: "swatch big" });
-    swatch.style.background = lead.colour_hex;
-    swatch.title = lead.colour_word
-      ? `Sampled ${lead.colour_hex} — the model called it "${lead.colour_word}"`
-      : `Sampled ${lead.colour_hex}`;
-    head.append(swatch);
-  }
-  head.append(el("h3", { textContent: lead.title || lead.cls }));
-
-  const facts = el("div", { className: "facts" });
+// "<plate> - <team> - Red Toyota Celica", with the parts that were never
+// read left out rather than shown as empty dashes.
+function stackName(key, members) {
+  if (key === UNKNOWN) return "Unknown";
+  const attrs = members.find((m) => identified(m.attributes))?.attributes || {};
   const number = members.find((m) => m.number)?.number;
   const plate = members.find((m) => m.plate)?.plate;
-  // Consolidation writes the accumulated answer onto every member of the
-  // group, so any member carries it. This used to read it off "the first
-  // member that has a team" -- and a road car with sponsor decals and no
-  // race team has no such member, so attrs fell back to {} and every
-  // sponsor the readers found was thrown away on the way to the screen.
-  // Nineteen frames read "Betta" off a Mini and the card showed nothing.
-  const attrs = members.find((m) => Object.keys(m.attributes || {}).length)?.attributes || {};
-  if (number) facts.append(el("span", { className: "fact number", textContent: `#${number}` }));
-  if (plate) facts.append(el("span", { className: "fact plate", textContent: plate }));
-  if (attrs.team) facts.append(el("span", { className: "fact team", textContent: attrs.team }));
+  const lead = members[0] || {};
+  // The title already carries the competition number -- VehicleAnalysis.title
+  // puts "#21" on the front of it -- so prepending it here as well printed
+  // "#21 · Nosse · #21 Black Mini Cooper".
+  const name = String(lead.title || lead.cls || "Vehicle").replace(/^#\S+\s+/, "");
+  const bits = [];
+  if (number) bits.push(`#${number}`);
+  if (plate) bits.push(plate);
+  if (attrs.team) bits.push(attrs.team);
+  else if (identified(attrs)) bits.push("Independent");
+  bits.push(name);
+  return bits.join(" · ");
+}
 
-  // Filter first, then cap. Slicing first meant a group whose first three
-  // sponsors included the team name showed two, and the fourth sponsor --
-  // which was on the car -- was never reachable at all.
-  const sponsors = (attrs.sponsors || []).filter((n) => n && n !== attrs.team);
-  for (const name of sponsors.slice(0, SPONSORS_SHOWN)) {
-    facts.append(el("span", { className: "fact soft", textContent: name }));
-  }
-  if (sponsors.length > SPONSORS_SHOWN) {
-    facts.append(el("span", {
-      className: "fact soft more",
-      textContent: `+${sponsors.length - SPONSORS_SHOWN}`,
-      title: sponsors.join(", "),
-    }));
-  }
+// How many sponsors fit before it stops being readable. The rest are still
+// reachable: they go behind a "+N" that lists all of them.
+const SPONSORS_SHOWN = 6;
+
+// The server always sends a full attributes object, every field present but
+// null until identify() has actually read something -- so "does this object
+// have any keys" can no longer tell an identified frame from one still
+// waiting its turn. This checks for content instead of presence.
+function identified(attrs) {
+  return !!(attrs && (attrs.make || attrs.colour || attrs.body_type || attrs.team
+    || (attrs.sponsors && attrs.sponsors.length)
+    || (attrs.livery_text && attrs.livery_text.length)));
+}
+
+/* ── stacks and the gallery ────────────────────────────────────
+   The review page is a wall of stacks, one per vehicle: the best frame of
+   it face up, the rest of the pile showing behind. Clicking a stack opens
+   that vehicle's own gallery in the same place, with a back button.
+
+   It used to lay every frame of every vehicle out at once, which meant a
+   shoot with eighty cars in it was a page you scrolled for a minute to
+   find one. A stack says "this is one car, here is what it looks like,
+   there are twelve of them" in the space the old header alone took. */
+
+function stackTile(group) {
+  const { key, members } = group;
+  const lead = bestFrame(members);
+  const tile = el("div", { className: "stack" + (key === UNKNOWN ? " unknown" : "") });
+  tile.dataset.key = key;
+
+  // Two empty boxes behind the photo, so a pile reads as a pile at a
+  // glance. Only drawn when there is actually more than one frame --
+  // a stack of one that looks like a stack of six is a lie about the shoot.
+  const pile = el("div", { className: "pile" + (members.length > 1 ? " deep" : "") });
+  const thumb = el("img", { className: "stack-shot", src: `${lead.crop_url}?w=420`,
+                            loading: "lazy", decoding: "async",
+                            alt: stackName(key, members) });
+  pile.append(thumb);
   if (members.length > 1) {
+    pile.append(el("span", { className: "stack-count",
+                             textContent: String(members.length) }));
+  }
+
+  const cap = el("div", { className: "stack-cap" });
+  if (lead.colour_hex && key !== UNKNOWN) {
+    const swatch = el("span", { className: "swatch" });
+    swatch.style.background = lead.colour_hex;
+    cap.append(swatch, " ");
+  }
+  cap.append(el("span", { className: "stack-name",
+                          textContent: stackName(key, members) }));
+
+  const sub = el("div", { className: "stack-sub" });
+  if (key === UNKNOWN) {
+    sub.textContent = `${members.length} frame${members.length === 1 ? "" : "s"}`
+      + " nothing was read off";
+  } else {
     const pct = Math.round((lead.group_agreement || 0) * 100);
-    const disputed = lead.disputed?.length ? lead.disputed : null;
-    facts.append(el("span", {
-      className: "fact count" + (disputed ? " disputed" : ""),
-      textContent: `${members.length} frames`,
-      title: disputed
-        ? `The readers disagreed: ${disputed.join(", ")}`
-        : `${pct}% agreed across ${members.length} frames`,
-    }));
+    sub.textContent = members.length > 1
+      ? `${members.length} frames · ${pct}% agree`
+      : "1 frame";
   }
 
-  // Which body shot it, and how many runs of the shutter it appears in. With
-  // a second shooter present these are the difference between "one car, two
-  // angles" and "two cars that look alike".
-  const cameras = [...new Set(members.map((m) => m.camera).filter(Boolean))];
-  const runs = [...new Set(members.map((m) => m.burst_key).filter((b) => b != null))];
-  if (cameras.length) {
-    facts.append(el("span", {
+  tile.append(pile, cap, sub);
+  tile.onclick = () => openStack(key);
+  return tile;
+}
+
+// The frame shown face-up on the stack: the best-rated one, because a pile
+// should be represented by its keeper, not by whichever came out of SQLite
+// first -- often a blurred lead-in shot of the same car.
+function bestFrame(members) {
+  return members.reduce((best, m) => {
+    const rank = (x) => (x.stars || 0) * 10 + (x.rating || 0) - (x.rejected ? 100 : 0);
+    return rank(m) > rank(best) ? m : best;
+  }, members[0]);
+}
+
+function openStack(key) {
+  state.stack = key;
+  setCursor(null);
+  renderGrid();
+  $("#grid-wrap").scrollTop = 0;
+}
+
+function closeStack() {
+  state.stack = null;
+  setCursor(null);
+  renderGrid();
+}
+
+// Everything the last load returned, kept so opening and closing a stack
+// does not have to go back to the server for frames it already has.
+function renderGrid() {
+  const groups = groupItems(state.items || []);
+  const grid = $("#grid");
+  if (!state.stack) {
+    grid.className = "stacks";
+    grid.replaceChildren(...groups.map(stackTile));
+    return;
+  }
+  const group = groups.find((g) => g.key === state.stack);
+  if (!group) { closeStack(); return; }
+  grid.className = "gallery";
+  grid.replaceChildren(galleryHead(group), ...group.members.map(galleryCard));
+}
+
+function galleryHead(group) {
+  const head = el("div", { className: "gallery-head" });
+  const back = el("button", { className: "ghost back", textContent: "←",
+                              title: "Back to every vehicle (Esc)" });
+  back.onclick = closeStack;
+  head.append(back, el("h3", { textContent: stackName(group.key, group.members) }));
+
+  if (group.key === UNKNOWN) {
+    head.append(el("span", {
       className: "fact soft",
-      textContent: cameras.length === 1 ? shortCamera(cameras[0])
-                                        : `${cameras.length} cameras`,
-      title: cameras.join(" · "),
+      textContent: "correct one and it moves to its own stack",
     }));
   }
-  if (runs.length > 1) {
-    facts.append(el("span", {
-      className: "fact soft", textContent: `${runs.length} bursts`,
-      title: "Seen in more than one run of the shutter",
-    }));
-  }
-
-  // The name came from looking at the pictures again rather than from a vote
-  // on what each frame's reader said. Worth saying: it is a different kind of
-  // answer, and presenting it as a majority would be a lie about its basis.
-  if (lead.second_look) {
-    facts.append(el("span", {
-      className: "fact soft", textContent: "read from the burst",
-      title: "The frames disagreed, so the sharpest of them were read together",
-    }));
-  }
-  head.append(facts);
-  // Only a group of several frames repeats itself, and only then is it worth
-  // stripping the name off each card. See the .multi rules in style.css.
-  section.classList.toggle("multi", members.length > 1);
-  section.append(head, el("div", { className: "strip" }, ...members.map(card)));
-  return section;
+  return head;
 }
 
 function shortCamera(name) {
@@ -1247,75 +1567,105 @@ function band(value) {
   return "low";
 }
 
-function card(item) {
+// What a card shows about its own frame: the picture, the rating, whether
+// it was read, and the two fields worth correcting by hand. Everything
+// about the *vehicle* -- its name, team, sponsors, camera, how many frames
+// agree -- is said once on the group header above the strip, because every
+// card in a group used to repeat all of it, and a twelve-frame vehicle
+// meant reading "blue Mini Cooper S, Nosso Racing, Canon EOS R7" twelve
+// times to find the one thing that actually differs frame to frame: the
+// picture.
+/* A field edited the way an email client edits recipients: each value is a
+   rectangle with an x, and a + opens a box to type the next one. The team
+   and the livery are read off the car by a model that is often close but
+   rarely exactly right, and correcting "Nosse" to "Nosso" used to mean
+   there was nowhere to do it -- they were plain text on the card. */
+function chipField({ values, single, placeholder, onChange }) {
+  const box = el("div", { className: "chips-edit" });
+
+  const commit = (next) => {
+    const seen = new Set();
+    const cleaned = [];
+    for (const v of next) {
+      const text = String(v).trim();
+      if (text && !seen.has(text.toUpperCase())) {
+        seen.add(text.toUpperCase());
+        cleaned.push(text);
+      }
+    }
+    onChange(cleaned);
+    draw(cleaned);
+  };
+
+  function draw(list) {
+    const kids = list.map((value) => {
+      const chip = el("span", { className: "chip", textContent: value });
+      const x = el("button", { className: "chip-x", textContent: "×",
+                               title: `Remove ${value}` });
+      x.onclick = (e) => {
+        e.stopPropagation();
+        commit(list.filter((v) => v !== value));
+      };
+      chip.append(x);
+      return chip;
+    });
+
+    // One team, many sponsors: a single-valued field offers the + only
+    // while it is empty, so there is never a second team to disagree with.
+    if (!single || !list.length) {
+      const add = el("button", { className: "chip-add", textContent: "+",
+                                 title: placeholder });
+      add.onclick = (e) => {
+        e.stopPropagation();
+        const input = el("input", { className: "chip-input", placeholder });
+        add.replaceWith(input);
+        input.focus();
+        let done = false;
+        const finish = (keep) => {
+          if (done) return;
+          done = true;
+          const text = input.value.trim();
+          if (keep && text) commit([...list, text]);
+          else draw(list);
+        };
+        input.onkeydown = (ev) => {
+          if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+          else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+        };
+        input.onblur = () => finish(true);
+      };
+      kids.push(add);
+    }
+    box.replaceChildren(...kids);
+  }
+
+  draw(values);
+  return box;
+}
+
+// One photograph inside a vehicle's gallery: the picture, what was read off
+// it, and the two judgements worth making frame by frame -- how many stars,
+// and whether it stays at all.
+function galleryCard(item) {
   const attrs = item.attributes || {};
-  // A frame Conrod culled is not the same as one a person threw out. The cull
-  // is a rating now -- red bar, reason underneath, fully legible -- because
-  // its whole purpose is to be looked at and disagreed with. Ghosting it at
-  // 40% opacity made the automatic decisions the hardest ones to review.
   const cutByHand = item.rejected && !item.cull_reason;
   const node = el("div", { className: "card" + (cutByHand ? " rejected" : "")
                                               + (item.cull_reason ? " culled" : "") });
   node.dataset.id = item.id;
-  // Clicking anywhere on a card moves the keyboard's attention to it, so
-  // the mouse and the shortcuts are working on the same vehicle.
+  node._item = item;      // so the full-frame view can render any card
   node.addEventListener("mousedown", () => setCursor(node, { scroll: false }));
 
-  // Ask for a thumbnail, not the 2048px crop the readers work from.
+  const frame = el("div", { className: "frame-box" });
   const thumb = el("img", { className: "thumb", src: `${item.crop_url}?w=420`,
                             loading: "lazy", decoding: "async",
-                            alt: item.title || item.cls, title: "Click for the whole frame" });
+                            alt: item.title || item.cls, title: item.filename });
   thumb.onclick = (e) => {
     if (e.shiftKey) { toggleSelect(node, item.id); return; }
-    $("#frame-img").src = item.frame_url;
-    $("#frame-caption").textContent = item.image_path;
-    $("#frame-dialog").showModal();
+    openFrame(node);
   };
+  frame.append(thumb);
 
-  const title = el("div", { className: "title", textContent: item.title || item.cls });
-  if (item.colour_hex) {
-    // The model's word for a colour is often wrong or useless -- two cars
-    // that look nothing alike both come back "gray". This square is measured
-    // off the crop, so a wrong word is obvious without opening the frame.
-    const swatch = el("span", { className: "swatch" });
-    swatch.style.background = item.colour_hex;
-    swatch.title = item.colour_word
-      ? `Sampled ${item.colour_hex} — the model called it "${item.colour_word}"`
-      : `Sampled ${item.colour_hex}`;
-    title.prepend(swatch, " ");
-  }
-  if (item.group_size > 1) {
-    // Say how many crops the group had and how much of it agreed, so a name
-    // eight frames settled on reads differently from a four-way tie.
-    //
-    // Three outcomes, not two: the group agreed on a full name, it agreed on
-    // the make but not the model, or it agreed on nothing. The middle one
-    // still shows a make, so calling it "no agreement" read as a
-    // contradiction against the "blue Ford" printed next to it.
-    const pct = Math.round((item.group_agreement || 0) * 100);
-    const disputed = item.disputed?.length ? item.disputed : null;
-    const makeOnly = disputed && item.make && !item.model;
-    const badge = el("span", {
-      className: "grouptag" + (disputed ? " disputed" : ""),
-      textContent: makeOnly
-        ? `${item.group_size} seen · ${pct}% say ${item.make}`
-        : disputed
-          ? `${item.group_size} seen · no agreement`
-          : `${item.group_size} seen · ${pct}% agree`,
-      title: disputed
-        ? `The readers disagreed: ${disputed.join(", ")}`
-        : `Agreed across ${item.group_size} frames of this vehicle`,
-    });
-    title.append(" ", badge);
-  }
-  // One chip for the picture, combining two separate measurements: how sharp
-  // the subject is, and how much of it the frame edge took. They are kept
-  // apart in the database and in the tooltip, because they are different
-  // faults with different fixes -- a frame cut in half is often pin sharp.
   const verdict = item.rating_verdict || item.sharpness_verdict;
-  // Shown when the cull rated it, and also when it has no measured verdict
-  // at all but somebody starred it by hand — otherwise their rating would
-  // be invisible on the one card they cared enough to rate.
   if ((verdict && verdict !== "unknown") || item.stars) {
     const why = [`subject sharpness ${(item.sharpness || 0).toFixed(2)}`];
     if (item.background >= 0) why.push(`background ${item.background.toFixed(2)}`);
@@ -1326,117 +1676,96 @@ function card(item) {
     if (item.sharp_end && item.sharp_end !== "even") {
       why.push(`sharpest towards the ${item.sharp_end}`);
     }
-    node.append(el("span", {
+    frame.append(el("span", {
       className: "focus stars " + (verdict || "") + (item.by_hand ? " by-hand" : ""),
       textContent: item.stars ? "★".repeat(item.stars) : (verdict || "—"),
       title: item.by_hand
         ? `${item.stars} stars, given by you — this is what Write XMP will use`
         : `${why.join(" · ")} — measured on the vehicle, not the whole frame`,
     }));
-    // The card takes the colour it will carry into the catalogue, so the
-    // grid can be read at a glance the way a filmstrip is.
     if (verdict) node.classList.add(`rated-${verdict}`);
   }
-
-  // A held pan: subject sharp, background smeared on purpose. Never culled
-  // automatically, and worth saying out loud, because the numbers underneath
-  // it look exactly like a frame that was simply missed.
   if (item.panning) {
-    node.append(el("span", { className: "focus panning", textContent: "panned",
+    frame.append(el("span", { className: "focus panning", textContent: "panned",
       title: "Subject sharp against a blurred background — kept, never auto-culled" }));
   }
-
-  // Cut by Conrod, not by a person. Saying which is the difference between
-  // "I decided this" and "something decided this and will not say what".
   if (item.cull_reason) {
-    node.append(el("div", { className: "culled", textContent: item.cull_reason }));
+    frame.append(el("div", { className: "culled", textContent: item.cull_reason }));
   }
 
-  const who = el("div", { className: "who", textContent: item.who || "" });
-  const kw = el("div", { className: "kw",
-                         textContent: (item.keywords || []).join(" · ") });
+  // What was read off this frame, on inline labelled lines -- "Plate: X",
+  // not a label column and a value column, which cost four rows of card
+  // height to say four short things.
+  const facts = el("div", { className: "readout" });
+  const readLine = (label, ...value) =>
+    facts.append(el("div", { className: "read" },
+      el("span", { className: "lbl", textContent: label }), ...value));
 
-  const num = el("input", { className: "num", value: item.number || "",
-                            placeholder: "—", inputMode: "numeric", autocomplete: "off" });
-  const plate = el("input", { className: "plate", value: item.plate || "",
-                              placeholder: "plate", autocomplete: "off" });
+  const plateInput = el("input", { className: "plate", value: item.plate || "",
+                                   placeholder: "—", autocomplete: "off" });
+  const numInput = el("input", { className: "num", value: item.number || "",
+                                 placeholder: "—", inputMode: "numeric",
+                                 autocomplete: "off" });
 
-  // Show the confidence of whatever was actually read. This used to report
-  // the race-number confidence unconditionally, so a card with a plate read at
-  // 0.89 and no competition number displayed a red 0%.
-  const readConf = item.number ? item.number_conf
-                 : item.plate ? item.plate_conf : null;
-  const readWhat = item.number ? "number" : item.plate ? "plate" : "";
-  const conf = el("span", { className: "tag conf",
-    title: readWhat ? `Confidence in the ${readWhat} read` : "Nothing was read",
-    textContent: readConf != null && (item.number || item.plate)
-      ? `${readWhat} ${Math.round(readConf * 100)}%` : "no read" });
-  conf.dataset.band = (item.number || item.plate) ? band(readConf) : "none";
+  const plateConf = el("span", { className: "tag conf",
+    textContent: item.plate && item.plate_conf != null
+      ? `${Math.round(item.plate_conf * 100)}%` : "" });
+  plateConf.hidden = !item.plate;
+  plateConf.dataset.band = item.plate ? band(item.plate_conf) : "none";
 
-  const src = el("span", {
-    className: "tag " + (item.number_source || "").replace("+", " "),
-    textContent: item.number_source || "", hidden: !item.number_source });
+  const numConf = el("span", { className: "tag conf",
+    textContent: item.number && item.number_conf != null
+      ? `${Math.round(item.number_conf * 100)}%` : "" });
+  numConf.hidden = !item.number;
+  numConf.dataset.band = item.number ? band(item.number_conf) : "none";
 
-  const teamTag = el("span", { className: "tag warn", textContent: "team unverified",
-    hidden: !(attrs.team && !attrs.team_corroborated) });
+  readLine("Plate", plateInput, plateConf);
+  readLine("No.", numInput, numConf);
 
-  // What the card was missing. A vehicle has a name, an owner of that name
-  // and a measure of how much either is worth, and none of it was on the
-  // card -- so a frame the readers were confident about and one they had
-  // guessed at looked identical, and the only way to tell was to open it.
-  const chips = el("div", { className: "chips" });
+  // Team and livery are read off the car by a model that is often close and
+  // rarely exact -- "Nosse" for "Nosso" -- and until now there was nowhere
+  // to correct either: they were plain text printed on the card.
+  const saveAttrs = (patch) => api(`/api/detections/${item.id}`, {
+    method: "POST",
+    body: JSON.stringify({ attributes: patch, reviewed: true }),
+  }).then((saved) => {
+    node.classList.add("saved");
+    loadSummary();
+    return saved;
+  }).catch((err) => toast(err.message));
 
-  if (attrs.team) {
-    chips.append(el("span", {
-      className: "tag team", textContent: attrs.team,
-      title: attrs.team_corroborated
-        ? "Read off the car and confirmed by OCR"
-        : "The model named this team but no read text backs it up",
-    }));
+  const teamRow = el("div", { className: "read" },
+    el("span", { className: "lbl", textContent: "Team" }));
+  teamRow.append(chipField({
+    values: attrs.team ? [attrs.team] : [],
+    single: true,
+    placeholder: "team or entrant",
+    onChange: (list) => {
+      attrs.team = list[0] || null;
+      saveAttrs({ team: list[0] || "" });
+    },
+  }));
+  if (!attrs.team) {
+    teamRow.append(el("span", { className: "val muted-note",
+      textContent: identified(attrs) ? "Independent" : "",
+      title: "No team name was read -- a privateer, or none shown" }));
   }
+  facts.append(teamRow);
 
-  // How much the identification is worth. A group that agreed across frames
-  // is evidence; one frame's own confidence is the model's opinion of
-  // itself, which is a much weaker thing -- so they are labelled apart
-  // rather than blended into one number that means neither.
-  if (item.group_size > 1 && item.group_agreement != null) {
-    const pct = Math.round(item.group_agreement * 100);
-    const idChip = el("span", { className: "tag conf", textContent: `id ${pct}%`,
-      title: `${pct}% of ${item.group_size} frames of this vehicle agreed on this name` });
-    idChip.dataset.band = band(item.group_agreement);
-    chips.append(idChip);
-  } else if (attrs.vlm_conf) {
-    const pct = Math.round(attrs.vlm_conf * 100);
-    const idChip = el("span", { className: "tag conf", textContent: `id ${pct}%`,
-      title: "The vision model's confidence in this name, from one frame. "
-           + "It is often confident and wrong; a name agreed across a burst is worth more." });
-    idChip.dataset.band = band(attrs.vlm_conf);
-    chips.append(idChip);
-  }
+  const liveryRow = el("div", { className: "read" },
+    el("span", { className: "lbl", textContent: "Livery" }));
+  liveryRow.append(chipField({
+    values: (attrs.sponsors || []).filter((s) => s && s !== attrs.team),
+    placeholder: "sponsor",
+    onChange: (list) => {
+      attrs.sponsors = list;
+      saveAttrs({ sponsors: list });
+    },
+  }));
+  facts.append(liveryRow);
 
-  if (item.second_look) {
-    chips.append(el("span", { className: "tag", textContent: "burst read",
-      title: "Named by showing the model the sharpest frames of this vehicle together" }));
-  }
-  if (attrs.body_type) {
-    chips.append(el("span", { className: "tag soft", textContent: attrs.body_type }));
-  }
-  if (item.plate_state) {
-    chips.append(el("span", { className: "tag soft", textContent: item.plate_state }));
-  }
-  // Which body shot it. With a second shooter present this is the difference
-  // between one car photographed twice and two cars.
-  if (item.camera) {
-    chips.append(el("span", { className: "tag soft", textContent: shortCamera(item.camera),
-                              title: item.camera }));
-  }
-  const extras = (attrs.sponsors || []).filter((s) => s && s !== attrs.team);
-  if (extras.length) {
-    chips.append(el("span", {
-      className: "tag soft", textContent: extras.slice(0, 2).join(" · ")
-        + (extras.length > 2 ? ` +${extras.length - 2}` : ""),
-      title: extras.join(", "),
-    }));
+  if (item.who) {
+    readLine("Driver", el("span", { className: "val", textContent: item.who }));
   }
 
   const save = async (patch) => {
@@ -1444,40 +1773,60 @@ function card(item) {
       method: "POST", body: JSON.stringify({ ...patch, reviewed: true }),
     });
     node.classList.add("saved");
-    title.textContent = saved.title || item.cls;
-    who.textContent = saved.who || "";
-    kw.textContent = (saved.keywords || []).join(" · ");
-    conf.textContent = "confirmed"; conf.dataset.band = "high";
-    src.textContent = "manual"; src.className = "tag manual"; src.hidden = false;
-    teamTag.hidden = true;
     loadSummary();
+    return saved;
+  };
+  numInput.onkeydown = async (e) => {
+    if (e.key === "Enter") { e.preventDefault(); await save({ number: numInput.value.trim() }); }
+  };
+  numInput.onblur = () => {
+    if (numInput.value.trim() !== (item.number || "")) save({ number: numInput.value.trim() });
+  };
+  plateInput.onblur = () => {
+    if (plateInput.value.trim() !== (item.plate || "")) save({ plate: plateInput.value.trim() });
   };
 
-  num.onkeydown = async (e) => {
-    if (e.key === "Enter") { e.preventDefault(); await save({ number: num.value.trim() }); focusNext(node); }
-    else if (e.key === "Escape") { e.preventDefault(); await reject(item.id, true); node.classList.add("rejected"); focusNext(node); }
+  // The rating, as five stars to click rather than a number to remember a
+  // shortcut for. The keyboard still does it faster; this is for the pass
+  // where a mouse is already in your hand.
+  const starRow = el("div", { className: "stars-control" });
+  const paintStars = (n) => {
+    [...starRow.querySelectorAll(".star")].forEach((s, i) => {
+      s.classList.toggle("on", i < n);
+    });
   };
-  num.onblur = () => { if (num.value.trim() !== (item.number || "")) save({ number: num.value.trim() }); };
-  plate.onblur = () => { if (plate.value.trim() !== (item.plate || "")) save({ plate: plate.value.trim() }); };
+  for (let n = 1; n <= 5; n += 1) {
+    const s = el("button", { className: "star", textContent: "★",
+                             title: `${n} star${n === 1 ? "" : "s"}` });
+    s.onclick = async (e) => {
+      e.stopPropagation();
+      setCursor(node, { scroll: false });
+      await setStars(node, Number(node.dataset.stars) === n ? 0 : n);
+      paintStars(Number(node.dataset.stars) || 0);
+    };
+    starRow.append(s);
+  }
+  node.dataset.stars = item.stars || "";
+  paintStars(item.stars || 0);
 
-  // Labelled, not a bare glyph, and it takes effect on the click — there is
-  // nothing to confirm and nothing is written to the photograph either way.
-  // U, or clicking it again, puts the vehicle back.
+  if (item.bystander) node.classList.add("bystander");
   const rejectBtn = el("button", { className: "ghost danger cut",
-                                   textContent: "Reject",
-                                   title: "Reject this vehicle (X). Click again to undo." });
-  rejectBtn.onclick = async () => {
-    const now = !node.classList.contains("rejected");
+    textContent: cutLabel(item, node),
+    title: (item.in_frame || 1) > 1
+      ? "Several vehicles in this frame, so this takes this one out of the "
+        + "vehicle and leaves the photograph alone (X)."
+      : "Reject this vehicle (X). Click again to undo." });
+  rejectBtn.onclick = async (e) => {
+    e.stopPropagation();
+    const cut = !(node.classList.contains("rejected")
+                  || node.classList.contains("bystander"));
     setCursor(node, { scroll: false });
-    await cutCard(node, now);
+    await cutCard(node, cut);
+    rejectBtn.textContent = cutLabel(item, node);
   };
 
-  node.append(thumb, el("div", { className: "body" },
-    title,
-    el("div", { className: "file", textContent: item.filename, title: item.image_path }),
-    el("div", { className: "row" }, num, plate, conf, src,
-       el("div", { className: "actions" }, rejectBtn)),
-    chips, teamTag, who, kw));
+  node.append(frame, el("div", { className: "body" }, facts),
+              el("div", { className: "verdict-row" }, starRow, rejectBtn));
   return node;
 }
 
@@ -1539,15 +1888,200 @@ async function setStars(node, stars) {
   }
   toast(saved.by_hand ? `${saved.stars} stars`
                       : "Back to the cull's rating");
+  if (state.dialogNode === node) renderFrameControls(node);
 }
 
-async function cutCard(node, rejected) {
+/* Reject means "get this out of my way", and what that should do depends
+   on what else is in the photograph.
+
+   A frame holding several vehicles is usually a good frame of one car with
+   others behind it, so rejecting there means "this is not the car" -- the
+   detection leaves the vehicle and stops speaking for the frame, and the
+   frame itself is untouched. Only when the vehicle is the sole thing
+   detected in the frame does rejecting mean rejecting the photograph.
+
+   One button either way: the distinction is real but it is not one anyone
+   should have to make by picking the right control. */
+async function cutCard(node, cut) {
   const id = Number(node.dataset.id);
   if (!id) return;
-  await reject(id, rejected);
-  node.classList.toggle("rejected", rejected);
+  const alone = ((node._item || {}).in_frame || 1) <= 1;
+  try {
+    await api(`/api/detections/${id}`, {
+      method: "POST",
+      body: JSON.stringify(alone ? { rejected: cut, reviewed: true }
+                                 : { bystander: cut, reviewed: true }),
+    });
+  } catch (err) { toast(err.message); return; }
+
+  if (node._item) node._item[alone ? "rejected" : "bystander"] = cut;
+  node.classList.toggle("rejected", cut && alone);
+  node.classList.toggle("bystander", cut && !alone);
+  if (cut && !alone) {
+    toast("Taken out of this vehicle — the frame is untouched");
+  }
   loadSummary();
+  if (state.dialogNode === node) renderFrame();
 }
+
+// What the button should say, given what rejecting would actually do here.
+function cutLabel(item, node) {
+  const alone = ((item || {}).in_frame || 1) <= 1;
+  const cut = node.classList.contains("rejected") || node.classList.contains("bystander");
+  if (cut) return alone ? "Restore" : "Put back";
+  return alone ? "Reject" : "Not this car";
+}
+
+// The full-frame dialog is where a hard call actually gets made -- soft or
+// sharp, kept or not -- so it carries the same reject and star controls as
+// the card behind it rather than making someone close it first. Both draw
+// off the same card node, through the same setStars/cutCard, so the two
+// views can never disagree about a vehicle's state.
+/* The full-frame view: the photograph, everything read off it down the
+   side, and a way through the rest of the vehicle's frames without going
+   back to the grid between each one. It used to be the picture, its path
+   and a Close button -- so culling a twenty-five frame burst meant open,
+   judge, close, click the next, twenty-five times. */
+function openFrame(node) {
+  if (!node) return;
+  state.dialogNode = node;
+  setCursor(node, { scroll: false });
+  renderFrame();
+  const dialog = $("#frame-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
+// Which frames the arrows walk: the ones on screen, in the order shown.
+function frameSiblings() {
+  const all = cards();
+  return { all, at: all.indexOf(state.dialogNode) };
+}
+
+function stepFrame(by) {
+  const { all, at } = frameSiblings();
+  if (at < 0 || !all.length) return;
+  const next = all[Math.min(all.length - 1, Math.max(0, at + by))];
+  if (next && next !== state.dialogNode) openFrame(next);
+}
+
+function renderFrame() {
+  const node = state.dialogNode;
+  if (!node) return;
+  const item = node._item || {};
+  const attrs = item.attributes || {};
+
+  $("#frame-img").src = item.frame_url || "";
+  $("#frame-title").textContent = item.title || item.cls || "Vehicle";
+  $("#frame-caption").textContent = item.image_path || "";
+
+  // Everything known about this one frame, as labelled lines.
+  const out = $("#frame-readout");
+  const line = (label, value, cls) => {
+    if (value === null || value === undefined || value === "") return;
+    out.append(el("div", { className: "read" },
+      el("span", { className: "lbl", textContent: label }),
+      el("span", { className: "val" + (cls ? " " + cls : ""), textContent: String(value) })));
+  };
+  out.replaceChildren();
+  line("Plate", item.plate || "—");
+  line("No.", item.number || "—");
+  if (item.number && item.number_conf != null) {
+    line("Read", `${Math.round(item.number_conf * 100)}% ${item.number_source || ""}`.trim());
+  }
+  const saveAttrs = (patch) => api(`/api/detections/${item.id}`, {
+    method: "POST", body: JSON.stringify({ attributes: patch, reviewed: true }),
+  }).then(() => loadSummary()).catch((err) => toast(err.message));
+
+  const chipRow = (label, values, opts) => {
+    const row = el("div", { className: "read" },
+      el("span", { className: "lbl", textContent: label }));
+    row.append(chipField({ values, ...opts }));
+    out.append(row);
+  };
+  chipRow("Team", attrs.team ? [attrs.team] : [], {
+    single: true, placeholder: "team or entrant",
+    onChange: (list) => { attrs.team = list[0] || null; saveAttrs({ team: list[0] || "" }); },
+  });
+  if (!attrs.team && identified(attrs)) {
+    out.lastChild.append(el("span", { className: "val muted-note",
+                                      textContent: "Independent" }));
+  }
+  const sponsors = (attrs.sponsors || []).filter((s) => s && s !== attrs.team);
+  chipRow("Livery", sponsors, {
+    placeholder: "sponsor",
+    onChange: (list) => { attrs.sponsors = list; saveAttrs({ sponsors: list }); },
+  });
+  if (item.who) line("Driver", item.who);
+  if (attrs.body_type) line("Body", attrs.body_type);
+  if (item.camera) line("Camera", shortCamera(item.camera));
+  if (item.sharpness != null) {
+    const verdict = item.rating_verdict || item.sharpness_verdict || "";
+    line("Sharpness", `${item.sharpness.toFixed(2)}${verdict ? " · " + verdict : ""}`);
+  }
+  if (item.cull_reason) line("Culled", item.cull_reason, "unverified");
+
+  const stars = Number(node.dataset.stars) || 0;
+  const box = $("#frame-stars");
+  box.replaceChildren(...[1, 2, 3, 4, 5].map((n) => {
+    const b = el("button", { className: "star" + (n <= stars ? " on" : ""),
+                             textContent: "★",
+                             title: `${n} star${n === 1 ? "" : "s"}` });
+    b.onclick = () => setStars(node, n);
+    return b;
+  }));
+  $("#frame-clear").onclick = () => setStars(node, 0);
+
+  const cut = node.classList.contains("rejected")
+              || node.classList.contains("bystander");
+  const rejectBtn = $("#frame-reject");
+  rejectBtn.textContent = cutLabel(item, node);
+  rejectBtn.title = (item.in_frame || 1) > 1
+    ? "Several vehicles in this frame. This takes this one out of the "
+      + "vehicle; the photograph itself is untouched."
+    : "Reject this vehicle. Nothing is written to the photograph either way.";
+  rejectBtn.onclick = () => cutCard(node, !cut);
+
+  /* A frame can hold several vehicles, and only one of them is what the
+     photograph is of. Rejecting the others is the wrong tool -- reject is
+     a judgement about the frame, and it was taking the frame's own subject
+     down with it. This says "not this car" instead: it leaves the vehicle
+     and stops speaking for the frame, and the frame is untouched. */
+  const bystanderBtn = $("#frame-bystander");
+  const many = (item.in_frame || 1) > 1;
+  bystanderBtn.hidden = !many;
+  if (many) {
+    const isBystander = Boolean(item.bystander);
+    bystanderBtn.textContent = isBystander ? "Is the main car" : "Not the main car";
+    bystanderBtn.classList.toggle("on", isBystander);
+    bystanderBtn.onclick = async () => {
+      const now = !item.bystander;
+      try {
+        await api(`/api/detections/${item.id}`, {
+          method: "POST",
+          body: JSON.stringify({ bystander: now, reviewed: true }),
+        });
+        item.bystander = now;
+        node.classList.toggle("bystander", now);
+        toast(now ? "Taken out of this vehicle" : "Back in this vehicle");
+        renderFrame();
+        loadSummary();
+      } catch (err) { toast(err.message); }
+    };
+  }
+
+  const { all, at } = frameSiblings();
+  $("#frame-pos").textContent = all.length > 1 ? `${at + 1} of ${all.length}` : "";
+  $("#frame-prev").disabled = at <= 0;
+  $("#frame-next").disabled = at < 0 || at >= all.length - 1;
+}
+
+// Kept as the name the rest of the app calls after a star or a reject.
+function renderFrameControls(node) {
+  if (state.dialogNode === node) renderFrame();
+}
+
+$("#frame-prev").onclick = () => stepFrame(-1);
+$("#frame-next").onclick = () => stepFrame(1);
 
 document.addEventListener("keydown", async (e) => {
   if (state.screen !== "review") return;
@@ -1556,23 +2090,40 @@ document.addEventListener("keydown", async (e) => {
   if (tag === "input" || tag === "select" || tag === "textarea") return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
+  // The dialog shows one frame at a time and traps focus on it, so j/k
+  // moving a cursor the person cannot see would only end up culling
+  // whichever card it landed on next, not the one still on screen.
+  const dialogOpen = $("#frame-dialog").open;
   const key = e.key;
   if (key === "?") { e.preventDefault(); showKeys(); return; }
-  if (key === "j" || key === "ArrowRight" || key === "ArrowDown") {
+  // Escape leaves the vehicle you are in, the way the back arrow does.
+  // The dialog handles its own Escape natively, so it goes first.
+  if (key === "Escape" && !dialogOpen && state.stack) {
+    e.preventDefault(); closeStack(); return;
+  }
+  // In the full-frame view the arrows walk the vehicle's frames, which is
+  // the whole point of being in it: judge, move on, without closing.
+  if (dialogOpen && (key === "ArrowRight" || key === "j")) {
+    e.preventDefault(); stepFrame(1); return;
+  }
+  if (dialogOpen && (key === "ArrowLeft" || key === "k")) {
+    e.preventDefault(); stepFrame(-1); return;
+  }
+  if (!dialogOpen && (key === "j" || key === "ArrowRight" || key === "ArrowDown")) {
     e.preventDefault(); moveCursor(1); return;
   }
-  if (key === "k" || key === "ArrowLeft" || key === "ArrowUp") {
+  if (!dialogOpen && (key === "k" || key === "ArrowLeft" || key === "ArrowUp")) {
     e.preventDefault(); moveCursor(-1); return;
   }
 
-  const node = state.cursor || cards()[0];
+  const node = dialogOpen ? state.dialogNode : (state.cursor || cards()[0]);
   if (!node) return;
-  if (!state.cursor) { setCursor(node); return; }
+  if (!dialogOpen && !state.cursor) { setCursor(node); return; }
 
   if (key === "x" || key === "X" || key === "Delete" || key === "Backspace") {
     e.preventDefault();
     await cutCard(node, true);
-    moveCursor(1);
+    if (!dialogOpen) moveCursor(1);
   } else if (key === "u" || key === "U") {
     e.preventDefault();
     await cutCard(node, false);
@@ -1581,7 +2132,7 @@ document.addEventListener("keydown", async (e) => {
     await api(`/api/detections/${node.dataset.id}`, {
       method: "POST", body: JSON.stringify({ reviewed: true }) });
     node.classList.add("saved");
-    moveCursor(1);
+    if (!dialogOpen) moveCursor(1);
   } else if (key >= "0" && key <= "5") {
     e.preventDefault();
     await setStars(node, Number(key));
@@ -1596,9 +2147,40 @@ $("#btn-keys").onclick = showKeys;
 $("#sort").onchange = () => {
   state.sort = $("#sort").value;
   state.offset = 0;
+  state.stack = null;
   setCursor(null);
   loadGrid();
 };
+
+// "3 stars and up" as one click, the way Aftershoot's toolbar does it,
+// rather than only being able to sort by rating and scroll to where it
+// stops being good enough. Clicking the star already active clears the
+// filter -- there is no separate "off" button to hunt for.
+renderStarFilter();
+setFacet("number");
+function renderStarFilter() {
+  const box = $("#star-filter");
+  const clear = el("button", { className: "ghost star-filter-clear",
+    textContent: "Any", title: "Show every rating" });
+  clear.classList.toggle("on", !state.minStars);
+  clear.onclick = () => setMinStars(null);
+  box.replaceChildren(clear, ...[1, 2, 3, 4, 5].map((n) => {
+    const b = el("button", {
+      className: "star" + (state.minStars && n <= state.minStars ? " on" : ""),
+      textContent: "★", title: `${n}${n === 1 ? " star" : " stars"} and up`,
+    });
+    b.onclick = () => setMinStars(state.minStars === n ? null : n);
+    return b;
+  }));
+}
+function setMinStars(n) {
+  state.minStars = n;
+  state.offset = 0;
+  state.stack = null;
+  setCursor(null);
+  renderStarFilter();
+  loadGrid();
+}
 
 function focusNext(fromCard) {
   const cards = $$(".card");
@@ -1624,18 +2206,108 @@ function updateBulkBar() {
   $("#bulk-count").textContent = `${state.selected.size} selected`;
 }
 
+/* Three tabs, not five. "By number" and "Plates" were never really views
+   -- both did nothing until you picked something from a sidebar they
+   turned on -- so they sat oddly beside "All" and "Rejected", which are
+   states a vehicle is in. The sidebar is always there now and does the
+   picking; these three say which vehicles it is picking from.
+
+   "Needs review" also used to be both a tab and the default sort, saying
+   the same thing twice in two controls a hand's width apart. */
 function setView(view) {
   state.view = view;
   state.offset = 0;
+  state.stack = null;
+  state.facetPick = null;      // a tab is a fresh start, not a narrowing
   $$("#view-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  $("#sidebar").hidden = view !== "number";
+  renderFacets();
   loadGrid(false);
   loadSummary();
 }
 
 $$("#view-tabs button").forEach((b) => { b.onclick = () => setView(b.dataset.view); });
+
+/* The sidebar. Numbers or plates, whichever is being browsed, with the one
+   in force shown as a filter that can be cleared. */
+function setFacet(kind) {
+  state.facet = kind;
+  $$("#facet-tabs button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.facet === kind));
+  $("#number-list").hidden = kind !== "number";
+  $("#plate-list").hidden = kind !== "plate";
+  renderFacets();
+}
+$$("#facet-tabs button").forEach((b) => { b.onclick = () => setFacet(b.dataset.facet); });
+
+function pickFacet(kind, value) {
+  state.facetPick = { kind, value };
+  state.offset = 0;
+  state.stack = null;
+  renderFacets();
+  loadGrid(false);
+}
+
+$("#facet-clear").onclick = () => {
+  state.facetPick = null;
+  state.offset = 0;
+  state.stack = null;
+  renderFacets();
+  loadGrid(false);
+};
+
+function renderFacets() {
+  const pick = state.facetPick;
+  $("#facet-clear").hidden = !pick;
+  if (pick) {
+    $("#facet-clear").textContent =
+      `Clear ${pick.kind === "plate" ? pick.value : "#" + pick.value}`;
+  }
+  $$("#number-list li").forEach((li) => li.classList.toggle(
+    "active", Boolean(pick) && pick.kind === "number" && li.dataset.value === pick.value));
+  $$("#plate-list li").forEach((li) => li.classList.toggle(
+    "active", Boolean(pick) && pick.kind === "plate" && li.dataset.value === pick.value));
+}
+
 $("#job-select").onchange = (e) => { state.jobId = Number(e.target.value); refreshReview(); };
-$("#more").onclick = () => { state.offset += state.limit; loadGrid(true); };
+/* Infinite scroll. A button meant that going through a shoot of two
+   thousand frames was scroll, reach for the mouse, click "Load more",
+   scroll again, over and over.
+
+   Driven by the scroll event rather than an IntersectionObserver: the
+   observer is the tidier mechanism but it did not fire at all in one of
+   the surfaces this gets looked at in, and a feed that silently stops
+   feeding is worse than a plain listener.
+
+   A page of detections can also collapse into very few stacks -- a hundred
+   and twenty frames of one car is one tile -- so a load that leaves the
+   pane unscrollable pulls the next page too, up to a few in a row, rather
+   than stranding someone at a short page with no way to ask for more. */
+function maybeLoadMore() {
+  const pane = $("#grid-wrap");
+  if (!pane || state.loadingMore) return;
+  if (state.screen !== "review") return;
+  if (state.items.length >= state.total) return;
+  // Only hold off while there is still page left to scroll through; once
+  // the bottom is in reach, fetch the next one.
+  const room = pane.scrollHeight - pane.clientHeight;
+  if (room > 0 && pane.scrollTop < room - 600) return;
+  state.loadingMore = true;
+  state.offset += state.limit;
+  loadGrid(true).finally(() => {
+    state.loadingMore = false;
+    maybeLoadMore();
+  });
+}
+
+function renderFoot() {
+  const foot = $("#more");
+  const seen = state.items.length;
+  foot.hidden = seen >= state.total;
+  foot.textContent =
+    `${seen.toLocaleString()} of ${state.total.toLocaleString()}…`;
+}
+
+$("#grid-wrap").addEventListener("scroll", () => maybeLoadMore(), { passive: true });
 
 let searchTimer;
 $("#search").oninput = (e) => {
@@ -1643,12 +2315,16 @@ $("#search").oninput = (e) => {
   searchTimer = setTimeout(() => {
     state.search = e.target.value.trim();
     state.offset = 0;
+    state.stack = null;
     loadGrid(false);
   }, 250);
 };
 
 $("#frame-close").onclick = () => $("#frame-dialog").close();
 $("#frame-dialog").onclick = (e) => { if (e.target.id === "frame-dialog") $("#frame-dialog").close(); };
+// Covers every way the dialog can close -- the button, the backdrop, Escape
+// -- in one place, so a stale node can never linger as the keyboard's target.
+$("#frame-dialog").addEventListener("close", () => { state.dialogNode = null; });
 
 $("#bulk-apply").onclick = async () => {
   await api("/api/detections/bulk", { method: "POST",
@@ -1745,7 +2421,6 @@ $("#btn-write").onclick = async () => {
 
     if (scan.active) {
       show("scan");
-      $("#scan-setup-pane").hidden = true;
       $("#scanner").hidden = false;
       $("#btn-stop").hidden = false;
       $("#btn-pause").hidden = false;
