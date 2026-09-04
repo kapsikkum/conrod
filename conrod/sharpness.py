@@ -150,6 +150,15 @@ class Sharpness:
     # gone either way. Culled all the same, but flagged for a person.
     uncertain: bool = False
 
+    # Whether the measure actually ran, as opposed to what it came back with.
+    # These are different answers and were being conflated: the scale bottoms
+    # out at zero, so a frame blurred past the end of it scores exactly 0.0 --
+    # which read as "could not be judged", and the detection was stored with
+    # no rating, no verdict and no colour at all. On one real album that was
+    # 541 detections, 8% of everything the cull kept: not culled, not rated,
+    # not sortable, and never eligible to be the keeper of a pass.
+    measured: bool = False
+
     def __bool__(self) -> bool:
         return self.verdict != "unknown"
 
@@ -257,7 +266,7 @@ def measure(image: Image.Image, box=None) -> Sharpness:
         score = _region_score(data)
         if score < 0:
             return Sharpness()
-        return Sharpness(score=score, verdict="unknown")
+        return Sharpness(score=score, verdict="unknown", measured=True)
 
     x1, y1, x2, y2 = inner
     subject = data[y1:y2, x1:x2]
@@ -269,7 +278,8 @@ def measure(image: Image.Image, box=None) -> Sharpness:
         score = _region_score(data)
         if score < 0:
             return Sharpness()
-        return Sharpness(score=score, verdict="unknown", uncertain=True)
+        return Sharpness(score=score, verdict="unknown", uncertain=True,
+                         measured=True)
 
     score = _normalise(float(np.percentile(subject_tiles, TILE_PERCENTILE)))
 
@@ -284,7 +294,8 @@ def measure(image: Image.Image, box=None) -> Sharpness:
 
     bands, sharp_end = _bands(subject)
     return Sharpness(score=score, verdict="unknown", background=background,
-                     panning=panning, bands=bands, sharp_end=sharp_end)
+                     panning=panning, bands=bands, sharp_end=sharp_end,
+                     measured=True)
 
 
 def _background_score(data: np.ndarray, inner) -> float:
@@ -492,7 +503,10 @@ def label_for(rating_verdict: str) -> str:
 def rate(image: Image.Image, settings=None, box=None) -> Sharpness:
     """Measure a crop and label it against the configured thresholds."""
     result = measure(image, box)
-    if not result and result.score <= 0:
+    # Only when nothing could be measured. A measured zero is an answer --
+    # the most blurred the scale goes -- and bailing out on it left the
+    # frame with no verdict rather than the one star it had earned.
+    if not result.measured:
         return result
     sharp_at = getattr(settings, "sharp_at", SHARP_AT) if settings else SHARP_AT
     blurred_below = (getattr(settings, "blurred_below", BLURRED_BELOW)

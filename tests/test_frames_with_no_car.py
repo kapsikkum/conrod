@@ -66,14 +66,34 @@ class TheWholeFrameIsMeasured(unittest.TestCase):
     def test_a_frame_with_no_texture_anywhere_is_left_unrated(self) -> None:
         """The limit of measuring a whole frame, written down.
 
-        Blurring something flattens it, so past a point every tile falls
-        under the contrast floor and the measure cannot tell a frame blurred
-        to mush from a legitimately empty one -- a sky, a wall, a smear. It
-        says nothing rather than guessing, which is the same answer it gives
-        for a crop it cannot read.
+        With nothing in the picture at all -- a frame of sky, a lens cap,
+        an unexposed sheet -- every tile falls under the contrast floor,
+        no tile survives, and there is nothing to take a percentile of. It
+        says nothing rather than guessing.
+
+        Deliberately a flat field rather than a heavily blurred photograph.
+        Blur was the fixture here and it does not reach this case: blurring
+        the texture below flattens it but leaves tiles above the floor, so
+        the measure still has an answer -- see the test below, which is
+        about what that answer should be.
+        """
+        flat = Image.fromarray(
+            np.full((400, 600), 128, dtype=np.uint8), mode="L").convert("RGB")
+        row = self._rate(flat)
+        self.assertIsNone(row["rating"])
+
+    def test_a_frame_blurred_past_the_bottom_of_the_scale_is_still_rated(self) -> None:
+        """Zero is an answer, and it used to be thrown away.
+
+        The scale bottoms out: a frame blurred past its low end normalises
+        to exactly 0.0, and that was read as "could not be judged" -- so the
+        worst frames of a shoot came back with no rating, no verdict and no
+        colour, and sorted alongside the ones nobody had looked at yet. On a
+        real album that was 541 detections, 8% of everything the cull kept.
         """
         row = self._rate(_photo(blur=5))
-        self.assertIsNone(row["rating"])
+        self.assertIsNotNone(row["rating"])
+        self.assertEqual(row["rating_verdict"], "poor")
 
     def test_an_unreadable_frame_is_not_an_error(self) -> None:
         """A bad preview is a frame with no score, not a scan that stops."""
