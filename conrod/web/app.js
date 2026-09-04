@@ -1362,8 +1362,8 @@ function formatSeconds(seconds) {
 // Every action on the Review bar needs an album to act on. With none they
 // stayed live over an empty grid reading "No albums yet", so the only thing
 // they could do was fail.
-const ALBUM_ACTIONS = ["#btn-group", "#btn-keepers", "#btn-rescan",
-                       "#btn-dry", "#btn-write"];
+const ALBUM_ACTIONS = ["#btn-group", "#btn-rescore", "#btn-keepers",
+                       "#btn-rescan", "#btn-dry", "#btn-write"];
 
 function enableAlbumActions(on) {
   for (const id of ALBUM_ACTIONS) {
@@ -2606,6 +2606,32 @@ $("#btn-group").onclick = async () => {
     toast(out.looked
       ? `${out.vehicles} vehicles in ${out.groups} piles (looked at ${out.looked} new crops)`
       : `${out.vehicles} vehicles in ${out.groups} piles`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+};
+
+// Measure the album again from the crops it already has. Minutes, against
+// the hours re-scanning the photographs would cost, and the only way to
+// pick up a change to the measure itself without starting over.
+$("#btn-rescore").onclick = async () => {
+  if (!confirm("Measure every crop in this album again?\n\nNo photographs "
+               + "are read and the stars you gave by hand are not touched. "
+               + "The keeper of each pass is worked out again afterwards."))
+    return;
+  const button = $("#btn-rescore");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Measuring…";
+  try {
+    const out = await api(`/api/jobs/${state.jobId}/rescore`, { method: "POST" });
+    toast(`${out.rescored.toLocaleString()} crops measured again — `
+          + `${out.picks.toLocaleString()} keepers across `
+          + `${out.passes.toLocaleString()} passes`);
+    refreshReview();
   } catch (err) {
     toast(err.message);
   } finally {

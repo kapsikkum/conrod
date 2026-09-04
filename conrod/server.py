@@ -1920,6 +1920,32 @@ def regroup(job_id: int) -> dict:
     return group_cars(job_id)
 
 
+@app.post("/api/jobs/{job_id}/rescore")
+def rescore_album(job_id: int) -> dict:
+    """Measure every stored crop again.
+
+    pipeline.rescore has existed since the focus scale was re-derived and
+    nothing could reach it: no endpoint, no button, no menu. So an album
+    scored against an older scale, or one scored before a fault in the
+    measure was fixed, could only be corrected by scanning it again from
+    the photographs -- hours, to redo a job that takes minutes from the
+    crops already on disk.
+
+    Found the hard way: a fix to the measure left 541 detections of a real
+    album with no rating, and there was no way to ask the app to look at
+    them again.
+    """
+    from . import pipeline
+
+    if _run.get("active"):
+        raise HTTPException(409, "A scan is running. Stop it first.")
+    done = pipeline.rescore(job_id, _state["settings"])
+    # The stars have moved, so which frame is the keeper of its pass may
+    # have moved with them.
+    picked = pipeline.pick_of_pass(job_id, _state["settings"])
+    return {"rescored": done, **picked}
+
+
 @app.post("/api/jobs/{job_id}/pick")
 def pick_of_pass(job_id: int) -> dict:
     """Mark the one frame of each pass worth keeping.
