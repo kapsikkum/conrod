@@ -1,74 +1,81 @@
-"""Vehicle understanding with a local vision-language model via Ollama.
+"""Vehicle understanding with a vision-language model.
 
-This is the part that replaces ConrodAI's metered cloud call. Ollama ships
-its own CUDA runtime, so this uses the discrete GPU even when the installed
-PyTorch is a CPU build.
+Local Ollama is the default -- it needs nothing else installed, sends
+nothing off the machine, and ships its own CUDA runtime, so it uses the
+discrete GPU even when the installed PyTorch is a CPU build. OpenAI,
+Anthropic and Gemini are also available for whoever would rather send crops
+to a cloud model; settings.vlm_provider picks which, and the request/response
+shape for each one lives in vlm_providers.py. Everything below -- the
+prompts, the schema, what a reply maps onto -- is the same regardless.
 
-It answers the semantic questions — what car is this, what colour, whose team,
-what does the livery say. It is deliberately *not* asked to read the plate:
-measured on a 6960x4640 frame, the model returns null for the plate at every
-input resolution, because the plate is only a few dozen pixels wide once the
-crop is scaled to fit. Plates go through plates.py instead.
+The model answers the semantic questions — what car is this, what colour,
+whose team, what does the livery say. It is deliberately *not* asked to read
+the plate: measured on a 6960x4640 frame, Ollama returns null for the plate
+at every input resolution, because the plate is only a few dozen pixels wide
+once the crop is scaled to fit. Plates go through plates.py instead.
 """
 
 from __future__ import annotations
 
 import base64
 import io
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 from PIL import Image
 
-from . import marques
+from . import marques, vlm_providers
 from .config import Settings
 
-CAR_PROMPT = """This is a photograph of a single vehicle, taken by a motorsport
-and car photographer.
+CAR_PROMPT = """Context: You are analyzing a professional automotive and motorsport photograph of a single vehicle. 
 
-Describe only what you can actually see:
-
-- make: the manufacturer, e.g. Ford, Nissan, Holden, Subaru, BMW.
-- model: model and variant if badged, e.g. "Focus RS", "WRX STI", "Mini Cooper S".
-- colour: everyday colour name, e.g. blue, silver, black, white.
-- body_type: hatchback, sedan, wagon, ute, coupe, convertible, SUV, van, truck.
-- race_number: the competition number on the door, bonnet or roundel, if this is
-  a competition car. Digits only. This is NOT the registration plate.
-- team: the race team or entrant name, if shown on the vehicle.
-- sponsors: brand names on the livery, as a list.
-- livery_text: any other readable words or slogans on the vehicle, as a list.
-- is_competition: true if this is set up for racing or track work (numbers,
-  roundels, tow hooks, racing livery, competition tyres), false for a road car.
+Task: Extract data fields strictly from the vehicle into the JSON template below. Do not infer, guess, or extrapolate details that are not visibly present in the image.
 
 Rules:
-- Report only what is legible. Use null for anything you cannot actually read.
-- Never guess a registration plate; ignore it entirely.
-- Do not report text from trackside signage, banners, barriers or the
-  background. Only text physically on the vehicle.
-- confidence is your overall certainty from 0.0 to 1.0."""
+1. Report only what is clearly legible. If a field cannot be seen, read, or identified with certainty, use a literal JSON null value.
+2. Look closely at the windows, fenders, and roof edges for small driver, team, or entrant names, which are frequently positioned directly next to a national flag decal.
+3. Never guess or extract a registration/license plate; ignore it entirely.
+4. Do not report text from trackside signage, banners, barriers, spectators, or the background. Only extract text physically on the vehicle.
+5. Output strictly raw JSON matching the template exactly. Do not include markdown formatting, backticks, or conversational text.
 
-BIKE_PROMPT = """This is a photograph of a single motorcycle, taken by a
-motorsport photographer.
+Return only this JSON structure:
+{
+  "make": "The manufacturer name string",
+  "model": "The model and variant string if badged or clearly identifiable",
+  "colour": "The base exterior colour as an everyday colour word, e.g. blue, silver, black, white -- not a manufacturer paint name",
+  "body_type": "One of: hatchback, sedan, wagon, ute, coupe, convertible, SUV, van, truck",
+  "race_number": "Digits only from the competition number on the door, bonnet, or roundel. Do not include letters.",
+  "team": "The race team, entrant, or driver name string if physically shown on the vehicle (often found next to flag decals)",
+  "sponsors": ["Array of corporate sponsor brand names visible on the livery"],
+  "livery_text": ["Array of any other readable words, URLs, or slogans on the vehicle"],
+  "is_competition": true/false,
+  "confidence": "Your overall certainty score for the extraction as a float from 0.0 to 1.0"
+}"""
 
-Describe only what you can actually see:
+BIKE_PROMPT = """Context: You are analyzing a professional motorsport photograph of a single motorcycle and its rider.
 
-- make: the manufacturer, e.g. Yamaha, Honda, Ducati, Kawasaki, Suzuki.
-- model: the model if badged, e.g. "YZF-R1", "Panigale V4".
-- colour: the dominant colour of the bodywork or fairing.
-- body_type: always "motorcycle".
-- race_number: the competition number on the fairing, number board or the
-  rider's leathers. Digits only.
-- team: the race team or entrant name, if shown.
-- sponsors: brand names on the fairing or leathers, as a list.
-- livery_text: any other readable words on the bike or rider, as a list.
-- is_competition: true if this is a race or track bike.
+Task: Extract data fields strictly from the motorcycle and the rider into the JSON template below. Do not infer, guess, or extrapolate details that are not visibly present in the image.
 
 Rules:
-- Report only what is legible. Use null for anything you cannot actually read.
-- Do not report text from trackside signage or the background.
-- confidence is your overall certainty from 0.0 to 1.0."""
+1. Report only what is clearly legible. If a field cannot be seen, read, or identified with certainty, use a literal JSON null value.
+2. Look at both the motorcycle fairings/bodywork AND the rider's racing leathers (including the back, chest, sleeves, and aero hump) to find race numbers, teams, and sponsors.
+3. Do not report text from trackside signage, banners, barriers, spectators, or the background. Only extract text physically on the motorcycle or rider.
+4. Output strictly raw JSON matching the template exactly. Do not include markdown formatting, backticks, or conversational text.
+
+Return only this JSON structure:
+{
+  "make": "The manufacturer name string",
+  "model": "The model name string if badged or clearly identifiable",
+  "colour": "The dominant color string of the motorcycle bodywork or fairing",
+  "body_type": "motorcycle",
+  "race_number": "Digits only from the competition number on the front fairing, tail, side boards, or rider's leathers. Do not include letters.",
+  "team": "The race team, entrant, or rider name string if physically shown on the bike or leathers",
+  "sponsors": ["Array of corporate sponsor brand names visible on the bike fairings or rider's leathers"],
+  "livery_text": ["Array of any other readable words, URLs, or slogans on the bike or rider"],
+  "is_competition": true/false,
+  "confidence": "Your overall certainty score for the extraction as a float from 0.0 to 1.0"
+}"""
 
 SCHEMA = {
     "type": "object",
@@ -117,12 +124,35 @@ class VehicleDescription:
         return " ".join(p for p in parts if p)
 
 
+def _brief(exc: Exception) -> str:
+    """One line naming the cause, with the provider's own wording where it
+    gave one -- an httpx error stringifies to a URL and a link to MDN,
+    which says nothing about which of the possible faults this was."""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        detail = ""
+        try:
+            detail = (response.json().get("error", {}) or {}).get("type", "")
+        except Exception:
+            pass
+        return f"HTTP {response.status_code} {detail}".strip()
+    return f"{type(exc).__name__}: {exc}"
+
+
 class VLMUnavailable(RuntimeError):
     pass
 
 
 def check_available(settings: Settings) -> None:
     """Fail early and clearly rather than once per crop, mid-run."""
+    provider = (settings.vlm_provider or "ollama").lower()
+    check = _AVAILABILITY_CHECKS.get(provider)
+    if check is None:
+        raise VLMUnavailable(f"Unknown vision provider '{provider}'.")
+    check(settings)
+
+
+def _check_ollama(settings: Settings) -> None:
     try:
         resp = httpx.get(f"{settings.vlm_host}/api/tags", timeout=5.0)
         resp.raise_for_status()
@@ -139,6 +169,103 @@ def check_available(settings: Settings) -> None:
         )
 
 
+# What each kind of Anthropic credential looks like. Used to catch the
+# setting and the key disagreeing -- which otherwise arrives as a bare 401
+# from somebody else's server, saying nothing about the actual problem.
+_CLAUDE_CODE_PREFIXES = ("sk-ant-oat01-", "sk-ant-ort01-")
+_API_KEY_PREFIXES = ("sk-ant-api",)
+
+
+def _check_key(settings: Settings, name: str) -> None:
+    """Every cloud provider needs at least this much before a real call is
+    worth trying -- and a missing key otherwise surfaces as an opaque 401
+    on the first crop of the scan rather than up front."""
+    if not (settings.vlm_api_key or "").strip():
+        raise VLMUnavailable(f"No {name} API key set. Add one in Settings.")
+
+
+def _check_anthropic_kind(settings: Settings) -> None:
+    """The key and the "key type" setting must agree, because they decide
+    which header it is sent on. Sent on the wrong one, a perfectly good
+    credential comes back 401 and looks like a bad key."""
+    key = (settings.vlm_api_key or "").strip()
+    # Only a choice someone actually made can disagree with the key; an
+    # unset one is inferred from the key itself and never will.
+    kind = (getattr(settings, "anthropic_key_kind", None) or "").strip().lower()
+    if kind == "api-key" and key.startswith(_CLAUDE_CODE_PREFIXES):
+        raise VLMUnavailable(
+            "That looks like a Claude Code token, but the key type is set to "
+            "\"api-key\". Set it to \"claude-code\", or paste an API key "
+            "from console.anthropic.com instead.")
+    if kind == "claude-code" and key.startswith(_API_KEY_PREFIXES):
+        raise VLMUnavailable(
+            "That looks like a console API key, but the key type is set to "
+            "\"claude-code\". Set it to \"api-key\".")
+
+
+def _rejected(name: str, exc: Exception, where: str,
+             model: str | None = None) -> VLMUnavailable:
+    """Say which kind of failure it was. A refused key, an unknown model and
+    an unreachable host all arrive as an exception from httpx, and reporting
+    the raw one leaves someone reading a stack of URLs to work out that the
+    answer is "that is the wrong sort of credential"."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        return VLMUnavailable(
+            f"{name} rejected the key. Check it is a current API key from "
+            f"{where}, and that the account it belongs to has credit.")
+    if status == 404 and model:
+        return VLMUnavailable(
+            f"{name} has no model called '{model}'. Check the Model field "
+            "in Settings.")
+    return VLMUnavailable(f"Cannot reach {name}: {exc}")
+
+
+def _check_openai(settings: Settings) -> None:
+    _check_key(settings, "OpenAI")
+    try:
+        resp = httpx.get("https://api.openai.com/v1/models",
+                         headers={"Authorization": f"Bearer {settings.vlm_api_key}"},
+                         timeout=10.0)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise _rejected("OpenAI", exc, "platform.openai.com",
+                        settings.vlm_model) from exc
+
+
+def _check_anthropic(settings: Settings) -> None:
+    _check_key(settings, "Anthropic")
+    _check_anthropic_kind(settings)
+    try:
+        resp = httpx.get("https://api.anthropic.com/v1/models",
+                         headers={"anthropic-version": vlm_providers.ANTHROPIC_VERSION,
+                                  **vlm_providers.anthropic_auth(settings)},
+                         timeout=10.0)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise _rejected("Anthropic", exc, "console.anthropic.com",
+                        settings.vlm_model) from exc
+
+
+def _check_gemini(settings: Settings) -> None:
+    _check_key(settings, "Gemini")
+    try:
+        resp = httpx.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": settings.vlm_api_key}, timeout=10.0)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise _rejected("Gemini", exc, "aistudio.google.com",
+                        settings.vlm_model) from exc
+
+
+_AVAILABILITY_CHECKS = {
+    "ollama": _check_ollama,
+    "openai": _check_openai,
+    "anthropic": _check_anthropic,
+    "gemini": _check_gemini,
+}
+
+
 def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = False,
              client: httpx.Client | None = None) -> VehicleDescription:
     """Ask the model what this vehicle is."""
@@ -146,38 +273,23 @@ def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = F
         image = Image.open(image)
 
     payload_image = _encode(image, settings.vlm_input_edge)
-    payload = {
-        "model": settings.vlm_model,
-        "prompt": BIKE_PROMPT if is_bike else CAR_PROMPT,
-        "images": [payload_image],
-        "stream": False,
-        "format": SCHEMA,
-        "options": {"temperature": 0.0, "num_predict": 500},
-    }
+    prompt = BIKE_PROMPT if is_bike else CAR_PROMPT
 
     owns_client = client is None
     client = client or httpx.Client(timeout=settings.vlm_timeout)
     try:
-        resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
-                           timeout=settings.vlm_timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        body = data.get("response") or ""
-        if not body.strip():
-            # Reasoning models (qwen3-vl, for one) put the answer in
-            # "thinking" and leave "response" empty even with think disabled.
-            # Without this the app reads nothing back from them at all.
-            body = data.get("thinking") or ""
-    except Exception:
+        parsed = vlm_providers.call(settings, prompt=prompt, images=[payload_image],
+                                    schema=SCHEMA, num_predict=500, client=client)
+    except Exception as exc:
+        # An empty description and a rate-limited one look identical on the
+        # card -- a vehicle nobody could name. Saying which is the
+        # difference between "the model could not read this car" and "the
+        # whole scan is being throttled and none of it will be read".
+        vlm_providers._note(f"describe failed: {_brief(exc)}")
         return VehicleDescription()
     finally:
         if owns_client:
             client.close()
-
-    try:
-        parsed = json.loads(body)
-    except json.JSONDecodeError:
-        return VehicleDescription()
 
     make = _text(parsed.get("make"))
     model = _text(parsed.get("model"))
@@ -241,25 +353,15 @@ def identify_burst(images: "list[Image.Image | Path]", settings: Settings, *,
     if not encoded:
         return VehicleDescription()
 
-    payload = {
-        "model": settings.vlm_model,
-        "prompt": BURST_PROMPT.format(count=len(encoded)),
-        "images": encoded,
-        "stream": False,
-        "format": SCHEMA,
-        "options": {"temperature": 0.0, "num_predict": 400},
-    }
+    prompt = BURST_PROMPT.format(count=len(encoded))
 
     owns_client = client is None
     client = client or httpx.Client(timeout=settings.vlm_timeout)
     try:
-        resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
-                           timeout=settings.vlm_timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        body = (data.get("response") or "").strip() or (data.get("thinking") or "")
-        parsed = json.loads(body)
-    except Exception:
+        parsed = vlm_providers.call(settings, prompt=prompt, images=encoded,
+                                    schema=SCHEMA, num_predict=400, client=client)
+    except Exception as exc:
+        vlm_providers._note(f"burst read failed: {_brief(exc)}")
         return VehicleDescription()
     finally:
         if owns_client:

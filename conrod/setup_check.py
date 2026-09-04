@@ -86,10 +86,31 @@ def inspect(settings: Settings) -> Environment:
         f"{settings.plate_model} — 7.5 MB, downloads on first use",
         required=False))
 
-    # --- Ollama and the vision model: optional but this is the good part ---
+    # --- The vision model: optional, but this is the good part ---
     if not settings.use_vlm:
         env.checks.append(Check("vlm", "Vision model", True,
                                 "disabled in settings", required=False))
+        return env
+
+    # Only Ollama has anything to install. Offering to pull "claude-sonnet-5"
+    # as a 6 GB download -- which is what this did once a provider could be
+    # something other than Ollama -- is nonsense: there is nothing local to
+    # fetch, the question is whether the key works.
+    provider = (getattr(settings, "vlm_provider", "ollama") or "ollama").lower()
+    if provider != "ollama":
+        from .vlm_providers import DISPLAY_NAMES
+
+        name = DISPLAY_NAMES.get(provider, provider)
+        if not getattr(settings, "vlm_api_key", ""):
+            env.checks.append(Check(
+                "vlm", "Vision model", False,
+                f"{settings.vlm_model} via {name} — no API key set. "
+                "Add one in Settings.",
+                required=False))
+        else:
+            env.checks.append(Check(
+                "vlm", "Vision model", True,
+                f"{settings.vlm_model} via {name}", required=False))
         return env
 
     reachable, models = _ollama_status(settings)
