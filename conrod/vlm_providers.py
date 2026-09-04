@@ -54,6 +54,70 @@ RETRY_STATUSES = {408, 429, 500, 502, 503, 504, 529}
 # there for things that might actually be broken.
 RATE_LIMIT_STATUSES = {429, 529}
 
+# ── configuration that cannot work ───────────────────────────────
+# These mean the request is wrong, not that the moment is: a model name the
+# provider does not have, a credential that cannot call this endpoint, a
+# request it will not accept. Retrying changes nothing and neither does the
+# next crop.
+#
+# This exists because of a real run. An identify pass was pointed at
+# Anthropic with a Claude Code OAuth token, which can list models but cannot
+# call /v1/messages. The startup check asked for the list, got it, and let
+# the run start; every one of the three thousand crops then came back 404,
+# each was recorded as "this vehicle could not be read", and the job
+# finished and reported success. The album came back with 3% of its vehicles
+# named and nothing anywhere saying why.
+FATAL_STATUSES = {400, 401, 403, 404, 405, 422}
+
+# How many in a row before the run stops. Not one: a single 400 can be one
+# crop the provider refused on its own merits, and losing a whole scan to
+# that would leave a bigger hole than the frame does. Five in a row with no
+# success between them is not about the frames.
+GIVE_UP_AFTER = 5
+
+
+class Misconfigured(BaseException):
+    """Every call is failing the same way and the configuration is why.
+
+    Off the Exception branch for the same reason Stopped is: the reader
+    wraps each step in `except Exception` so one failure cannot blank a
+    whole detection, which would quietly turn "nothing in this album can
+    ever be identified" into three thousand individually unremarkable
+    empty descriptions.
+    """
+
+
+_fatal_run = 0          # consecutive unusable answers; any success clears it
+_fatal_said = ""        # what the provider said about the last of them
+_fatal_lock = threading.Lock()
+
+
+def note_fatal(said: str) -> int:
+    """Count one answer that means the configuration is wrong."""
+    global _fatal_run, _fatal_said
+    with _fatal_lock:
+        _fatal_run += 1
+        _fatal_said = said
+        return _fatal_run
+
+
+def clear_fatal() -> None:
+    """A call worked, so whatever came before it was not the configuration."""
+    global _fatal_run, _fatal_said
+    if _fatal_run:
+        with _fatal_lock:
+            _fatal_run, _fatal_said = 0, ""
+
+
+def given_up() -> str:
+    """The reason the run should stop, or "" while it should carry on.
+
+    Read by the loop handing out crops. The workers are the ones that
+    discover this, and they cannot stop the loop that is feeding them.
+    """
+    with _fatal_lock:
+        return _fatal_said if _fatal_run >= GIVE_UP_AFTER else ""
+
 # The longest single backoff we invent for ourselves. A retry-after from the
 # provider is obeyed as given, however long it is: it is a fact about when
 # the limit lifts, not a guess, and capping it just means asking again too
@@ -221,7 +285,9 @@ def call(settings: Settings, *, prompt: str, images: list[str], schema: dict,
     fn = _PROVIDERS.get(provider)
     if fn is None:
         raise ValueError(f"unknown vision provider '{provider}'")
-    return fn(settings, prompt, images, schema, num_predict, client)
+    answer = fn(settings, prompt, images, schema, num_predict, client)
+    clear_fatal()
+    return answer
 
 
 def _ollama(settings: Settings, prompt: str, images: list[str], schema: dict,
@@ -234,6 +300,10 @@ def _ollama(settings: Settings, prompt: str, images: list[str], schema: dict,
         "format": schema,
         "options": {"temperature": 0.0, "num_predict": num_predict},
     }
+    # Deliberately not through _send: that gate is shared across every
+    # worker, and nothing meters a program talking to itself. Ollama blocks
+    # while it loads a model rather than refusing, so there is nothing here
+    # worth waiting out -- see OllamaIsLeftAlone in tests/test_rate_limits.
     resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
                        timeout=settings.vlm_timeout)
     resp.raise_for_status()

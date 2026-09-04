@@ -124,19 +124,73 @@ class VehicleDescription:
         return " ".join(p for p in parts if p)
 
 
+def provider_message(response) -> str:
+    """What the provider actually said, whichever envelope it said it in.
+
+    Every one of them reports the reason in a different place, and reading
+    only some of them is worse than reading none: one identify run logged
+    "describe failed: HTTP 404" three thousand times because the reason sat
+    in a field this did not look at. The three shapes:
+
+        OpenAI/Anthropic  {"error": {"type": ..., "message": ...}}
+        Gemini            {"error": {"status": ..., "message": ...}}
+        Ollama            {"error": "model 'x' not found"}
+    """
+    try:
+        body = response.json()
+    except Exception:
+        text = (getattr(response, "text", "") or "").strip()
+        return text[:200]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, str):
+        return error[:200]
+    if isinstance(error, dict):
+        said = error.get("message") or error.get("type") or error.get("status")
+        if said:
+            return str(said)[:200]
+    return ""
+
+
 def _brief(exc: Exception) -> str:
-    """One line naming the cause, with the provider's own wording where it
-    gave one -- an httpx error stringifies to a URL and a link to MDN,
-    which says nothing about which of the possible faults this was."""
+    """One line naming the cause, in the provider's own words.
+
+    An httpx error stringifies to a URL and a link to MDN, which says
+    nothing about which of the possible faults this was -- and a bare status
+    code is barely better. A 404 from Anthropic means one of "no such
+    model", "that credential cannot call this endpoint" and "the URL is
+    wrong", and only the body distinguishes them.
+    """
     response = getattr(exc, "response", None)
     if response is not None:
-        detail = ""
-        try:
-            detail = (response.json().get("error", {}) or {}).get("type", "")
-        except Exception:
-            pass
-        return f"HTTP {response.status_code} {detail}".strip()
+        said = provider_message(response)
+        return f"HTTP {response.status_code} {said}".strip()
     return f"{type(exc).__name__}: {exc}"
+
+
+def _failed(what: str, settings: Settings, exc: Exception) -> None:
+    """Record one failed call, and stop the run if they are all failing.
+
+    The line says which provider and which model, because "describe failed:
+    HTTP 404" read the same whichever of the four was configured and
+    whatever was wrong with it.
+    """
+    who = vlm_providers.DISPLAY_NAMES.get(
+        (settings.vlm_provider or "ollama").lower(), settings.vlm_provider)
+    said = _brief(exc)
+    vlm_providers._note(f"{who} ({settings.vlm_model}) {what} failed: {said}")
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status not in vlm_providers.FATAL_STATUSES:
+        vlm_providers.clear_fatal()
+        return
+    run = vlm_providers.note_fatal(said)
+    if run < vlm_providers.GIVE_UP_AFTER:
+        return
+    raise vlm_providers.Misconfigured(
+        f"{who} refused the last {run} vehicles the same way, so it will "
+        f"refuse the rest: {said}. Nothing was identified. Check the model "
+        f"name and API key in Settings, then run Identify again."
+    )
 
 
 class VLMUnavailable(RuntimeError):
@@ -209,53 +263,84 @@ def _rejected(name: str, exc: Exception, where: str,
     an unreachable host all arrive as an exception from httpx, and reporting
     the raw one leaves someone reading a stack of URLs to work out that the
     answer is "that is the wrong sort of credential"."""
-    status = getattr(getattr(exc, "response", None), "status_code", None)
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    said = provider_message(response) if response is not None else ""
     if status in (401, 403):
         return VLMUnavailable(
-            f"{name} rejected the key. Check it is a current API key from "
-            f"{where}, and that the account it belongs to has credit.")
-    if status == 404 and model:
+            f"{name} rejected the key: {said or 'not authorised'}. Check it "
+            f"is a current API key from {where}, and that the account it "
+            f"belongs to has credit.")
+    if status == 404:
+        # Two different faults share this code, and the provider's own
+        # sentence is what separates them: a model name that does not exist,
+        # and a credential that exists but is not allowed to call this
+        # endpoint. Guessing "no such model" for both sent one photographer
+        # looking for a typo in a model name that was spelled correctly.
         return VLMUnavailable(
-            f"{name} has no model called '{model}'. Check the Model field "
-            "in Settings.")
-    return VLMUnavailable(f"Cannot reach {name}: {exc}")
+            f"{name} would not answer for model '{model}': {said or 'not found'}. "
+            f"Check the Model field in Settings, and that the key is one "
+            f"from {where} rather than another kind of token.")
+    # Everything else -- a 500, a timeout, a refused connection -- is the
+    # provider being unwell rather than the configuration being wrong, and
+    # is worth trying again rather than worth changing a setting over.
+    return VLMUnavailable(f"Cannot reach {name}: {said or exc}")
+
+
+def _trial_image() -> str:
+    """A postage stamp to send with the trial call.
+
+    The trial has to carry a picture, because half of what can be wrong is
+    wrong only for requests that have one -- a text-only model, an endpoint
+    that takes no image block, a provider that meters vision separately.
+    """
+    return _encode(Image.new("RGB", (32, 32), (128, 128, 128)), 32)
+
+
+def _trial_call(settings: Settings, name: str, where: str) -> None:
+    """Ask the provider the exact question the scan will, once.
+
+    The checks here used to fetch the provider's model list, which proves
+    only that the key can read a list. A Claude Code OAuth token can do
+    that and cannot call /v1/messages at all: the check passed, the run
+    started, and every crop came back 404. The one thing worth asking is
+    the thing the run depends on, so this sends a real request down the
+    real code path -- same endpoint, same auth header, same model name,
+    same schema dialect, same response envelope -- and reads it back.
+
+    Costs one call of a few dozen tokens at the start of a run, against
+    thousands in it.
+    """
+    try:
+        with httpx.Client(timeout=min(30.0, settings.vlm_timeout)) as client:
+            vlm_providers.call(settings, prompt="Reply with an empty JSON object.",
+                               images=[_trial_image()], schema=SCHEMA,
+                               num_predict=64, client=client)
+    except httpx.HTTPStatusError as exc:
+        raise _rejected(name, exc, where, settings.vlm_model) from exc
+    except httpx.RequestError as exc:
+        raise VLMUnavailable(f"Cannot reach {name}: {exc}") from exc
+    except Exception:
+        # It answered. Whatever it found to say about a blank grey tile is
+        # not evidence about the album, and refusing to start the run over
+        # it would be the check inventing its own failure.
+        return
 
 
 def _check_openai(settings: Settings) -> None:
     _check_key(settings, "OpenAI")
-    try:
-        resp = httpx.get("https://api.openai.com/v1/models",
-                         headers={"Authorization": f"Bearer {settings.vlm_api_key}"},
-                         timeout=10.0)
-        resp.raise_for_status()
-    except Exception as exc:
-        raise _rejected("OpenAI", exc, "platform.openai.com",
-                        settings.vlm_model) from exc
+    _trial_call(settings, "OpenAI", "platform.openai.com")
 
 
 def _check_anthropic(settings: Settings) -> None:
     _check_key(settings, "Anthropic")
     _check_anthropic_kind(settings)
-    try:
-        resp = httpx.get("https://api.anthropic.com/v1/models",
-                         headers={"anthropic-version": vlm_providers.ANTHROPIC_VERSION,
-                                  **vlm_providers.anthropic_auth(settings)},
-                         timeout=10.0)
-        resp.raise_for_status()
-    except Exception as exc:
-        raise _rejected("Anthropic", exc, "console.anthropic.com",
-                        settings.vlm_model) from exc
+    _trial_call(settings, "Anthropic", "console.anthropic.com")
 
 
 def _check_gemini(settings: Settings) -> None:
     _check_key(settings, "Gemini")
-    try:
-        resp = httpx.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         params={"key": settings.vlm_api_key}, timeout=10.0)
-        resp.raise_for_status()
-    except Exception as exc:
-        raise _rejected("Gemini", exc, "aistudio.google.com",
-                        settings.vlm_model) from exc
+    _trial_call(settings, "Gemini", "aistudio.google.com")
 
 
 _AVAILABILITY_CHECKS = {
@@ -285,7 +370,7 @@ def describe(image: Image.Image | Path, settings: Settings, *, is_bike: bool = F
         # card -- a vehicle nobody could name. Saying which is the
         # difference between "the model could not read this car" and "the
         # whole scan is being throttled and none of it will be read".
-        vlm_providers._note(f"describe failed: {_brief(exc)}")
+        _failed("describe", settings, exc)
         return VehicleDescription()
     finally:
         if owns_client:
@@ -361,7 +446,7 @@ def identify_burst(images: "list[Image.Image | Path]", settings: Settings, *,
         parsed = vlm_providers.call(settings, prompt=prompt, images=encoded,
                                     schema=SCHEMA, num_predict=400, client=client)
     except Exception as exc:
-        vlm_providers._note(f"burst read failed: {_brief(exc)}")
+        _failed("burst read", settings, exc)
         return VehicleDescription()
     finally:
         if owns_client:

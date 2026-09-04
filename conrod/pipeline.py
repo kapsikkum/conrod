@@ -188,6 +188,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             )
 
     if settings.use_vlm and analyse:
+        # Whatever the provider refused last time is not this run's problem.
+        vlm_providers.clear_fatal()
         vlm.check_available(settings)
 
     conn = store.connect()
@@ -265,6 +267,11 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             if should_stop and should_stop():
                 on_progress({"stage": "stopped", "done": index, "total": len(files),
                              "message": "stopped by request"})
+                break
+            halted = vlm_providers.given_up()
+            if halted:
+                on_progress({"stage": "stopped", "done": index, "total": len(files),
+                             "message": halted})
                 break
 
             processed = index
@@ -560,10 +567,26 @@ def learn_taste(settings: Settings, *, on_progress: Progress = _noop) -> dict | 
     """
     conn = store.connect()
     try:
+        # A star given in Lightroom is a star given by hand, and it counts
+        # exactly as much as one given here -- which is the whole reason
+        # ratings are read out of the files in the first place. Looking only
+        # at d.stars meant that after a reset, or on a shoot rated before
+        # Conrod ever saw it, the album came back with two thousand ratings
+        # in it and Learn from my ratings answered "0 rated frames so far".
+        #
+        # Only where the frame holds one vehicle. The file's rating is a
+        # judgement on the whole photograph; on a frame with three cars in
+        # it there is no way to tell which of them earned it, and handing
+        # the same star to all three teaches the model that a car it has
+        # never been asked about is worth five.
         rated = [dict(r) for r in conn.execute(
-            """SELECT stars, embedding FROM detections
-                WHERE stars IS NOT NULL AND embedding IS NOT NULL
-                  AND embedding != ''""")]
+            """SELECT COALESCE(d.stars, i.rating_in_file) AS stars, d.embedding
+                 FROM detections d JOIN images i ON i.id = d.image_id
+                WHERE d.embedding IS NOT NULL AND d.embedding != ''
+                  AND (d.stars IS NOT NULL
+                       OR (i.rating_in_file > 0 AND 1 =
+                           (SELECT COUNT(*) FROM detections d2
+                             WHERE d2.image_id = i.id)))""")]
         vectors, stars = [], []
         for row in rated:
             vector = similarity.unpack(row["embedding"])
@@ -680,13 +703,14 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
     vlm_providers.set_stop_check(should_stop or (lambda: False))
 
     if settings.use_vlm:
+        vlm_providers.clear_fatal()
         vlm.check_available(settings)
 
     conn = store.connect()
     try:
         store.set_job_status(conn, job_id, "scanning")
         pending = conn.execute(
-            """SELECT d.id, d.crop_path, d.cls, d.x1, d.y1, d.x2, d.y2,
+            """SELECT d.id, d.crop_path, d.cls, d.conf, d.x1, d.y1, d.x2, d.y2,
                       COALESCE(i.preview_path, i.path) AS frame
                  FROM detections d JOIN images i ON i.id = d.image_id
                 WHERE i.job_id = ? AND d.rejected = 0 AND d.crop_path IS NOT NULL
@@ -726,6 +750,11 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
                 on_progress({"stage": "stopped", "done": done, "total": total,
                              "message": "stopped by request"})
                 break
+            halted = vlm_providers.given_up()
+            if halted:
+                on_progress({"stage": "stopped", "done": done, "total": total,
+                             "message": halted})
+                break
             box = (row["x1"], row["y1"], row["x2"], row["y2"])
             # A bike is judged by the detector's class, which is what the
             # detect loop passed too -- the reader asks a different question
@@ -739,7 +768,7 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
             # job, however many hours it took. The size comes from the JPEG
             # header, not from decoding it.
             _announce_frame(row["frame"], row["id"], box, row["cls"],
-                            on_progress, done, total)
+                            row["conf"], on_progress, done, total)
             while True:
                 if should_stop and should_stop():
                     break
@@ -849,7 +878,8 @@ def _mmss(seconds: float) -> str:
 
 
 def _announce_frame(frame_path: str, det_id: int, box, cls: str | None,
-                    on_progress: Progress, done: int, total: int) -> None:
+                    conf: float | None, on_progress: Progress,
+                    done: int, total: int) -> None:
     """Put a frame the identify stage is about to read on the live view.
 
     The view is keyed by detection id and filled by the detect loop, which
@@ -872,8 +902,13 @@ def _announce_frame(frame_path: str, det_id: int, box, cls: str | None,
                  "frame": {"name": Path(frame_path).name,
                            "preview": str(frame_path),
                            "phase": "identifying",
+                           # The detector's own confidence, read back from
+                           # the row. Hardcoded 0.0 here once, which drew
+                           # every box during an identify pass labelled
+                           # "car . 0%" -- a number that looked like a
+                           # verdict on the car and was not one.
                            "boxes": [{"id": det_id, "kind": cls or "vehicle",
-                                      "conf": 0.0,
+                                      "conf": float(conf or 0.0),
                                       "x": x1 / width, "y": y1 / height,
                                       "w": (x2 - x1) / width,
                                       "h": (y2 - y1) / height}]}})
@@ -1169,6 +1204,16 @@ def _analysis_worker(work, settings: Settings, counters: dict,
                 # the crop back so a resume picks it up rather than counting
                 # it as analysed-and-empty, and leave the queue for the other
                 # workers to drain on their own way out.
+                break
+            except vlm_providers.Misconfigured as halt:
+                # The provider is refusing everything for the same reason.
+                # Leave this crop unanalysed rather than storing an empty
+                # answer over it -- an empty answer is indistinguishable
+                # afterwards from a vehicle nothing could be read off, and
+                # a resume would skip it. The loop handing out crops reads
+                # vlm_providers.given_up() and stops.
+                errors.append(str(halt))
+                on_progress({"stage": "warn", "message": str(halt)})
                 break
             except Exception as exc:
                 errors.append(f"analyse {crop_path}: {exc}")

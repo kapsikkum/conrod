@@ -1128,6 +1128,63 @@ def _has_detections(job_id: int | None) -> bool:
                 WHERE i.job_id = ? LIMIT 1""", (job_id,)).fetchone())
 
 
+@app.post("/api/reset/identifications")
+def reset_identifications(job_id: int | None = None) -> dict:
+    """Forget what the vision model said, and keep everything else.
+
+    The narrowest of the three resets, and the one that recovers a run
+    where the model itself was the problem -- a wrong model name, a
+    credential that could not call the endpoint, a provider down for the
+    afternoon. Identify only looks at detections that have never been
+    answered, so an album full of *empty* answers is finished as far as it
+    is concerned: running it again reads nothing and reports success. This
+    is what makes it readable again.
+
+    Deliberately not the same as resetting detections. That one deletes the
+    detections and their crops, which takes the ratings with them -- and
+    the ratings are the hand-given stars the learned rating is fitted to,
+    which cost an afternoon to give and cannot be recomputed. Kept here:
+    every crop, every star, sharpness, framing, plates, race numbers,
+    embeddings, and which frames were rejected. Dropped: the make, model,
+    colour, team, sponsors and livery text, and the groups built out of
+    them.
+
+    The photographs are untouched, as always.
+    """
+    if _run.get("active"):
+        raise HTTPException(
+            409, "A scan is running. Stop it first, then reset.")
+
+    where = "WHERE i.job_id = ?" if job_id is not None else ""
+    args = (job_id,) if job_id is not None else ()
+    with store.session() as conn:
+        if job_id is not None and not conn.execute(
+                "SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(404, "no such scan")
+        cleared = conn.execute(
+            f"""UPDATE detections
+                   SET attributes = NULL,
+                       group_key = NULL, group_size = NULL,
+                       group_agreement = NULL, group_colour_hex = NULL
+                 WHERE image_id IN (SELECT i.id FROM images i {where})""",
+            args).rowcount
+        # A number the vision model read goes with it; one the OCR or the
+        # roundel reader found does not. Those never involved the model and
+        # are usually the better reading anyway.
+        conn.execute(
+            f"""UPDATE detections SET number = NULL, number_source = NULL,
+                       number_conf = NULL
+                 WHERE number_source = 'vlm' AND image_id IN
+                       (SELECT i.id FROM images i {where})""", args)
+        # Back to "culled": the cars have been found and judged, and none of
+        # them has been named. Which is exactly what Identify expects.
+        conn.execute(
+            "UPDATE jobs SET status='culled'"
+            + (" WHERE id=?" if job_id is not None else ""), args)
+        conn.commit()
+    return {"ok": True, "identifications_cleared": cleared}
+
+
 @app.post("/api/reset/detections")
 def reset_detections(job_id: int | None = None) -> dict:
     """Throw away every detection and identification, keeping the albums.

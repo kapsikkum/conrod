@@ -526,6 +526,29 @@ $("#btn-learn").onclick = async () => {
   }
 };
 
+// Forget what the model said and nothing else. The case this is for: the
+// vision model was misconfigured or down, so every car came back unnamed.
+// Identify only looks at cars it has never answered for, which means an
+// album full of empty answers is finished as far as it is concerned.
+$("#btn-reset-identifications").onclick = async () => {
+  const note = $("#reset-note");
+  if (!confirm(
+      "Forget every make, model, colour and team Conrod read, so the album "
+      + "can be identified again?\n\nThe cars it found, your star ratings, "
+      + "the plates and the race numbers all stay.\n\nYour photographs are "
+      + "not touched.")) return;
+  try {
+    const out = await api("/api/reset/identifications", { method: "POST" });
+    note.textContent = "";
+    toast(`${out.identifications_cleared} identifications cleared. `
+          + "Run Identify Album again.");
+    loadHome();
+    show("home");
+  } catch (err) {
+    note.textContent = String(err.message || err);
+  }
+};
+
 // Throw away the found cars, keep the albums. The common case by far: a
 // setting changed, or the identification was wrong, and the answer is to run
 // it again rather than to re-read two thousand RAWs first.
@@ -1099,6 +1122,25 @@ function frameTile(frame, token) {
   return node;
 }
 
+// What to write on a box drawn over a frame in the live view.
+//
+// In the order the photographer would say it: the race number if one was
+// read, otherwise what the car turned out to be, otherwise only what the
+// detector saw. The identification was already arriving on every box and
+// was never shown -- so a whole identify pass drew "car · 0%" over every
+// vehicle it had just named, and the one frame where the vision model had
+// failed looked exactly like the ones where it had worked.
+function boxLabel(box) {
+  const pct = (value) => `${Math.round((value || 0) * 100)}%`;
+  if (box.number) return `#${box.number} · ${pct(box.read_conf)}`;
+  if (box.title) return box.title;
+  const kind = box.kind || "vehicle";
+  const named = kind.charAt(0).toUpperCase() + kind.slice(1);
+  // No confidence until there is one. A detector score of zero is what a
+  // missing number looks like, not a detection nobody believed in.
+  return box.conf ? `${named} · ${pct(box.conf)}` : named;
+}
+
 function updateTile(node, frame, active) {
   node.querySelector(".name").textContent = frame.name || "";
   node.querySelector(".phase").textContent =
@@ -1116,10 +1158,7 @@ function updateTile(node, frame, active) {
       mark.style.top = `${box.y * 100}%`;
       mark.style.width = `${box.w * 100}%`;
       mark.style.height = `${box.h * 100}%`;
-      const label = box.number
-        ? `#${box.number} · ${((box.read_conf || 0) * 100).toFixed(0)}%`
-        : `${box.kind} · ${((box.conf || 0) * 100).toFixed(0)}%`;
-      mark.append(el("div", { className: "box-label", textContent: label }));
+      mark.append(el("div", { className: "box-label", textContent: boxLabel(box) }));
       return mark;
     }));
   }
