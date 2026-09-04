@@ -252,12 +252,25 @@
       </div>
 
       <div class="danger-zone">
-        <h3>Start again</h3>
         <p>
-          Your photographs are not touched by either of these &mdash; nothing
+          Your photographs are not touched by anything here &mdash; nothing
           Conrod decides is ever written to a file until you press Write XMP.
           Your settings and entry list are kept.
         </p>
+        <h3>Cached previews</h3>
+        <p class="muted">
+          Conrod keeps the camera JPEG it pulls out of each RAW, about 1.2 MB
+          a frame, so the review screen can show a photograph that only exists
+          as a 30 MB CR3. On a big shoot that adds up, and none of it is your
+          photographs &mdash; every one of these can be pulled again.
+        </p>
+        <div id="cache-survey" class="cache-survey muted">Measuring…</div>
+        <div class="actions-row">
+          <button id="btn-cache-clear">Clear what I have ticked</button>
+          <span class="muted" id="cache-note"></span>
+        </div>
+
+        <h3>Start again</h3>
         <p>
           <strong>Identifications</strong> forgets only what the vision model
           said &mdash; makes, models, colours, teams and the groups built out

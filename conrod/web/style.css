@@ -1129,3 +1129,15 @@ dialog::backdrop { background: rgba(0,0,0,.78); }
 }
 .danger-zone .actions-row { margin: 0; }
 button.danger:hover { color: #ff7b7b; border-color: var(--bad); }
+
+/* Cached previews. A checkbox, its size, and what losing it costs -- the
+   size on the left so the column reads as a list of amounts, because that
+   is the question being asked. */
+.cache-survey { display: flex; flex-direction: column; gap: .4rem; margin: .6rem 0; }
+.cache-row { display: flex; align-items: baseline; gap: .6rem; cursor: pointer; }
+.cache-row input { margin: 0; flex: none; }
+.cache-size {
+  flex: none; min-width: 4.5rem; text-align: right;
+  font-variant-numeric: tabular-nums; font-weight: 600;
+}
+.cache-what { flex: 1; line-height: 1.35; }

@@ -76,7 +76,7 @@ function show(screen) {
     b.classList.toggle("active", b.dataset.screen === screen));
   if (screen === "home") loadHome();
   if (screen === "setup") { loadSetup(); checkUpdate(); }
-  if (screen === "settings") loadSettings();
+  if (screen === "settings") { loadSettings(); loadCacheSurvey(); }
   if (screen === "album") loadAlbum();
   if (screen === "review") refreshReview();
   // Coming to the Scan screen always means "I want to add a folder". The
@@ -528,6 +528,119 @@ $("#btn-learn").onclick = async () => {
   } finally {
     button.disabled = false;
     button.textContent = was;
+  }
+};
+
+/* ── cached previews ──────────────────────────────────────────
+   A single "clear the cache" button would hide the only thing worth
+   knowing: what each part costs to lose. A preview of a frame nobody has
+   reached costs the minute it takes to pull again; a preview of a frame
+   in the album being reviewed is the only way that RAW can be shown at
+   all. So each is offered separately, with its price written next to it,
+   and none is ticked to start with. */
+function gb(bytes) {
+  if (!bytes) return "0 MB";
+  return bytes >= 1024 ** 3
+    ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
+    : `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
+async function loadCacheSurvey() {
+  const box = $("#cache-survey");
+  if (!box) return;
+  let survey;
+  try {
+    survey = await api("/api/cache");
+  } catch (err) {
+    box.textContent = `Could not measure the cache: ${err.message || err}`;
+    return;
+  }
+  const jobs = await api("/api/jobs").catch(() => []);
+
+  const row = (what, jobId, size, label, cost) => {
+    const line = el("label", { className: "cache-row" });
+    const input = el("input", { type: "checkbox" });
+    input.dataset.what = what;
+    if (jobId != null) input.dataset.jobId = String(jobId);
+    line.append(input,
+      el("span", { className: "cache-size", textContent: size }),
+      el("span", { className: "cache-what" },
+        el("strong", { textContent: label }),
+        el("span", { className: "muted", textContent: ` — ${cost}` })));
+    return line;
+  };
+
+  const rows = [];
+  const loose = survey.orphaned.bytes + survey.orphaned_crops.bytes;
+  if (survey.orphaned.files + survey.orphaned_crops.files) {
+    rows.push(row("orphaned", null, gb(loose), "Belongs to no album",
+      "left over from folders scanned once and forgotten. Nothing wants these."));
+  }
+  if (survey.thumbs.files) {
+    rows.push(row("thumbnails", null, gb(survey.thumbs.bytes), "Thumbnails",
+      "remade the moment a screen needs one."));
+  }
+  if (survey.waiting.files) {
+    rows.push(row("waiting", null, gb(survey.waiting.bytes),
+      "Frames not yet looked at",
+      `${survey.waiting.files.toLocaleString()} previews already pulled for `
+      + "frames no scan has reached. Carrying on that album pulls them again."));
+  }
+  if (survey.log) {
+    rows.push(row("log", null, gb(survey.log), "Log file",
+      "what Conrod writes down when something goes wrong. Clear it once you "
+      + "have read it."));
+  }
+  // An album's own previews, offered one album at a time: the answer is a
+  // different one for the shoot being reviewed and the one finished last
+  // month, and a single button cannot ask.
+  for (const job of jobs) {
+    if (!job.image_count) continue;
+    rows.push(row("job", job.id, "album",
+      `Previews for ${job.label || job.root}`,
+      `${job.image_count.toLocaleString()} frames. The album, its vehicles `
+      + "and your stars are all kept; a RAW cannot be enlarged until its "
+      + "preview is pulled again."));
+  }
+
+  box.replaceChildren(
+    el("div", { className: "muted",
+                textContent: `${gb(survey.free)} free on this drive, and `
+                  + `${gb(survey.in_use.bytes)} of previews in use by albums `
+                  + `you have looked at.` }),
+    ...rows);
+}
+
+$("#btn-cache-clear").onclick = async () => {
+  const note = $("#cache-note");
+  const ticked = [...$("#cache-survey").querySelectorAll("input:checked")];
+  if (!ticked.length) { note.textContent = "Nothing ticked."; return; }
+
+  const body = { orphaned: false, thumbnails: false, waiting: false, log: false };
+  const albums = [];
+  for (const input of ticked) {
+    if (input.dataset.what === "job") albums.push(Number(input.dataset.jobId));
+    else body[input.dataset.what] = true;
+  }
+  if (!confirm("Clear the ticked caches?\n\nYour photographs, albums, "
+               + "vehicles and star ratings are all kept. Anything dropped "
+               + "here can be made again.")) return;
+
+  note.textContent = "Clearing…";
+  try {
+    let freed = 0;
+    const out = await api("/api/cache/clear",
+                          { method: "POST", body: JSON.stringify(body) });
+    freed += out.freed;
+    for (const id of albums) {
+      const one = await api("/api/cache/clear", { method: "POST",
+        body: JSON.stringify({ job_id: id }) });
+      freed += one.freed;
+    }
+    note.textContent = `Freed ${gb(freed)}.`;
+    loadCacheSurvey();
+  } catch (err) {
+    note.textContent = String(err.message || err);
   }
 };
 

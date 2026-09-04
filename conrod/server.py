@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -27,7 +28,8 @@ from . import pipeline, setup_check, store, vlm, watch
 from . import sharpness as sharpness_mod
 from .analyze import VehicleAnalysis
 from .config import (CACHE_DIR, DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES,
-                     Settings)
+                     LOG_PATH, Settings)
+from .exif import _mirror_name
 from .mapping import NumberMap
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -1128,6 +1130,198 @@ def _has_detections(job_id: int | None) -> bool:
         return bool(conn.execute(
             """SELECT 1 FROM detections d JOIN images i ON i.id = d.image_id
                 WHERE i.job_id = ? LIMIT 1""", (job_id,)).fetchone())
+
+
+@app.get("/api/cache")
+def cache_survey() -> dict:
+    """What the cache is holding, split by what dropping it would cost.
+
+    Previews are the bulk of it -- about 1.2 MB per RAW, kept so the review
+    screen can show a frame that only exists as a 30 MB CR3. They are not
+    all worth the same, though, and a single "clear the cache" button hides
+    the difference between throwing away a rebuild and throwing away the
+    only reason the next scan will be quick.
+    """
+    previews = CACHE_DIR / "previews"
+    referenced, wanted = _preview_paths()
+
+    buckets = {"in_use": [0, 0], "waiting": [0, 0], "orphaned": [0, 0]}
+    for path in previews.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        key = str(path)
+        where = ("in_use" if key in referenced
+                 else "waiting" if key in wanted else "orphaned")
+        buckets[where][0] += 1
+        buckets[where][1] += size
+
+    crops = _dir_size(CACHE_DIR / "crops", keep=_crop_paths())
+    thumbs = _dir_size(CACHE_DIR / "thumbs")
+    try:
+        free = shutil.disk_usage(CACHE_DIR).free
+    except OSError:
+        free = 0
+    try:
+        log_size = LOG_PATH.stat().st_size
+    except OSError:
+        log_size = 0
+
+    return {
+        "free": free,
+        "log": log_size,
+        # Previews for frames of an album that has been looked at. Dropping
+        # them means a RAW frame cannot be enlarged in review until it is
+        # extracted again.
+        "in_use": {"files": buckets["in_use"][0], "bytes": buckets["in_use"][1]},
+        # Previews already pulled for frames no scan has reached yet.
+        # Dropping them costs the extraction time when the album is carried
+        # on, and nothing else.
+        "waiting": {"files": buckets["waiting"][0], "bytes": buckets["waiting"][1]},
+        # Previews belonging to no album at all -- a folder that was scanned
+        # once and forgotten, an album that has been deleted. Free.
+        "orphaned": {"files": buckets["orphaned"][0], "bytes": buckets["orphaned"][1]},
+        "orphaned_crops": {"files": crops[0], "bytes": crops[1]},
+        "thumbs": {"files": thumbs[0], "bytes": thumbs[1]},
+    }
+
+
+class CacheClear(BaseModel):
+    # Every one of these is off by default. A cache button that guesses
+    # would eventually guess wrong about the album someone is working on.
+    orphaned: bool = False
+    thumbnails: bool = False
+    waiting: bool = False
+    log: bool = False
+    job_id: int | None = None       # previews of one finished album
+
+
+@app.post("/api/cache/clear")
+def cache_clear(body: CacheClear) -> dict:
+    """Drop the parts of the cache the photographer chose, and nothing else.
+
+    Never touches a photograph, and never touches a crop that an album
+    still refers to: crops carry the ratings, the plates and the
+    embeddings, and re-making one means detecting the frame again.
+    """
+    if _run.get("active"):
+        raise HTTPException(409, "A scan is running. Stop it first.")
+
+    referenced, wanted = _preview_paths()
+    freed = 0
+    removed = 0
+
+    def drop(path: Path) -> None:
+        nonlocal freed, removed
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            return
+        freed += size
+        removed += 1
+
+    if body.job_id is not None:
+        with store.session() as conn:
+            rows = conn.execute(
+                """SELECT preview_path FROM images
+                    WHERE job_id=? AND preview_path IS NOT NULL""",
+                (body.job_id,)).fetchall()
+            for row in rows:
+                drop(Path(row["preview_path"]))
+            # The album keeps its frames, its vehicles and its ratings; it
+            # just cannot show a RAW until the preview is pulled again.
+            conn.execute("UPDATE images SET preview_path=NULL WHERE job_id=?",
+                         (body.job_id,))
+
+    if body.orphaned or body.waiting:
+        for path in (CACHE_DIR / "previews").rglob("*"):
+            if not path.is_file():
+                continue
+            key = str(path)
+            if key in referenced:
+                continue
+            if key in wanted:
+                if body.waiting:
+                    drop(path)
+            elif body.orphaned:
+                drop(path)
+
+    if body.orphaned:
+        keep = _crop_paths()
+        for path in (CACHE_DIR / "crops").rglob("*"):
+            if path.is_file() and str(path) not in keep:
+                drop(path)
+
+    if body.thumbnails:
+        for path in (CACHE_DIR / "thumbs").rglob("*"):
+            if path.is_file():
+                drop(path)
+
+    if body.log:
+        # The rolled-over copy is nobody's, so it goes. The live one is held
+        # open by this very process for the whole session -- a windowed build
+        # redirects its output there -- and Windows will not unlink a file
+        # somebody has open, so unlinking it failed silently and the 78 MB
+        # stayed exactly where it was. Emptying it works on an open file and
+        # is what was wanted anyway.
+        drop(LOG_PATH.with_suffix(".log.1"))
+        try:
+            was = LOG_PATH.stat().st_size
+            with open(LOG_PATH, "w", encoding="utf-8"):
+                pass
+            freed += was
+            removed += 1
+        except OSError:
+            pass
+
+    return {"ok": True, "removed": removed, "freed": freed}
+
+
+def _preview_paths() -> tuple[set[str], set[str]]:
+    """Previews an album is using, and previews waiting for one to reach them.
+
+    The second set has to be derived rather than read: a frame's
+    preview_path is only written once the frame has been through detection,
+    so previews pulled for frames a scan never got to are referenced by
+    nothing and look exactly like rubbish.
+    """
+    referenced: set[str] = set()
+    wanted: set[str] = set()
+    out = CACHE_DIR / "previews"
+    with store.session() as conn:
+        for row in conn.execute(
+                "SELECT path, preview_path FROM images"):
+            if row["preview_path"]:
+                referenced.add(row["preview_path"])
+            else:
+                source = Path(row["path"])
+                wanted.add(str(out / _mirror_name(source.parent)
+                               / f"{source.stem}.jpg"))
+    return referenced, wanted
+
+
+def _crop_paths() -> set[str]:
+    with store.session() as conn:
+        return {r["crop_path"] for r in conn.execute(
+            "SELECT crop_path FROM detections WHERE crop_path IS NOT NULL")}
+
+
+def _dir_size(where: Path, keep: set[str] | None = None) -> tuple[int, int]:
+    """How many files and how many bytes, ignoring any that are still used."""
+    files = total = 0
+    for path in where.rglob("*"):
+        if not path.is_file() or (keep and str(path) in keep):
+            continue
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+        files += 1
+    return files, total
 
 
 @app.post("/api/reset/identifications")

@@ -916,8 +916,8 @@ def _check_room(raws: list, on_progress: Progress) -> None:
         return
     raise NotEnoughRoom(
         f"This album needs about {_gb(needed)} of cached previews and there "
-        f"is {_gb(free)} free. Clear some space, or use Clear cached previews "
-        f"in Settings to drop the ones from albums you have finished with."
+        f"is {_gb(free)} free. Settings has a Cached previews section that "
+        f"says what is taking the room and what dropping each part costs."
     )
 
 
