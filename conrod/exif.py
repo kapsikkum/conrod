@@ -115,6 +115,7 @@ def extract_previews(
     on_progress: Callable[[int, int], None] | None = None,
     workers: int = 4,
     chunk: int = 24,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[Path, Path]:
     """Pull the embedded JPEG preview out of each RAW file.
 
@@ -124,6 +125,13 @@ def extract_previews(
     Detection never needs the full RAW: the embedded preview is a
     camera-rendered JPEG, typically near full resolution, and reading it
     avoids a demosaic that would cost seconds per frame.
+
+    ``should_stop`` is checked between batches. Without it this was the one
+    stretch of a scan that could not be interrupted: six thousand RAWs is
+    half an hour of extraction, Stop did nothing for the whole of it, and
+    an app that ignores its own buttons for half an hour is indistinguishable
+    from one that has hung. Whatever has been extracted by then is kept and
+    returned -- the files are on disk and a later run reuses them.
     """
     exe = executable or find_exiftool()
     result: dict[Path, Path] = {}
@@ -139,7 +147,11 @@ def extract_previews(
     total = len(files)
     done = 0
 
+    stopped = should_stop or (lambda: False)
+
     for src_dir, group in by_dir.items():
+        if stopped():
+            break
         dest = out_dir / _mirror_name(src_dir)
         dest.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +160,7 @@ def extract_previews(
         # small to read a plate or a sponsor decal from.
         for tag in ("JpgFromRaw", "PreviewImage", "OtherImage", "ThumbnailImage"):
             pending = [f for f in group if not (dest / f"{f.stem}.jpg").exists()]
-            if not pending:
+            if not pending or stopped():
                 break
             # In batches, across several exiftool processes. One call for the
             # whole shoot was both slower -- exiftool is single-threaded Perl,
@@ -163,6 +175,13 @@ def extract_previews(
                     done += chunk
                     if on_progress:
                         on_progress(min(done, total), total)
+                    if stopped():
+                        # Let the batches already running finish rather than
+                        # abandoning half-written JPEGs in the cache; just
+                        # queue no more work after them.
+                        for waiting in futures:
+                            waiting.cancel()
+                        break
 
         extracted = {}
         for f in group:

@@ -44,6 +44,31 @@ FOCUS_SCALE = 3
 # window opens can leave a trace. See _ensure_streams in main.py.
 LOG_PATH = DATA_ROOT / "conrod.log"
 
+# Nothing rotated this, and a scan that hits a rate limit logs a line per
+# crop. One real machine reached 81 MB, at which point the log had stopped
+# being the thing you read when something went wrong and become the thing
+# you grep. One roll-over is kept: the previous file is where a failure
+# from yesterday still lives.
+LOG_MAX_BYTES = 8 * 1024 * 1024
+
+
+def append_log(text: str) -> None:
+    """Add a line to the log, rolling it over once it gets large.
+
+    Never raises. Every caller is already handling a failure of its own and
+    none of them should turn a note about it into a second one.
+    """
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            previous = LOG_PATH.with_suffix(".log.1")
+            previous.unlink(missing_ok=True)
+            LOG_PATH.rename(previous)
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+    except Exception:
+        pass
+
 for _d in (MODEL_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 

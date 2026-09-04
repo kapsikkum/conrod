@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -220,7 +221,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         _record_origins(conn, job_id, files, on_progress, settings,
                         should_stop)
 
-        previews = _prepare_previews(files, on_progress, settings)
+        previews = _prepare_previews(files, on_progress, settings,
+                                     should_stop)
 
         if stop_after == "index":
             # The album exists, its frames are known and every one of them has
@@ -838,7 +840,9 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
 
 
 def _prepare_previews(files: Iterable[Path], on_progress: Progress,
-                      settings: Settings) -> dict[Path, Path]:
+                      settings: Settings,
+                      should_stop: Callable[[], bool] | None = None,
+                      ) -> dict[Path, Path]:
     """Extract the embedded JPEG from every RAW, reporting as it goes.
 
     This is the longest silent stretch of a big shoot -- thousands of
@@ -858,14 +862,67 @@ def _prepare_previews(files: Iterable[Path], on_progress: Progress,
                      "message": f"extracting previews {done}/{total}"
                                 + (f" · about {_mmss(left)} left" if done > 8 else "")})
 
+    # A full-resolution camera JPEG per RAW, and they stay in the cache. Six
+    # thousand frames is around twenty gigabytes, which is enough to fill a
+    # drive that looked comfortable when the scan started -- and a scan that
+    # runs out of room mid-way stops in whatever way the first failed write
+    # happens to take, with the frames it never reached left looking exactly
+    # like frames nobody has got to yet.
+    _check_room(raws, on_progress)
+
     on_progress({"stage": "preview", "done": 0, "total": len(raws),
                  "message": f"extracting previews from {len(raws)} RAW files"})
     previews = extract_previews(raws, CACHE_DIR / "previews",
                                 on_progress=report,
-                                workers=max(1, settings.preview_workers))
+                                workers=max(1, settings.preview_workers),
+                                should_stop=should_stop)
     on_progress({"stage": "preview", "done": len(previews), "total": len(raws),
                  "message": f"extracted {len(previews)}/{len(raws)} previews"})
     return previews
+
+
+# What one cached preview costs, measured over 16,108 of them from a real
+# shoot: 18.8 GB, so about 1.2 MB each. Crops add roughly a tenth of that.
+PREVIEW_BYTES = 1_250_000
+
+# Left over afterwards. Windows itself needs room to breathe, and a scan
+# that ends with a full drive takes the page file and everything else with
+# it -- so this refuses a little before the edge rather than at it.
+SPARE_BYTES = 3 * 1024 ** 3
+
+
+class NotEnoughRoom(RuntimeError):
+    """The cache would not fit, said before anything is written."""
+
+
+def _check_room(raws: list, on_progress: Progress) -> None:
+    """Refuse a scan that cannot fit, rather than dying part way through it.
+
+    Failing at the start is a sentence. Failing at frame 3,547 of 6,221 is
+    an album that says "Still scanning" forever, because the frames it never
+    reached are indistinguishable from frames it has not got to yet.
+    """
+    try:
+        free = shutil.disk_usage(CACHE_DIR.parent).free
+    except OSError:
+        return                      # not knowing is not a reason to refuse
+    needed = len(raws) * PREVIEW_BYTES
+    if free >= needed + SPARE_BYTES:
+        if free < needed + SPARE_BYTES * 3:
+            on_progress({"stage": "warn", "done": 0, "total": 0,
+                         "message": f"{_gb(free)} free and this album needs "
+                                    f"about {_gb(needed)} of previews. It "
+                                    f"should fit, but not by much."})
+        return
+    raise NotEnoughRoom(
+        f"This album needs about {_gb(needed)} of cached previews and there "
+        f"is {_gb(free)} free. Clear some space, or use Clear cached previews "
+        f"in Settings to drop the ones from albums you have finished with."
+    )
+
+
+def _gb(size: float) -> str:
+    return f"{size / 1024 ** 3:.1f} GB"
 
 
 def _mmss(seconds: float) -> str:

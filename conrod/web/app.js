@@ -360,7 +360,12 @@ const SETTING_GROUPS = [
     ["anthropic_key_kind", "Key type", "select", ["auto", "api-key", "claude-code"],
       "auto reads it off the key. api-key is a console.anthropic.com key (sent as x-api-key); claude-code is a Claude Code token (sent as a bearer token).",
       (s) => s.vlm_provider === "anthropic"],
-    ["vlm_input_edge", "Input size (px)", "number", null, ""],
+    ["vlm_input_edge", "Input size (px)", "number", null,
+     "How large a crop is sent. Ollama re-sizes it to its own grid, so on a "
+     + "local model anything from 512 to 1568 arrives identical — measured at "
+     + "1,094 tokens for all three, and only 2048 sends more. Raising this "
+     + "below 2048 costs nothing and gains nothing there. It does change what "
+     + "a cloud provider sees."],
     ["identify_team", "Read team and sponsors", "bool", null, ""],
   ]],
   ["Window", [
@@ -1231,11 +1236,37 @@ async function refreshReview() {
   // that ran to the end still says so with nothing left to do. Counting the
   // frames rather than trusting the status stopped this reading "Still
   // scanning — 0 frames to go" indefinitely.
-  if (left > 0) {
+  // Whether anything is actually running right now. Without asking, an
+  // album that stopped part way through read "Still scanning — 2,674 frames
+  // to go" for ever: the count was right and the tense was wrong, so the
+  // honest answer to "it stopped and said nothing" was sitting on the
+  // screen telling the photographer to keep waiting.
+  let running = false;
+  try {
+    running = Boolean((await api("/api/scan")).active);
+  } catch {
+    // Not knowing is not worth failing the screen over.
+  }
+
+  if (left > 0 && running) {
     note.hidden = false;
     note.textContent = `Still scanning — ${left.toLocaleString()} frame`
       + `${left === 1 ? "" : "s"} to go. Vehicles are grouped once the scan `
       + `finishes, so every frame is listed on its own until then.`;
+  } else if (left > 0) {
+    note.hidden = false;
+    note.replaceChildren(
+      el("span", { textContent:
+        `This album stopped with ${left.toLocaleString()} frame`
+        + `${left === 1 ? "" : "s"} never looked at`
+        + (job.failed_count
+            ? `, and ${job.failed_count.toLocaleString()} that could not be read`
+            : "")
+        + ". Carrying on picks up where it left off — the frames already "
+        + "done are not read again. " }),
+      el("button", { className: "step", textContent: "Carry on",
+                     onclick: () => runStage(job, state.lastStage || "cull") }),
+    );
   } else if (job.status === "scanning" && !job.grouped_count) {
     // Everything has been looked at, but grouping is the last step of a full
     // scan and this album has not had it. Say what to press rather than

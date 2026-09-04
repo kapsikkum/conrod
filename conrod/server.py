@@ -23,7 +23,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from . import keywords as keywords_mod
-from . import pipeline, setup_check, store, watch
+from . import pipeline, setup_check, store, vlm, watch
 from . import sharpness as sharpness_mod
 from .analyze import VehicleAnalysis
 from .config import (CACHE_DIR, DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES,
@@ -715,6 +715,14 @@ def start_scan(body: ScanRequest) -> dict:
             _run["message"] = (f"{summary.images} frames, "
                                f"{summary.detections} vehicles, "
                                f"{summary.identified} identified")
+        except (pipeline.NotEnoughRoom, vlm.VLMUnavailable) as exc:
+            # Written to be read by the photographer, not by whoever is
+            # debugging this. "NotEnoughRoom: This album needs about 7.8 GB"
+            # puts a class name in front of a sentence that was already a
+            # sentence, and there is no stack worth keeping for either.
+            _run["error"] = str(exc)
+            _run["stage"] = "error"
+            note(str(exc), "error")
         except Exception as exc:
             _run["error"] = f"{type(exc).__name__}: {exc}"
             _run["stage"] = "error"
@@ -722,18 +730,12 @@ def start_scan(body: ScanRequest) -> dict:
             # The one-line message is what the activity panel shows, but a
             # scan dying with "database is locked" and no traceback is close
             # to undebuggable. Keep the stack somewhere it can be read.
-            try:
-                import traceback
+            import traceback
 
-                from .config import LOG_PATH
+            from .config import append_log
 
-                LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-                with open(LOG_PATH, "a", encoding="utf-8") as fh:
-                    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                    fh.write(f"\n--- scan failed {stamp} ---\n")
-                    traceback.print_exc(file=fh)
-            except Exception:
-                pass
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            append_log(f"\n--- scan failed {stamp} ---\n" + traceback.format_exc())
         finally:
             _run["active"] = False
 

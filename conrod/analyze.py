@@ -33,19 +33,14 @@ def _log_step_failure(step: str, exc: Exception) -> None:
     tripped, and never wrote down why. Sixteen consecutive detections came
     back with nothing at all -- not just no plate, no make or colour either
     -- and there was no record anywhere of what had actually failed."""
-    try:
-        import time
-        import traceback
+    import time
+    import traceback
 
-        from .config import LOG_PATH
+    from .config import append_log
 
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as fh:
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            fh.write(f"\n--- {step} failed {stamp}: {exc} ---\n")
-            traceback.print_exc(file=fh)
-    except Exception:
-        pass
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    append_log(f"\n--- {step} failed {stamp}: {exc} ---\n"
+               + traceback.format_exc())
 
 
 @dataclass

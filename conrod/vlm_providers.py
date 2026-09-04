@@ -267,15 +267,9 @@ def _send(send, settings: Settings, what: str) -> httpx.Response:
 def _note(message: str) -> None:
     """Rate limits are slow, not silent -- a scan that has quietly stopped
     for four minutes should say which of the two it is."""
-    try:
-        from .config import LOG_PATH
+    from .config import append_log
 
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as fh:
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            fh.write(stamp + "  " + message + chr(10))
-    except Exception:
-        pass
+    append_log(time.strftime("%Y-%m-%d %H:%M:%S") + "  " + message)
 
 
 def call(settings: Settings, *, prompt: str, images: list[str], schema: dict,

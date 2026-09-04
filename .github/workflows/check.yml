@@ -33,7 +33,7 @@ jobs:
         run: node --check conrod/web/app.js
 
       - name: Offline unit tests
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -t . -v
 
       # Runs the readers for real — a YOLO inference, an OCR pass and a plate
       # detector load — so a broken dependency is caught on the commit that

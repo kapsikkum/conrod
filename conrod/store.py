@@ -243,9 +243,17 @@ def list_jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
                (SELECT COUNT(*) FROM detections d
                   JOIN images i2 ON i2.id = d.image_id
                  WHERE i2.job_id = j.id) AS detection_count,
+               -- Frames nobody has looked at yet. Deliberately not
+               -- "status != 'detected'", which counted the ones that were
+               -- looked at and failed as still to come: an album with fifty
+               -- unreadable frames then said "50 frames to go" for ever,
+               -- however many times it was run.
                (SELECT COUNT(*) FROM images i3
-                 WHERE i3.job_id = j.id AND i3.status != 'detected')
+                 WHERE i3.job_id = j.id AND i3.status = 'pending')
                  AS unfinished_count,
+               (SELECT COUNT(*) FROM images i5
+                 WHERE i5.job_id = j.id AND i5.status = 'error')
+                 AS failed_count,
                -- Whether grouping has ever run on this album. Grouping is
                -- the last step of a full scan, so an album that was culled
                -- and stopped has none, and the review screen needs to say
