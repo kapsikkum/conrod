@@ -643,6 +643,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
                   d.cls, d.plate, d.sharpness, i.id AS image_id, i.burst_key
              FROM detections d JOIN images i ON i.id = d.image_id
             WHERE i.job_id = ? AND d.rejected = 0
+              AND COALESCE(d.bystander, 0) = 0
             ORDER BY i.id, d.id""",
         (job_id,),
     ).fetchall()
