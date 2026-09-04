@@ -23,6 +23,41 @@ def _texture(width: int, height: int, seed: int = 7) -> Image.Image:
     return Image.fromarray(data, mode="L").convert("RGB")
 
 
+def _photo_texture(width: int, height: int, seed: int = 7) -> Image.Image:
+    """Detail as a camera records it, rather than as a random number
+    generator produces it.
+
+    ``_texture`` is per-pixel noise, which carries energy right up to the
+    sampling limit. Nothing photographed through a lens does: the glass and
+    the sensor band-limit it long before that, and what is left sits on
+    edges -- panel gaps, badges, the line of a spoiler -- rather than in
+    every pixel. The difference decides the top of the scale: against white
+    noise the measure still reads its maximum after two pixels of blur, so
+    anything calibrated on it puts the sharp end where no photograph can
+    reach and drops the whole shoot into the bottom half.
+
+    Pre-blurring the noise instead does not work either, and the reason is
+    worth writing down: blurs add in quadrature, so once the fixture is soft
+    enough to be in range, another pixel on top of it is an eight percent
+    change rather than the step off crisp that it is on a real frame.
+    """
+    rng = np.random.default_rng(seed)
+    data = np.full((height, width), 40, dtype=np.uint8)
+    for _ in range(60):                                   # panels and glass
+        x, y = rng.integers(0, width - 60), rng.integers(0, height - 50)
+        data[y:y + rng.integers(6, 50), x:x + rng.integers(8, 60)] = (
+            rng.integers(90, 235))
+    for _ in range(120):                                  # gaps and badges
+        x, y = rng.integers(0, width - 30), rng.integers(0, height - 30)
+        if rng.integers(0, 2):
+            data[y:y + rng.integers(1, 3), x:x + rng.integers(6, 30)] = (
+                rng.integers(90, 235))
+        else:
+            data[y:y + rng.integers(6, 30), x:x + rng.integers(1, 3)] = (
+                rng.integers(90, 235))
+    return Image.fromarray(data, mode="L").convert("RGB")
+
+
 def _flat(width: int, height: int, value: int = 128) -> Image.Image:
     return Image.new("RGB", (width, height), (value, value, value))
 
@@ -121,8 +156,12 @@ class Verdicts(unittest.TestCase):
 
         A saturating curve put everything from pin-sharp to visibly soft
         inside four points of each other.
+
+        On a photographic fixture rather than white noise, for the reason
+        given on ``_photo_texture``: the scale is calibrated for pictures,
+        and noise sits off the end of it.
         """
-        base = _texture(600, 400)
+        base = _photo_texture(600, 400)
         crisp = sharpness.measure(base).score
         usable = sharpness.measure(
             base.filter(ImageFilter.GaussianBlur(1))).score
@@ -253,9 +292,18 @@ class StarsAndLabels(unittest.TestCase):
         self.assertGreater(sharpness.stars_for(0.9), sharpness.stars_for(0.4))
         self.assertEqual(sharpness.stars_for(0.0), 1)
 
-    def test_five_stars_is_never_given_automatically(self) -> None:
-        """Whether the moment is any good is not a focus measurement."""
-        self.assertLessEqual(sharpness.stars_for(1.0), 4)
+    def test_the_whole_scale_is_reachable(self) -> None:
+        """The measure used to stop at four, on the grounds that whether the
+        moment is any good is not a focus measurement. It is the
+        photographer's scale though, and they can overrule any of it -- so
+        the cull gives its opinion across the range instead.
+
+        The bands were also calibrated above what the measure actually
+        produces: the top one began at 0.72 when the highest rating over
+        1,720 real frames was 0.711, so four was unreachable and the whole
+        shoot squashed into one to three."""
+        reachable = {sharpness.stars_for(r / 100) for r in range(101)}
+        self.assertEqual(reachable, {1, 2, 3, 4, 5})
 
     def test_colours_match_the_verdicts(self) -> None:
         self.assertEqual(sharpness.label_for("good"), "Green")

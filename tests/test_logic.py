@@ -100,6 +100,32 @@ class TeamCorroboration(unittest.TestCase):
         self.assertFalse(_corroborated("Racing Team", ["RACING", "TEAM"]))
 
 
+class ThePerCardAttributes(unittest.TestCase):
+    """`item.attributes` is where the review grid reads team, sponsors,
+    body type and every other chip that is not one of the few fields sent
+    as its own top-level key. `VehicleAnalysis.to_dict()` did not exist --
+    only `to_json()` did -- so server.py's `analysis.to_dict() if
+    hasattr(analysis, "to_dict") else {}` silently took the `else {}`
+    branch on every single card, every time. Team, sponsors and body type
+    had been empty in the review grid regardless of what was actually
+    read, and nothing raised because the fallback was valid, empty JSON."""
+
+    def test_to_dict_exists_and_matches_to_json(self) -> None:
+        import json
+
+        analysis = VehicleAnalysis(team="Nosso Racing", make="Mini", sponsors=["Betta"])
+        self.assertEqual(analysis.to_dict(), json.loads(analysis.to_json()))
+
+    def test_the_dead_fallback_is_gone_from_the_listing_endpoint(self) -> None:
+        from pathlib import Path
+
+        import conrod
+
+        source = (Path(conrod.__file__).parent / "server.py").read_text(encoding="utf-8")
+        self.assertNotIn('hasattr(analysis, "to_dict")', source)
+        self.assertIn("item[\"attributes\"] = analysis.to_dict()", source)
+
+
 class Mapping(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

@@ -579,15 +579,31 @@ class ScanRequest(BaseModel):
 def start_scan(body: ScanRequest) -> dict:
     with _run_lock:
         if _run["active"]:
+            # Adding an album is not the thing the one-at-a-time rule is
+            # protecting. That rule is about the GPU and the detector, and
+            # indexing touches neither -- it walks the folder, reads EXIF
+            # and pulls the previews out. Refusing it meant that during a
+            # scan that runs for hours there was no way to add the next
+            # card at all: the Scan screen only ever showed the run already
+            # going, and "Add album" had nowhere to go.
+            if body.stage == "index" and not _index["active"]:
+                return _start_index(body)
             raise HTTPException(409, "a scan is already running")
         if body.stage not in ("all", "index", "cull", "identify"):
             raise HTTPException(400, f"unknown stage {body.stage!r}")
         root = Path(body.path)
         if body.stage == "identify":
-            # Nothing is read off disk, so the folder need not still exist --
-            # the card may have been unplugged weeks ago.
             if body.resume_job is None:
                 raise HTTPException(400, "identify continues an album, so it needs one")
+            # On an album that has already been culled nothing is read off
+            # disk, so the folder need not still exist -- the card may have
+            # been unplugged weeks ago. On one that has only been indexed
+            # there are no crops yet, so the photographs do have to be there.
+            if _needs_folder_to_identify(body.resume_job) and not root.is_dir():
+                raise HTTPException(
+                    400, "no vehicles have been found in this album yet, so "
+                         "identifying it means reading the photographs again "
+                         f"-- and {body.path} is not there")
         elif not root.is_dir():
             raise HTTPException(400, "not a folder")
         _frames.clear()
@@ -670,7 +686,7 @@ def start_scan(body: ScanRequest) -> dict:
 
     def worker() -> None:
         try:
-            if body.stage == "identify":
+            if body.stage == "identify" and _has_detections(body.resume_job):
                 # Naming an album that was detected and culled earlier. It
                 # works from the stored crops, so there is no folder to walk
                 # and no photograph to re-read.
@@ -686,7 +702,13 @@ def start_scan(body: ScanRequest) -> dict:
                     should_stop=lambda: _run["stop"],
                     wait_if_paused=_resume_gate.wait,
                     resume_job=body.resume_job,
-                    stop_after=None if body.stage == "all" else body.stage,
+                    stop_after=None if body.stage in ("all", "identify")
+                               else body.stage,
+                    # Identify on an album nobody has culled: find the cars
+                    # and name them, and keep every one of them. Culling is
+                    # a separate decision and this is the photographer
+                    # declining to make it yet.
+                    cull=body.stage != "identify",
                 )
             _run["job_id"] = summary.job_id
             _run["stage"] = "done"
@@ -763,6 +785,52 @@ def _estimate_eta() -> int | None:
     return round(remaining * span / frames)
 
 
+# An album being added while a scan runs. Kept apart from _run on purpose:
+# _run owns the live frame view, the pause gate and the stop flag, none of
+# which mean anything to a folder being indexed, and all of which would be
+# wrong to hand a second job a share of.
+_index: dict = {"active": False, "job_id": None, "done": 0, "total": 0,
+                "message": "", "error": None, "label": None}
+
+
+def _start_index(body: ScanRequest) -> dict:
+    """Index a folder alongside a running scan. Disk and CPU only."""
+    root = Path(body.path)
+    if not root.is_dir():
+        raise HTTPException(400, "not a folder")
+    _index.update({"active": True, "job_id": None, "done": 0, "total": 0,
+                   "message": "reading the folder", "error": None,
+                   "label": body.label or root.name})
+
+    def progress(event: dict) -> None:
+        # Indexing stops before detection, so it never emits the frame and
+        # vehicle events the live view is built on -- only counts.
+        if event.get("stage") not in ("frame", "vehicle"):
+            _index["done"] = event.get("done", _index["done"])
+            _index["total"] = event.get("total", _index["total"])
+            if event.get("message"):
+                _index["message"] = event["message"]
+
+    def worker() -> None:
+        try:
+            summary = pipeline.run(
+                root, _state["settings"], label=body.label,
+                recursive=body.recursive, on_progress=progress,
+                resume_job=body.resume_job, stop_after="index",
+            )
+            _index["job_id"] = summary.job_id
+            _index["message"] = f"{summary.images} frames ready to cull"
+            note(f"album added: {_index['message']}", "info")
+        except Exception as exc:
+            _index["error"] = f"{type(exc).__name__}: {exc}"
+            note(_index["error"], "error")
+        finally:
+            _index["active"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"ok": True, "indexing": True}
+
+
 @app.get("/api/scan")
 def scan_status() -> dict:
     elapsed = time.time() - _run["started"] if _run["started"] else 0
@@ -773,6 +841,9 @@ def scan_status() -> dict:
     if _run["active"] and _run["total"]:
         _note_rate(_run["done"])
         out["eta"] = _estimate_eta()
+    # An album added while this one runs, so the Scan screen can say so
+    # without the two of them fighting over the same progress bar.
+    out["indexing"] = dict(_index)
     return out
 
 
@@ -1025,6 +1096,138 @@ def rename_job(job_id: int, body: JobPatch) -> dict:
     return {"ok": True}
 
 
+def _needs_folder_to_identify(job_id: int | None) -> bool:
+    """Whether identifying this album means reading the photographs again.
+
+    Only true for an album that exists and has nothing found in it yet. An
+    album nobody recognises is not a folder problem and must not be reported
+    as one -- the run itself gives a straight answer about the missing job,
+    where a complaint about the path sends you looking for a card that was
+    never the issue.
+    """
+    if job_id is None:
+        return False
+    with store.session() as conn:
+        known = conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return bool(known) and not _has_detections(job_id)
+
+
+def _has_detections(job_id: int | None) -> bool:
+    """Whether there is anything stored to identify without re-reading files.
+
+    Decides which of two quite different jobs "identify" means: naming crops
+    that a cull already cut, or walking the folder to find the cars first.
+    An album that has only been indexed has no crops, and pointing the crop
+    reader at it finds nothing and reports success.
+    """
+    if job_id is None:
+        return False
+    with store.session() as conn:
+        return bool(conn.execute(
+            """SELECT 1 FROM detections d JOIN images i ON i.id = d.image_id
+                WHERE i.job_id = ? LIMIT 1""", (job_id,)).fetchone())
+
+
+@app.post("/api/reset/detections")
+def reset_detections(job_id: int | None = None) -> dict:
+    """Throw away every detection and identification, keeping the albums.
+
+    The expensive half of a scan is finding and naming the cars; the cheap
+    half is walking the folder and pulling previews out of the RAWs. This
+    drops the first and keeps the second, so re-running does not spend
+    minutes re-reading files that have not changed. Which is what "start the
+    identification again" actually means -- the alternative, forgetting the
+    album outright, makes you re-index a shoot whose frames are all still
+    exactly where they were.
+
+    The photographs are untouched, as always. ``job_id`` limits it to one
+    album; without it, every album.
+    """
+    if _run.get("active"):
+        raise HTTPException(
+            409, "A scan is running. Stop it first, then reset.")
+
+    where = "WHERE i.job_id = ?" if job_id is not None else ""
+    args = (job_id,) if job_id is not None else ()
+    with store.session() as conn:
+        if job_id is not None and not conn.execute(
+                "SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+            raise HTTPException(404, "no such scan")
+        crops = [r["crop_path"] for r in conn.execute(
+            f"""SELECT d.crop_path FROM detections d
+                  JOIN images i ON i.id = d.image_id
+                 {where} {'AND' if where else 'WHERE'} d.crop_path IS NOT NULL""",
+            args)]
+        gone = conn.execute(
+            f"""DELETE FROM detections WHERE image_id IN
+                (SELECT i.id FROM images i {where})""", args).rowcount
+        # Back to "indexed": the frames are known, nothing has been found in
+        # them yet. Leaving them "done" would offer a Write XMP that has
+        # nothing left to write.
+        conn.execute(
+            "UPDATE jobs SET status='indexed'"
+            + (" WHERE id=?" if job_id is not None else ""), args)
+        conn.commit()
+
+    removed = 0
+    for path in crops:
+        for candidate in (Path(path), *Path(path).parent.glob(
+                Path(path).stem + ".t*.jpg")):
+            try:
+                candidate.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    return {"ok": True, "detections_removed": gone, "crops_removed": removed}
+
+
+@app.post("/api/reset")
+def reset_everything() -> dict:
+    """Forget every scan and everything read from it, and start again.
+
+    The photographs are not touched. Nothing Conrod has decided has ever been
+    written to them -- that only happens on Write XMP -- so this throws away
+    Conrod's own work and nothing else: the scans, the detections, the plates
+    and numbers and identifications, and the crops cut out along the way.
+    Settings and the entry list are kept, because they are how the next scan
+    is set up rather than a result of the last one.
+
+    Refuses while a scan is running rather than tearing the ground out from
+    under it. The caller is expected to have asked first; a confirmation is
+    not something a server can check, so this at least makes the irreversible
+    half impossible to reach by accident.
+    """
+    if _run.get("active"):
+        raise HTTPException(
+            409, "A scan is running. Stop it first, then reset.")
+
+    with store.session() as conn:
+        crops = [r["crop_path"] for r in conn.execute(
+            "SELECT crop_path FROM detections WHERE crop_path IS NOT NULL")]
+        jobs = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+        frames = conn.execute("SELECT COUNT(*) AS n FROM images").fetchone()["n"]
+        # ON DELETE CASCADE clears images and detections with the jobs.
+        conn.execute("DELETE FROM jobs")
+
+    removed = 0
+    for path in crops:
+        for candidate in (Path(path), *Path(path).parent.glob(
+                Path(path).stem + ".t*.jpg")):
+            try:
+                candidate.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+
+    # Back to the values it starts life with, rather than cleared: the rest
+    # of the server reads these keys by name and an empty dict is a KeyError
+    # waiting for whoever next opens the scan page.
+    _index.update({"active": False, "job_id": None, "done": 0, "total": 0,
+                   "message": "", "error": None, "label": None})
+    return {"ok": True, "scans_removed": jobs, "frames_removed": frames,
+            "crops_removed": removed}
+
+
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: int) -> dict:
     """Forget a scan.
@@ -1151,6 +1354,14 @@ def job_summary(job_id: int) -> dict:
             (job_id,),
         ).fetchall()
 
+        plates = conn.execute(
+            """SELECT d.plate AS plate, COUNT(*) AS frames
+                 FROM detections d JOIN images i ON i.id = d.image_id
+                WHERE i.job_id = ? AND d.plate IS NOT NULL AND d.rejected = 0
+                GROUP BY d.plate ORDER BY frames DESC""",
+            (job_id,),
+        ).fetchall()
+
         number_map: NumberMap = _state["number_map"]
         return {
             "job": dict(job),
@@ -1158,6 +1369,7 @@ def job_summary(job_id: int) -> dict:
             "images": {k: (v or 0) for k, v in dict(images).items()},
             "numbers": [{**dict(n), "who": number_map.describe(n["number"])}
                         for n in numbers],
+            "plates": [dict(p) for p in plates],
             "map_size": len(number_map),
         }
 
@@ -1170,8 +1382,12 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
        d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
        d.cull_reason, d.clipped, d.rating, d.rating_verdict, d.stars,
-       d.panning, d.background, d.sharp_end, d.uncertain,
-       i.path AS image_path, i.id AS image_id, i.camera, i.burst_key
+       d.panning, d.background, d.sharp_end, d.uncertain, d.bystander,
+       i.path AS image_path, i.id AS image_id, i.camera, i.burst_key,
+       -- Whether "which car is the subject" is even a question for this
+       -- frame. One vehicle in it and there is nothing to choose between.
+       (SELECT COUNT(*) FROM detections x
+         WHERE x.image_id = d.image_id) AS in_frame
   FROM detections d
   JOIN images i ON i.id = d.image_id
  WHERE i.job_id = :job_id
@@ -1201,8 +1417,13 @@ _RANK = _rank_sql()
 ORDERINGS = {
     # The default: least confident first, because that is what review is for.
     "review": "d.number_conf ASC, d.id ASC",
-    "best": f"({_RANK}) IS NULL, ({_RANK}) DESC, d.rating DESC, d.id ASC",
-    "worst": f"({_RANK}) IS NULL, ({_RANK}) ASC, d.rating ASC, d.id ASC",
+    # `d.stars IS NULL` before the raw rating so that at equal stars a
+    # rating given by hand comes first. It is a judgement where the measured
+    # one is a proposal, and now that the measure reaches five as well, a
+    # frame someone starred was being buried under a sharper one that had
+    # merely been calculated to the same number.
+    "best": f"({_RANK}) IS NULL, ({_RANK}) DESC, d.stars IS NULL, d.rating DESC, d.id ASC",
+    "worst": f"({_RANK}) IS NULL, ({_RANK}) ASC, d.stars IS NULL, d.rating ASC, d.id ASC",
     "frame": "i.id ASC, d.id ASC",
 }
 
@@ -1212,8 +1433,10 @@ def detections(
     job_id: int,
     view: str = Query("review", pattern="^(review|all|number|plate|rejected)$"),
     number: str | None = None,
+    plate: str | None = None,
     search: str | None = None,
     sort: str = Query("review", pattern="^(review|best|worst|frame)$"),
+    min_stars: int | None = Query(None, ge=1, le=5),
     limit: int = 120,
     offset: int = 0,
 ) -> dict:
@@ -1233,7 +1456,11 @@ def detections(
         clauses.append("d.number = :number AND d.rejected = 0")
         params["number"] = number
     elif view == "plate":
-        clauses.append("d.plate IS NOT NULL AND d.rejected = 0")
+        if plate:
+            clauses.append("d.plate = :plate AND d.rejected = 0")
+            params["plate"] = plate
+        else:
+            clauses.append("d.plate IS NOT NULL AND d.rejected = 0")
     elif view == "rejected":
         clauses.append("d.rejected = 1")
 
@@ -1243,6 +1470,13 @@ def detections(
             "OR IFNULL(d.plate,'') LIKE :q OR i.path LIKE :q)"
         )
         params["q"] = f"%{search}%"
+
+    # Aftershoot-style "3 stars and up" as a filter, not just a sort order --
+    # the same effective-stars expression the sort already uses, so a card
+    # showing 4 stars and a filter set to 3+ can never disagree.
+    if min_stars:
+        clauses.append(f"({_RANK}) >= :min_stars")
+        params["min_stars"] = min_stars
 
     sql = DETECTION_QUERY
     if clauses:
@@ -1264,11 +1498,19 @@ def detections(
         item = dict(row)
         raw_attributes = item.pop("attributes", None)
         analysis = VehicleAnalysis.from_json(raw_attributes)
+        # The stored analysis only carries a real "kind" once identify() has
+        # actually run; before that it is the dataclass default, "car" --
+        # regardless of what the detector actually found. The detection's
+        # own class is ground truth from the moment it exists, so it wins
+        # over an unset or stale one. Without this a motorcycle waiting to
+        # be identified showed "Car" on the card, not "Motorcycle".
+        if item.get("cls"):
+            analysis.kind = item["cls"]
         item["filename"] = Path(item["image_path"]).name
         item["who"] = number_map.describe(item["number"]) if item["number"] else ""
         item["crop_url"] = f"/api/crop/{item['id']}"
         item["frame_url"] = f"/api/frame/{item['image_id']}"
-        item["attributes"] = analysis.to_dict() if hasattr(analysis, "to_dict") else {}
+        item["attributes"] = analysis.to_dict()
         # Read straight from the stored JSON: the disputed list is written by
         # grouping and is not a field of VehicleAnalysis, so round-tripping
         # through it would drop the list silently.
@@ -1347,6 +1589,7 @@ class DetectionUpdate(BaseModel):
     plate: str | None = None
     attributes: dict | None = None
     rejected: bool | None = None
+    bystander: bool | None = None
     reviewed: bool = True
     # 1-5 by hand, or 0 to hand the frame back to the measured rating.
     stars: int | None = Field(default=None, ge=0, le=5)
@@ -1373,6 +1616,8 @@ def update_detection(det_id: int, body: DetectionUpdate) -> dict:
             raise HTTPException(404, "no such detection")
 
         analysis = VehicleAnalysis.from_json(row["attributes"])
+        if row["cls"]:
+            analysis.kind = row["cls"]
         number, source, confidence = row["number"], row["number_source"], row["number_conf"]
         plate = row["plate"]
 
@@ -1397,8 +1642,23 @@ def update_detection(det_id: int, body: DetectionUpdate) -> dict:
                     if key == "team" and value:
                         # A human typed it, so it no longer needs corroborating.
                         analysis.team_corroborated = True
+            # Sponsors are a list, not a string -- the review UI edits them
+            # as chips, so what arrives is the whole list as it should now
+            # stand rather than one value to set. Blanks and duplicates are
+            # dropped here so the same name typed twice, or with different
+            # spacing, cannot end up as two keywords in the catalogue.
+            if "sponsors" in body.attributes:
+                seen, cleaned = set(), []
+                for raw in body.attributes["sponsors"] or []:
+                    text = str(raw).strip()
+                    if text and text.upper() not in seen:
+                        seen.add(text.upper())
+                        cleaned.append(text)
+                analysis.sponsors = cleaned
 
         rejected = row["rejected"] if body.rejected is None else int(body.rejected)
+        bystander = (row["bystander"] if body.bystander is None
+                     else int(body.bystander))
         # 0 means "forget what I said", not "zero stars" -- every catalogue
         # reads 0 as unrated, and there has to be a way back to the measured
         # rating after a mis-keyed number.
@@ -1408,15 +1668,17 @@ def update_detection(det_id: int, body: DetectionUpdate) -> dict:
         conn.execute(
             """UPDATE detections
                   SET number=?, number_source=?, number_conf=?,
-                      plate=?, attributes=?, rejected=?, reviewed=?, stars=?
+                      plate=?, attributes=?, rejected=?, reviewed=?, stars=?,
+                      bystander=?
                 WHERE id=?""",
             (number, source, confidence, plate, analysis.to_json(),
-             rejected, int(body.reviewed), stars, det_id),
+             rejected, int(body.reviewed), stars, bystander, det_id),
         )
 
     number_map: NumberMap = _state["number_map"]
     return {
         "ok": True, "id": det_id, "number": number, "plate": plate,
+        "bystander": bool(bystander),
         # The stars the card should now show, which after clearing a hand
         # rating is the measured one -- not the empty column. Returning the
         # column left the pill reading "-" on a frame the cull had rated.
@@ -1433,6 +1695,7 @@ class BulkUpdate(BaseModel):
     ids: list[int]
     number: str | None = None
     rejected: bool | None = None
+    bystander: bool | None = None
 
 
 @app.post("/api/detections/bulk")

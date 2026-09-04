@@ -8,6 +8,7 @@ detection produces them rather than waiting for the whole shoot to be scanned.
 from __future__ import annotations
 
 import hashlib
+import os
 import queue
 import threading
 import time
@@ -35,6 +36,49 @@ from .mapping import NumberMap
 from .writer import write_keywords
 
 Progress = Callable[[dict], None]
+
+# How many newly-identified vehicles between re-groupings while a scan is
+# still running. consolidate() is a full pass over the job's own detections,
+# not an incremental one, so this is a balance: too low and a big album
+# spends its GPU time re-grouping instead of identifying; too high and a
+# long scan looks like nothing has been grouped at all until it finishes,
+# which read as "grouping is an afterthought" on a multi-thousand-frame
+# album. It always still runs once more at the very end regardless.
+REGROUP_CHECKPOINT = 250
+
+# What a file already says about itself. Both are what Lightroom and Bridge
+# read and write, so a shoot that has been culled once by hand arrives with
+# the photographer's own opinion attached and the cull can defer to it.
+EXISTING_MARK_TAGS = ("Rating", "Label")
+
+
+def _maybe_regroup(conn, job_id: int, settings: Settings, counters: dict,
+                   counter_lock: threading.Lock, checkpoint: dict,
+                   errors: list[str], on_progress: Progress) -> None:
+    """Group what has been identified so far, at most every so often.
+
+    Grouping mid-scan is what turns a wall of ungrouped single-frame cards
+    into vehicles the moment there is enough evidence to name one, instead
+    of only once the last frame of the album has been read. Safe to call
+    this often -- consolidate() works entirely from stored crops and is
+    documented as safe to re-run any number of times -- so this is purely a
+    cost trade-off, not a correctness one.
+    """
+    if not settings.group_vehicles:
+        return
+    with counter_lock:
+        analysed = counters["analysed"]
+    if analysed - checkpoint["last"] < REGROUP_CHECKPOINT:
+        return
+    checkpoint["last"] = analysed
+    try:
+        stats = grouping.consolidate(conn, job_id, settings)
+        on_progress({"stage": "grouping", "done": stats["vehicles"],
+                     "total": stats["vehicles"],
+                     "message": f"{stats['vehicles']} vehicles in "
+                                f"{stats['groups']} groups so far"})
+    except Exception as exc:
+        errors.append(f"grouping: {exc}")
 
 
 def _noop(_event: dict) -> None:
@@ -66,7 +110,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         should_stop: Callable[[], bool] | None = None,
         wait_if_paused: Callable[[], None] | None = None,
         resume_job: int | None = None,
-        stop_after: str | None = None) -> JobSummary:
+        stop_after: str | None = None,
+        cull: bool = True) -> JobSummary:
     """Scan, detect and analyse a folder. Does not write metadata.
 
     ``resume_job`` continues a job that was stopped or interrupted: frames it
@@ -90,6 +135,15 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
     if stop_after not in (None, "index", "cull"):
         raise ValueError(f"unknown stage {stop_after!r}")
     analyse = stop_after is None
+
+    # Culling is a separate question from finding and naming the cars, and
+    # the answer is allowed to be "no". Identifying an album nobody has culled
+    # is a real way to work -- keep everything, name everything, decide later
+    # -- and it used to be unreachable, because detections only ever came
+    # into existence during a cull. Everything is still measured and rated
+    # either way; this only decides whether a rating is acted on.
+    if stop_after == "cull" and not cull:
+        raise ValueError("a cull that culls nothing is just detection")
     # Progress reporting is a side channel: a failure in the UI's callback
     # must never take down a scan that is hours into a shoot.
     raw_progress = on_progress
@@ -173,6 +227,7 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         errors: list[str] = []
         counters = {"analysed": 0, "identified": 0}
         counter_lock = threading.Lock()
+        checkpoint = {"last": 0}
 
         # A pool rather than one thread: plate detection and OCR are
         # onnxruntime calls that release the GIL and so genuinely overlap,
@@ -266,13 +321,36 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                         # The stars the cull would write. Carried on the box
                         # so the live view can say what it decided without
                         # keeping its own copy of the bands.
-                        box["stars"] = sharpness_mod.stars_for(rating)
+                        stars = sharpness_mod.stars_for(rating)
+                        box["stars"] = stars
                         if focus.panning:
                             box["panning"] = True
+
+                        # The photographer's own standing instruction, on the
+                        # star the cull just worked out. Deliberately ahead of
+                        # the blur cull and deliberately without the pan
+                        # exemption: that exemption protects a held pan from
+                        # the machine's opinion, and this is not the machine's
+                        # opinion -- it is a rule someone set knowing the
+                        # whole scale. A pan that lands on one star has a
+                        # smeared subject, which is the thing being asked
+                        # about. Rejected, not deleted, so the Rejected view
+                        # puts any of it back.
+                        floor = settings.auto_reject_below_stars if cull else 0
+                        if floor and stars < floor:
+                            store.cull_detection(
+                                conn, det_id,
+                                f"{stars} star{'' if stars == 1 else 's'}"
+                                f", below your limit of {floor}",
+                                uncertain=unsure)
+                            culled += 1
+                            box["culled"] = True
+                            continue
+
                         # A held pan is never culled automatically, and a
                         # close call is culled but flagged, so it turns up in
                         # review instead of vanishing.
-                        if (settings.cull_blurred
+                        if (cull and settings.cull_blurred
                                 and sharpness_mod.cullable(focus, verdict)):
                             store.cull_detection(
                                 conn, det_id, _cull_reason(focus, edges),
@@ -312,6 +390,9 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                 errors.append(f"{path.name}: {exc}")
             if index % 10 == 0 or index == len(files):
                 conn.commit()
+                if analyse:
+                    _maybe_regroup(conn, job_id, settings, counters,
+                                   counter_lock, checkpoint, errors, on_progress)
             note = (f"{total_detections} vehicles, "
                     f"{counters['identified']} identified")
             if culled:
@@ -366,6 +447,82 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
         conn.close()
 
 
+def rescore(job_id: int | None, settings: Settings, *,
+            on_progress: Progress = _noop,
+            should_stop: Callable[[], bool] | None = None) -> int:
+    """Measure every stored crop again and write the new sharpness back.
+
+    Needed whenever the focus scale is re-derived. A rating is a number about
+    a scale: the album on disk was scored against the old one, and reading it
+    with the new bands is not a stale answer but a wrong one -- the shoot
+    these bands were fitted to tops out at 0.711 on the old scale, and the
+    new three-star floor is 0.728, so every frame in it would read as one
+    star until it was measured again.
+
+    Works entirely from the stored crops, like identify does, so it re-reads
+    no photographs and takes minutes rather than the hours a fresh scan
+    would. Ratings given by hand are not touched: they are in a different
+    column and they were never on this scale to begin with.
+    """
+    where = "WHERE i.job_id = ?" if job_id is not None else ""
+    args = (job_id,) if job_id is not None else ()
+    conn = store.connect()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT d.id, d.crop_path, d.x1, d.y1, d.x2, d.y2
+                  FROM detections d JOIN images i ON i.id = d.image_id
+                 {where} {'AND' if where else 'WHERE'} d.crop_path IS NOT NULL""",
+            args)]
+        total = len(rows)
+        on_progress({"stage": "rescore", "done": 0, "total": total,
+                     "message": f"re-measuring {total} crops"})
+        done = 0
+        for row in rows:
+            if should_stop and should_stop():
+                break
+            width = row["x2"] - row["x1"]
+            height = row["y2"] - row["y1"]
+            pad = settings.crop_padding
+            crop_box = (row["x1"] - width * pad, row["y1"] - height * pad,
+                        row["x2"] + width * pad, row["y2"] + height * pad)
+            focus = _focus_of(row["crop_path"], settings,
+                              box=(row["x1"], row["y1"], row["x2"], row["y2"]),
+                              crop_box=crop_box)
+            done += 1
+            if not focus:
+                continue
+            # The framing factor is not recoverable here -- it needs the frame
+            # size, which the crop does not carry -- so the stored ratio
+            # between rating and sharpness is reused. On a frame that was
+            # never clipped that ratio is one, which is nearly all of them.
+            old = conn.execute(
+                "SELECT sharpness, rating FROM detections WHERE id=?",
+                (row["id"],)).fetchone()
+            factor = 1.0
+            if old and old["sharpness"] and old["rating"] is not None:
+                factor = min(1.0, old["rating"] / old["sharpness"])
+            rating = focus.score * factor
+            verdict = sharpness_mod.rating_for(
+                rating, settings.sharp_at, settings.blurred_below)
+            conn.execute(
+                """UPDATE detections SET sharpness=?, sharpness_verdict=?,
+                       rating=?, rating_verdict=?, panning=?, background=?,
+                       sharp_end=? WHERE id=?""",
+                (focus.score, focus.verdict, rating, verdict,
+                 int(bool(focus.panning)), focus.background, focus.sharp_end,
+                 row["id"]))
+            if done % 100 == 0:
+                conn.commit()
+                on_progress({"stage": "rescore", "done": done, "total": total,
+                             "message": f"re-measured {done}/{total}"})
+        conn.commit()
+        on_progress({"stage": "rescore", "done": done, "total": total,
+                     "message": f"re-measured {done} crops"})
+        return done
+    finally:
+        conn.close()
+
+
 def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
              should_stop: Callable[[], bool] | None = None,
              wait_if_paused: Callable[[], None] | None = None) -> JobSummary:
@@ -395,6 +552,7 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
                       COALESCE(i.preview_path, i.path) AS frame
                  FROM detections d JOIN images i ON i.id = d.image_id
                 WHERE i.job_id = ? AND d.rejected = 0 AND d.crop_path IS NOT NULL
+                  AND COALESCE(d.bystander, 0) = 0
                   AND (d.attributes IS NULL OR d.attributes = '')
                 ORDER BY d.id""",
             (job_id,),
@@ -411,6 +569,7 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
         errors: list[str] = []
         counters = {"analysed": 0, "identified": 0}
         counter_lock = threading.Lock()
+        checkpoint = {"last": 0}
         pool = [
             threading.Thread(
                 target=_analysis_worker,
@@ -434,6 +593,15 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
             # detect loop passed too -- the reader asks a different question
             # about a rider than about a car.
             is_bike = (row["cls"] or "").lower() in BIKE_CLASS_NAMES
+
+            # Tell the live view this frame exists. It only ever learned
+            # about frames from the detect loop, which this stage does not
+            # run -- so identifying an album that had been culled earlier
+            # showed "Reading the folder..." and an empty panel for the whole
+            # job, however many hours it took. The size comes from the JPEG
+            # header, not from decoding it.
+            _announce_frame(row["frame"], row["id"], box, row["cls"],
+                            on_progress, done, total)
             while True:
                 if should_stop and should_stop():
                     break
@@ -475,6 +643,8 @@ def identify(job_id: int, settings: Settings, *, on_progress: Progress = _noop,
                 named = counters["identified"]
             on_progress({"stage": "identify", "done": min(seen, total),
                          "total": total, "message": f"{named} named"})
+            _maybe_regroup(conn, job_id, settings, counters, counter_lock,
+                          checkpoint, errors, on_progress)
         for worker in pool:
             worker.join(timeout=300)
 
@@ -538,6 +708,37 @@ def _mmss(seconds: float) -> str:
     if seconds >= 60:
         return f"{seconds // 60}m {seconds % 60:02d}s"
     return f"{seconds}s"
+
+
+def _announce_frame(frame_path: str, det_id: int, box, cls: str | None,
+                    on_progress: Progress, done: int, total: int) -> None:
+    """Put a frame the identify stage is about to read on the live view.
+
+    The view is keyed by detection id and filled by the detect loop, which
+    only runs when detection runs. Identifying an already-culled album
+    therefore had nothing to show: an empty panel reading "Reading the
+    folder..." for the whole job.
+
+    Only the header is read, so this costs a stat and a few hundred bytes
+    rather than decoding a 32-megapixel preview per vehicle.
+    """
+    try:
+        with Image.open(frame_path) as frame:
+            width, height = frame.size
+    except Exception:
+        return
+    if not width or not height:
+        return
+    x1, y1, x2, y2 = (float(v) for v in box)
+    on_progress({"stage": "frame", "done": done, "total": total,
+                 "frame": {"name": Path(frame_path).name,
+                           "preview": str(frame_path),
+                           "phase": "identifying",
+                           "boxes": [{"id": det_id, "kind": cls or "vehicle",
+                                      "conf": 0.0,
+                                      "x": x1 / width, "y": y1 / height,
+                                      "w": (x2 - x1) / width,
+                                      "h": (y2 - y1) / height}]}})
 
 
 def _native_region(frame_path: str, box, settings: Settings):
@@ -624,39 +825,87 @@ def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
     Advisory, not required: a folder of files with no EXIF at all still
     scans, it just has one camera and a burst per frame.
     """
-    if not getattr(settings, "group_by_burst", True):
+    files = list(files)
+    want_bursts = bool(getattr(settings, "group_by_burst", True))
+    want_marks = bool(getattr(settings, "import_existing_ratings", True))
+
+    # Both of these are properties of the files, not of the run, so a second
+    # pass over an album that already has them is an exiftool walk of the
+    # whole shoot for an answer that cannot have changed. Adding an album and
+    # then culling it is two passes by definition, and on 1,800 frames the
+    # second one is minutes of nothing.
+    if want_bursts:
+        have = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE job_id=? AND burst_key IS NOT NULL",
+            (job_id,)).fetchone()[0]
+        if have and have >= len(files):
+            want_bursts = False
+            on_progress({"stage": "cameras",
+                         "message": f"capture times already read for {have} frames"})
+    if want_marks:
+        seen = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE job_id=? AND rating_in_file IS NOT NULL",
+            (job_id,)).fetchone()[0]
+        if seen:
+            want_marks = False
+    if not (want_bursts or want_marks):
         return
 
-    # Bursts are a property of the files, not of the run, so a second pass
-    # over an album that already has them is an exiftool walk of the whole
-    # shoot for an answer that cannot have changed. Adding an album and then
-    # culling it is two passes by definition, and on 1,800 frames the second
-    # one is minutes of nothing.
-    have = conn.execute(
-        "SELECT COUNT(*) FROM images WHERE job_id=? AND burst_key IS NOT NULL",
-        (job_id,)).fetchone()[0]
-    if have and have >= len(list(files)):
-        on_progress({"stage": "cameras",
-                     "message": f"capture times already read for {have} frames"})
-        return
+    # One walk for both. They want different tags but the expensive part is
+    # opening seventeen hundred RAW files, not which fields are asked for.
+    wanted = list(bursts.TAGS) if want_bursts else []
+    if want_marks:
+        wanted += [tag for tag in EXISTING_MARK_TAGS if tag not in wanted]
 
-    on_progress({"stage": "cameras", "message": "reading camera and capture times"})
+    on_progress({"stage": "cameras",
+                 "message": "reading camera, capture times and existing ratings"
+                            if want_marks else "reading camera and capture times"})
     try:
         with ExifTool() as tool:
-            rows = tool.read_tags(list(files), list(bursts.TAGS))
+            rows = tool.read_tags(files, wanted)
     except Exception as exc:                      # exiftool missing or unhappy
         on_progress({"stage": "cameras",
                      "message": f"could not read capture times: {exc}"})
         return
 
-    frames = bursts.describe(rows, fallback="camera",
-                             gap=getattr(settings, "burst_gap", bursts.BURST_GAP_SECONDS))
-    store.set_frame_origin(conn, job_id, frames)
-    cameras = {f.camera for f in frames}
-    runs = len({f.burst for f in frames})
-    on_progress({"stage": "cameras",
-                 "message": f"{runs} burst{'' if runs == 1 else 's'} from "
-                            f"{len(cameras)} camera{'' if len(cameras) == 1 else 's'}"})
+    said = []
+    if want_bursts:
+        frames = bursts.describe(
+            rows, fallback="camera",
+            gap=getattr(settings, "burst_gap", bursts.BURST_GAP_SECONDS))
+        store.set_frame_origin(conn, job_id, frames)
+        cameras = {f.camera for f in frames}
+        runs = len({f.burst for f in frames})
+        said.append(f"{runs} burst{'' if runs == 1 else 's'} from "
+                    f"{len(cameras)} camera{'' if len(cameras) == 1 else 's'}")
+
+    if want_marks:
+        marks = _existing_marks(files, rows)
+        rated = store.set_existing_marks(conn, job_id, marks)
+        if rated:
+            said.append(f"{rated} frame{'' if rated == 1 else 's'} already rated")
+
+    if said:
+        on_progress({"stage": "cameras", "message": ", ".join(said)})
+
+
+def _existing_marks(files) -> dict:
+    """The rating and label each frame already carries, sidecar first.
+
+    Reads through culling.read_culls rather than repeating it. A RAW is not
+    where Lightroom puts a rating -- it writes an .xmp beside the file and
+    leaves the original untouched -- and read_culls already knows that, along
+    with the XMP:Rating fallback and the chunking that keeps a 6,000-frame
+    read from looking hung. Measured on one shoot: all 1,833 CR3s reported 0
+    and their sidecars held 310 fives and nine ones, so a reader that asks
+    the RAW alone finds nothing on a shoot that has been rated for weeks.
+    """
+    try:
+        with ExifTool() as tool:
+            found = culling.read_culls(list(files), tool)
+    except Exception:            # worth having, not worth failing a scan over
+        return {}
+    return {str(path): (cull.rating, cull.label) for path, cull in found.items()}
 
 
 def _analysis_worker(work, settings: Settings, counters: dict,
@@ -737,7 +986,7 @@ WRITE_QUERY = """
 SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
        d.rejected AS rejected, d.rating AS rating,
        d.rating_verdict AS rating_verdict, d.panning AS panning,
-       d.stars AS stars
+       d.stars AS stars, d.bystander AS bystander
   FROM images i
   JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
@@ -756,6 +1005,12 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
                 row["image_id"], {"path": Path(row["path"]), "analyses": [],
                                   "best": None, "panning": False,
                                   "by_hand": None})
+            # A vehicle in the frame that is not what the frame is of says
+            # nothing about it: not its keywords, not its rating, not the
+            # stars. Rejecting is a judgement about the photograph; this is
+            # a statement about which car in it is the subject.
+            if row["bystander"]:
+                continue
             # Keywords come only from vehicles that survived and were read.
             if not row["rejected"] and row["attributes"]:
                 entry["analyses"].append(
