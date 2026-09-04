@@ -730,12 +730,19 @@ def pick_of_pass(job_id: int, settings: Settings, *,
     again picks the same one -- and the runner-up is not touched: it keeps
     its rating and its own label, and is one click away in the grid.
 
+    A star given by hand wins the pass outright. The measure is a proposal
+    and their star is an answer, and on a real album the two disagreed: a
+    frame rated 5 in Lightroom lost its pass to one the focus measure liked
+    better and scored 2. Ranking on the measure alone means the keeper of a
+    pass can be a frame the photographer had already passed over.
+
     Re-runnable, like every other pass here. Reads no photographs.
     """
     conn = store.connect()
     try:
         rows = conn.execute(
             """SELECT d.id, d.rating, d.sharpness, d.group_key,
+                      COALESCE(d.stars, i.rating_in_file) AS by_hand,
                       i.id AS image_id, i.burst_key
                  FROM detections d JOIN images i ON i.id = d.image_id
                 WHERE i.job_id = ?
@@ -761,10 +768,16 @@ def pick_of_pass(job_id: int, settings: Settings, *,
                 score = row["sharpness"]
             if score is None:
                 continue
+            # A star given by hand sorts above every measured frame, and
+            # against another starred frame the stars decide. Compared as a
+            # pair so this needs no scaling between two different scales:
+            # whether it was starred at all comes first, and the measure
+            # only breaks a tie between frames of equal standing.
+            rank = (row["by_hand"] or 0, score)
             # Strictly greater, so an equal score leaves the earlier frame
             # in place. That is what makes a re-run pick the same frame.
-            if unit not in best or score > best[unit][0]:
-                best[unit] = (score, row["id"])
+            if unit not in best or rank > best[unit][0]:
+                best[unit] = (rank, row["id"])
 
         picks = {det_id for _, det_id in best.values()}
         conn.execute(
@@ -1439,7 +1452,8 @@ SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
        COALESCE(d.rating_verdict, i.rating_verdict) AS rating_verdict,
        d.panning AS panning,
        d.stars AS stars, d.bystander AS bystander,
-       d.burst_pick AS burst_pick
+       d.burst_pick AS burst_pick,
+       i.rating_in_file AS rating_in_file, i.label_in_file AS label_in_file
   FROM images i
   LEFT JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
@@ -1494,7 +1508,9 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
             entry = by_image.setdefault(
                 row["image_id"], {"path": Path(row["path"]), "analyses": [],
                                   "best": None, "panning": False,
-                                  "by_hand": None, "pick": False})
+                                  "by_hand": None, "pick": False,
+                                  "had_rating": row["rating_in_file"],
+                                  "had_label": row["label_in_file"]})
             # A vehicle in the frame that is not what the frame is of says
             # nothing about it: not its keywords, not its rating, not the
             # stars. Rejecting is a judgement about the photograph; this is
@@ -1524,11 +1540,23 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
             entry["pick"] = entry["pick"] or bool(row["burst_pick"])
 
         written = failed = skipped = 0
+        kept_rating = kept_label = 0
         with ExifTool() as tool:
             for index, (image_id, entry) in enumerate(by_image.items(), start=1):
                 path, analyses = entry["path"], entry["analyses"]
                 words = keywords_mod.for_frame(analyses, settings, number_map)
                 rating, label = verdict_for(entry, settings)
+                # What the file already says, and whether this is allowed to
+                # replace it. Counted because the alternative is what
+                # happened on a real album: every one of 6,221 frames
+                # already carried a colour label, overwrite_label was off,
+                # and so the keeper of every pass was written -- correctly
+                # and silently -- nowhere at all. "6,221 frames would be
+                # keyworded" was true and useless.
+                if rating is not None and not settings.overwrite_rating                         and (entry["had_rating"] or 0) > 0:
+                    kept_rating += 1
+                if label is not None and not settings.overwrite_label                         and entry["had_label"]:
+                    kept_label += 1
                 if not words and rating is None:
                     skipped += 1
                     continue
@@ -1562,6 +1590,9 @@ def write_job(job_id: int, settings: Settings, number_map: NumberMap | None = No
         if not dry_run:
             store.set_job_status(conn, job_id, "written")
         return {"frames": len(by_image), "written": written, "failed": failed,
-                "skipped": skipped, "dry_run": dry_run}
+                "skipped": skipped, "dry_run": dry_run,
+                # Frames whose rating or label will be left exactly as it is
+                # because one is already there and Overwrite is off.
+                "kept_rating": kept_rating, "kept_label": kept_label}
     finally:
         conn.close()

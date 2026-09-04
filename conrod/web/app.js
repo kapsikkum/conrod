@@ -2658,7 +2658,19 @@ $("#btn-dry").onclick = async () => {
   try {
     const r = await api(`/api/jobs/${state.jobId}/write`, {
       method: "POST", body: JSON.stringify({ dry_run: true }) });
-    toast(`${r.frames} frames would be keyworded`);
+    // Say what will *not* happen as well. On an album whose frames already
+    // carry colour labels -- which is any album that has been through
+    // Lightroom once -- create-only mode means the cull's colour and the
+    // keeper's blue label go nowhere, and the old message said nothing
+    // about it.
+    const held = [];
+    if (r.kept_label) held.push(`${r.kept_label.toLocaleString()} keep the `
+      + `colour label they already have`);
+    if (r.kept_rating) held.push(`${r.kept_rating.toLocaleString()} keep the `
+      + `star rating they already have`);
+    toast(`${r.frames.toLocaleString()} frames would be written`
+          + (held.length ? ` — ${held.join(", ")}. `
+             + `Turn on Overwrite in Settings to replace them.` : ""));
   } catch (err) {
     toast(`Could not work out what would be written: ${err.message}`);
   }

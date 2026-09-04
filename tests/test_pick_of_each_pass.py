@@ -204,6 +204,64 @@ class WhatItWillNotPick(_Pass):
         self.assertEqual(self._picks(), {best})
 
 
+class AStarGivenByHandWinsThePass(_Pass):
+    """Their judgement beats the focus measure, because the measure is a
+    proposal and their star is an answer.
+
+    Found on a real album after writing it out: IMG_0029 carried a 5 the
+    photographer had given in Lightroom and IMG_0030 scored better on focus,
+    so the keeper of that pass was a frame they had already passed over --
+    and the one they had picked was written as a plain non-keeper.
+    """
+
+    def _starred(self, burst, rating, stars):
+        det = self._shot(burst, rating)
+        self.conn.execute("UPDATE detections SET stars=? WHERE id=?",
+                          (stars, det))
+        self.conn.commit()
+        return det
+
+    def _from_the_file(self, burst, rating, stars):
+        det = self._shot(burst, rating)
+        image_id = self.conn.execute(
+            "SELECT image_id FROM detections WHERE id=?", (det,)).fetchone()[0]
+        self.conn.execute("UPDATE images SET rating_in_file=? WHERE id=?",
+                          (stars, image_id))
+        self.conn.commit()
+        return det
+
+    def test_a_starred_frame_beats_a_sharper_one(self) -> None:
+        theirs = self._starred(7, 0.20, 5)
+        self._shot(7, 0.95)
+        self._run()
+        self.assertEqual(self._picks(), {theirs})
+
+    def test_a_star_set_in_lightroom_counts_the_same(self) -> None:
+        """It is the same judgement, made in another window."""
+        theirs = self._from_the_file(7, 0.20, 5)
+        self._shot(7, 0.95)
+        self._run()
+        self.assertEqual(self._picks(), {theirs})
+
+    def test_the_measure_still_separates_two_starred_frames(self) -> None:
+        self._starred(7, 0.20, 4)
+        sharper = self._starred(7, 0.90, 4)
+        self._run()
+        self.assertEqual(self._picks(), {sharper})
+
+    def test_more_stars_beats_fewer(self) -> None:
+        self._starred(7, 0.95, 3)
+        best = self._starred(7, 0.10, 5)
+        self._run()
+        self.assertEqual(self._picks(), {best})
+
+    def test_an_unstarred_pass_is_decided_by_the_measure_as_before(self) -> None:
+        self._shot(7, 0.20)
+        sharp = self._shot(7, 0.95)
+        self._run()
+        self.assertEqual(self._picks(), {sharp})
+
+
 class RunningItAgain(_Pass):
     def test_a_tie_breaks_on_the_earlier_frame(self) -> None:
         """In 36% of passes the top two are within 0.01, so ties are the
