@@ -1382,6 +1382,7 @@ SELECT d.id, d.number, d.number_source, d.number_conf, d.conf, d.cls,
        d.reviewed, d.rejected, d.group_key, d.group_size, d.group_agreement,
        d.colour_hex, d.group_colour_hex, d.sharpness, d.sharpness_verdict,
        d.cull_reason, d.clipped, d.rating, d.rating_verdict, d.stars,
+       d.predicted_stars,
        d.panning, d.background, d.sharp_end, d.uncertain, d.bystander,
        i.path AS image_path, i.id AS image_id, i.camera, i.burst_key,
        -- Whether "which car is the subject" is even a question for this
@@ -1405,11 +1406,17 @@ def _rank_sql() -> str:
     Written out rather than imported because the sort happens in SQLite.
     Generated from STAR_BANDS so that retuning the bands cannot leave the
     sort ordering by numbers nothing else agrees with.
+
+    Three sources, in the order they deserve to be believed: the star the
+    photographer gave, then the one learned from the stars they have given
+    elsewhere, then the focus measure. A prediction never overrules an
+    answer, and the measure is what is left when there is nothing to learn
+    from -- a new machine, or an album nobody has rated yet.
     """
     arms = " ".join(f"WHEN d.rating >= {floor} THEN {stars}"
                     for floor, stars in sharpness_mod.STAR_BANDS)
-    return ("COALESCE(d.stars, CASE WHEN d.rating IS NULL THEN NULL "
-            f"{arms} END)")
+    return ("COALESCE(d.stars, d.predicted_stars, "
+            f"CASE WHEN d.rating IS NULL THEN NULL {arms} END)")
 
 
 _RANK = _rank_sql()
@@ -1551,10 +1558,14 @@ def detections(
         # cannot disagree about how good the frame is. A rating given by
         # hand wins: the measurement is a proposal, the photographer's is
         # the answer.
+        # Same order the sort uses: the answer, then what was learned from
+        # their other answers, then the measure.
         rating_value = item.get("rating")
         item["by_hand"] = item.get("stars") is not None
-        item["stars"] = item.get("stars") or (
-            None if rating_value is None else sharpness_mod.stars_for(rating_value))
+        item["learned"] = (not item["by_hand"]
+                           and item.get("predicted_stars") is not None)
+        item["stars"] = (item.get("stars") or item.get("predicted_stars") or (
+            None if rating_value is None else sharpness_mod.stars_for(rating_value)))
         try:
             item["second_look"] = bool(json.loads(raw_attributes or "{}")
                                        .get("group_second_look"))
@@ -1593,6 +1604,27 @@ class DetectionUpdate(BaseModel):
     reviewed: bool = True
     # 1-5 by hand, or 0 to hand the frame back to the measured rating.
     stars: int | None = Field(default=None, ge=0, le=5)
+
+
+@app.post("/api/taste")
+def learn_taste() -> dict:
+    """Learn this photographer's scale from the frames they have rated.
+
+    Their ratings are their ratings whichever album they were given on, so
+    this is deliberately not per-job. Returns how well the result agrees with
+    ratings it was not shown, which is the only figure worth quoting.
+    """
+    from . import pipeline
+
+    score = pipeline.learn_taste(_state["settings"])
+    if not score:
+        from . import taste as taste_mod
+
+        raise HTTPException(
+            400, f"{taste_mod.ENOUGH_RATINGS} rated frames are needed before "
+                 "Conrod can learn your scale. Rate some in review and try "
+                 "again.")
+    return score
 
 
 @app.post("/api/jobs/{job_id}/group")
@@ -1699,8 +1731,9 @@ def update_detection(det_id: int, body: DetectionUpdate) -> dict:
         # The stars the card should now show, which after clearing a hand
         # rating is the measured one -- not the empty column. Returning the
         # column left the pill reading "-" on a frame the cull had rated.
-        "stars": stars or (None if row["rating"] is None
-                           else sharpness_mod.stars_for(row["rating"])),
+        "stars": stars or row["predicted_stars"] or (
+            None if row["rating"] is None
+            else sharpness_mod.stars_for(row["rating"])),
         "by_hand": stars is not None,
         "who": number_map.describe(number) if number else "",
         "title": analysis.title,

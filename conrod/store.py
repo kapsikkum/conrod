@@ -143,6 +143,11 @@ _MIGRATIONS = [
     # no car in it unrated -- so a shoot's worth of frames the detector found
     # nothing in came back with no opinion of any kind, which is not the same
     # as "fine".
+    # The star this photographer would probably give, learned from the ones
+    # they have given already. Stored rather than computed on read because
+    # sorting is SQL: the order-by has to be able to reach it.
+    ("detections", "predicted_stars", "INTEGER"),
+
     ("images", "sharpness", "REAL"),
     ("images", "rating", "REAL"),
     ("images", "rating_verdict", "TEXT"),

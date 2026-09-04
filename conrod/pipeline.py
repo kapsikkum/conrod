@@ -28,6 +28,7 @@ from . import keywords as keywords_mod
 from . import grouping
 from . import sharpness as sharpness_mod
 from . import similarity
+from . import taste
 from . import store, vlm, vlm_providers
 from .analyze import VehicleAnalysis, analyze
 from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
@@ -542,6 +543,63 @@ def rescore(job_id: int | None, settings: Settings, *,
         on_progress({"stage": "rescore", "done": done, "total": total,
                      "message": f"re-measured {done} crops"})
         return done
+    finally:
+        conn.close()
+
+
+def learn_taste(settings: Settings, *, on_progress: Progress = _noop) -> dict | None:
+    """Fit the photographer's own scale, and apply it across every album.
+
+    Their ratings are their ratings whichever shoot they were given on, so
+    this learns from all of them at once and writes a prediction onto every
+    detection that has an embedding. Frames they rated by hand keep their own
+    star -- a prediction never overrules an answer.
+
+    Returns how well it agrees with ratings it was not shown, or None when
+    there is not enough to learn from yet.
+    """
+    conn = store.connect()
+    try:
+        rated = [dict(r) for r in conn.execute(
+            """SELECT stars, embedding FROM detections
+                WHERE stars IS NOT NULL AND embedding IS NOT NULL
+                  AND embedding != ''""")]
+        vectors, stars = [], []
+        for row in rated:
+            vector = similarity.unpack(row["embedding"])
+            if vector is not None:
+                vectors.append(vector)
+                stars.append(row["stars"])
+        if len(vectors) < taste.ENOUGH_RATINGS:
+            on_progress({"stage": "grouping",
+                         "message": f"{len(vectors)} rated frames so far; "
+                                    f"{taste.ENOUGH_RATINGS} needed before "
+                                    "Conrod can learn your scale"})
+            return None
+
+        model = taste.fit(vectors, stars)
+        if not model:
+            return None
+        taste.save(model)
+        score = taste.agreement(vectors, stars)
+
+        rows = [dict(r) for r in conn.execute(
+            """SELECT id, embedding FROM detections
+                WHERE embedding IS NOT NULL AND embedding != ''""")]
+        written = 0
+        for row in rows:
+            guess = taste.predict(model, similarity.unpack(row["embedding"]))
+            if guess is not None:
+                conn.execute("UPDATE detections SET predicted_stars=? WHERE id=?",
+                             (guess, row["id"]))
+                written += 1
+        conn.commit()
+        if score:
+            on_progress({"stage": "grouping",
+                         "message": f"learned from {score['n']} of your ratings: "
+                                    f"agrees within one star "
+                                    f"{score['within_one'] * 100:.0f}% of the time"})
+        return score
     finally:
         conn.close()
 

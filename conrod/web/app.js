@@ -506,6 +506,26 @@ $("#btn-reset-settings").onclick = async () => {
   toast("Settings reset to defaults");
 };
 
+// Fit the star ratings to the ones the photographer has actually given.
+// Reports agreement on ratings the fit was not shown, because agreement with
+// the frames it trained on is a flattering number that means nothing.
+$("#btn-learn").onclick = async () => {
+  const button = $("#btn-learn");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Learning…";
+  try {
+    const out = await api("/api/taste", { method: "POST" });
+    toast(`Learned from ${out.n} of your ratings — agrees within one star `
+          + `${Math.round(out.within_one * 100)}% of the time`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+};
+
 // Throw away the found cars, keep the albums. The common case by far: a
 // setting changed, or the identification was wrong, and the answer is to run
 // it again rather than to re-read two thousand RAWs first.

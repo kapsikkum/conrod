@@ -44,7 +44,10 @@ class TheStarColumn(unittest.TestCase):
         vehicle until the grid was reloaded."""
         source = Path(server.__file__).read_text(encoding="utf-8")
         body = source[source.index("def update_detection"):]
-        self.assertIn('"stars": stars or (None if row["rating"] is None', body)
+        # The chain, not one exact line: hand rating, then the star learned
+        # from the photographer's other ratings, then the measured one.
+        self.assertIn('"stars": stars or row["predicted_stars"] or (', body)
+        self.assertIn('sharpness_mod.stars_for(row["rating"])', body)
         self.assertIn('"by_hand": stars is not None', body)
 
     def test_the_api_refuses_a_rating_off_the_scale(self) -> None:
@@ -70,8 +73,10 @@ class SortingByStar(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE detections (id INTEGER PRIMARY KEY,"
-                     " rating REAL, stars INTEGER)")
-        conn.executemany("INSERT INTO detections VALUES (?,?,?)", rows)
+                     " rating REAL, stars INTEGER, predicted_stars INTEGER)")
+        conn.executemany(
+            "INSERT INTO detections (id, rating, stars) VALUES (?,?,?)",
+            rows)
         return conn
 
     def _order(self, conn, how):
@@ -142,8 +147,10 @@ class FilteringByStar(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE detections (id INTEGER PRIMARY KEY,"
-                     " rating REAL, stars INTEGER)")
-        conn.executemany("INSERT INTO detections VALUES (?,?,?)", rows)
+                     " rating REAL, stars INTEGER, predicted_stars INTEGER)")
+        conn.executemany(
+            "INSERT INTO detections (id, rating, stars) VALUES (?,?,?)",
+            rows)
         return conn
 
     def _at_least(self, conn, n):
