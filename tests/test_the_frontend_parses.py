@@ -42,14 +42,26 @@ class TheMarkupIsWiredToTheCode(unittest.TestCase):
     line after it throwing, which takes the rest of the file with it.
     """
 
-    def test_every_button_the_code_binds_is_in_the_page(self) -> None:
+    def test_every_element_the_code_reaches_for_is_in_the_page(self) -> None:
+        """Every $("#id"), not only the ones an onclick is hung on.
+
+        This started life checking onclick bindings and would not have caught
+        the bug it was written for. A "Not the main car" button was removed
+        from the page when Reject was rewired to do that job, and the line
+        that set its .hidden stayed behind. It threw on every attempt to open
+        a frame, which took the whole full-frame view down with it -- clicking
+        a picture to see it larger stopped working, in a shipped release, and
+        nothing anywhere said why.
+        """
         import re
 
         code = (WEB / "app.js").read_text(encoding="utf-8")
         html = (WEB / "index.html").read_text(encoding="utf-8")
-        bound = set(re.findall(r'\$\("#([a-z0-9-]+)"\)\.onclick', code))
-        missing = sorted(i for i in bound if f'id="{i}"' not in html)
-        self.assertEqual(missing, [], f"bound in app.js, absent from the page: {missing}")
+        wanted = set(re.findall(r'\$\("#([A-Za-z0-9_-]+)"\)', code))
+        missing = sorted(i for i in wanted if f'id="{i}"' not in html)
+        self.assertEqual(
+            missing, [],
+            f"app.js reaches for these, and the page has none of them: {missing}")
 
 
 if __name__ == "__main__":

@@ -137,6 +137,15 @@ _MIGRATIONS = [
     # opening a single crop again -- which is what makes "Group cars" cheap
     # enough to press after every correction.
     ("detections", "embedding", "TEXT"),
+
+    # The frame's own sharpness, for frames with no vehicle in them at all.
+    # The cull measures the car, which is right, and leaves a photograph with
+    # no car in it unrated -- so a shoot's worth of frames the detector found
+    # nothing in came back with no opinion of any kind, which is not the same
+    # as "fine".
+    ("images", "sharpness", "REAL"),
+    ("images", "rating", "REAL"),
+    ("images", "rating_verdict", "TEXT"),
 ]
 
 

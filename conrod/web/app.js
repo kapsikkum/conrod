@@ -2041,33 +2041,14 @@ function renderFrame() {
     : "Reject this vehicle. Nothing is written to the photograph either way.";
   rejectBtn.onclick = () => cutCard(node, !cut);
 
-  /* A frame can hold several vehicles, and only one of them is what the
-     photograph is of. Rejecting the others is the wrong tool -- reject is
-     a judgement about the frame, and it was taking the frame's own subject
-     down with it. This says "not this car" instead: it leaves the vehicle
-     and stops speaking for the frame, and the frame is untouched. */
-  const bystanderBtn = $("#frame-bystander");
-  const many = (item.in_frame || 1) > 1;
-  bystanderBtn.hidden = !many;
-  if (many) {
-    const isBystander = Boolean(item.bystander);
-    bystanderBtn.textContent = isBystander ? "Is the main car" : "Not the main car";
-    bystanderBtn.classList.toggle("on", isBystander);
-    bystanderBtn.onclick = async () => {
-      const now = !item.bystander;
-      try {
-        await api(`/api/detections/${item.id}`, {
-          method: "POST",
-          body: JSON.stringify({ bystander: now, reviewed: true }),
-        });
-        item.bystander = now;
-        node.classList.toggle("bystander", now);
-        toast(now ? "Taken out of this vehicle" : "Back in this vehicle");
-        renderFrame();
-        loadSummary();
-      } catch (err) { toast(err.message); }
-    };
-  }
+  /* A frame holding several vehicles used to get its own "Not the main car"
+     button here. Reject was rewired to do that job instead -- on a frame
+     with other cars in it, Reject takes this car out and leaves the frame
+     alone -- so the button went, and this is what is left of it.
+
+     The button went from the page and this line did not, which threw on
+     every attempt to open a frame and took the whole full-frame view with
+     it: clicking a picture to see it larger simply stopped working. */
 
   const { all, at } = frameSiblings();
   $("#frame-pos").textContent = all.length > 1 ? `${at + 1} of ${all.length}` : "";

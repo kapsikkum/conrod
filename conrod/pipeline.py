@@ -385,6 +385,22 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
                         except queue.Full:
                             continue
 
+                # A frame with no vehicle in it still gets an opinion. The
+                # cull measures the car, which is the right question when
+                # there is one -- but the detector finding nothing is not the
+                # same as the photograph being fine, and leaving it unrated
+                # meant a run of empty frames came back with no verdict of
+                # any kind and sorted alongside the keepers.
+                #
+                # Measured on the whole frame, which is the honest fallback:
+                # with no subject to point at there is nothing to measure but
+                # the picture. It is not compared against the crops -- a
+                # whole-frame number and a subject number are different
+                # questions -- so it lives on the image rather than being
+                # mixed into the detections.
+                if not boxes:
+                    _rate_whole_frame(conn, image_id, source, settings)
+
                 on_progress({"stage": "frame", "done": index, "total": len(files),
                              "frame": {"name": path.name, "preview": str(source),
                                        "phase": "detected" if boxes else "empty",
@@ -878,6 +894,36 @@ def _focus_of(crop_path, settings, box=None, crop_box=None):
         return None
 
 
+def _rate_whole_frame(conn, image_id: int, source, settings: Settings) -> None:
+    """Sharpness of a photograph with no vehicle in it.
+
+    Measured on the frame itself, since there is no subject to point at. The
+    result is deliberately not a detection: a whole-frame score and a subject
+    score answer different questions and are not comparable, and writing this
+    into the detections table would put them on one scale and let an empty
+    frame outrank a car.
+
+    Never worth failing a frame over -- an unreadable preview is a frame with
+    no score, not a scan that stops.
+    """
+    try:
+        with Image.open(source) as frame:
+            frame.load()
+            focus = sharpness_mod.rate(frame, settings)
+    except Exception:
+        return
+    if not focus:
+        return
+    verdict = sharpness_mod.rating_for(
+        focus.score, settings.sharp_at, settings.blurred_below)
+    try:
+        conn.execute(
+            "UPDATE images SET sharpness=?, rating=?, rating_verdict=? WHERE id=?",
+            (focus.score, focus.score, verdict, image_id))
+    except Exception:
+        pass
+
+
 def _record_origins(conn, job_id: int, files, on_progress, settings,
                     should_stop=None) -> None:
     """Work out which camera took each frame and which burst it belongs to.
@@ -1110,11 +1156,13 @@ def _analysis_worker(work, settings: Settings, counters: dict,
 # out of the write the way it used to be.
 WRITE_QUERY = """
 SELECT i.id AS image_id, i.path AS path, d.attributes AS attributes,
-       d.rejected AS rejected, d.rating AS rating,
-       d.rating_verdict AS rating_verdict, d.panning AS panning,
+       d.rejected AS rejected,
+       COALESCE(d.rating, i.rating) AS rating,
+       COALESCE(d.rating_verdict, i.rating_verdict) AS rating_verdict,
+       d.panning AS panning,
        d.stars AS stars, d.bystander AS bystander
   FROM images i
-  JOIN detections d ON d.image_id = i.id
+  LEFT JOIN detections d ON d.image_id = i.id
  WHERE i.job_id = ?
  ORDER BY i.id, d.id
 """
