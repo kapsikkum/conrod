@@ -213,7 +213,8 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             conn.commit()
             return JobSummary(job_id, 0, 0, 0)
 
-        _record_origins(conn, job_id, files, on_progress, settings)
+        _record_origins(conn, job_id, files, on_progress, settings,
+                        should_stop)
 
         previews = _prepare_previews(files, on_progress, settings)
 
@@ -823,7 +824,8 @@ def _focus_of(crop_path, settings, box=None, crop_box=None):
         return None
 
 
-def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
+def _record_origins(conn, job_id: int, files, on_progress, settings,
+                    should_stop=None) -> None:
     """Work out which camera took each frame and which burst it belongs to.
 
     One exiftool pass over the whole shoot, before anything is analysed. Two
@@ -869,9 +871,24 @@ def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
     on_progress({"stage": "cameras",
                  "message": "reading camera, capture times and existing ratings"
                             if want_marks else "reading camera and capture times"})
+    # Read in chunks and say so. One call for the whole shoot is faster in
+    # theory and unusable in practice: 6,000 frames is minutes of opening
+    # RAW files during which the screen showed a full progress bar, "about
+    # 0s left" and no sign of life. culling.read_culls already chunks for
+    # exactly this reason; this pass did not, and neither did the ratings
+    # pass that was added beside it.
+    total = len(files)
+    rows = []
     try:
         with ExifTool() as tool:
-            rows = tool.read_tags(files, wanted)
+            for start in range(0, total, culling.CULL_CHUNK):
+                if should_stop and should_stop():
+                    return
+                batch = files[start:start + culling.CULL_CHUNK]
+                rows += tool.read_tags(batch, wanted)
+                done = min(start + culling.CULL_CHUNK, total)
+                on_progress({"stage": "cameras", "done": done, "total": total,
+                             "message": f"read {done}/{total} frames"})
     except Exception as exc:                      # exiftool missing or unhappy
         on_progress({"stage": "cameras",
                      "message": f"could not read capture times: {exc}"})
@@ -889,7 +906,7 @@ def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
                     f"{len(cameras)} camera{'' if len(cameras) == 1 else 's'}")
 
     if want_marks:
-        marks = _existing_marks(files, rows)
+        marks = _existing_marks(files, rows, on_progress, should_stop)
         rated = store.set_existing_marks(conn, job_id, marks)
         if rated:
             said.append(f"{rated} frame{'' if rated == 1 else 's'} already rated")
@@ -898,23 +915,53 @@ def _record_origins(conn, job_id: int, files, on_progress, settings) -> None:
         on_progress({"stage": "cameras", "message": ", ".join(said)})
 
 
-def _existing_marks(files) -> dict:
+def _existing_marks(files, rows, on_progress=_noop, should_stop=None) -> dict:
     """The rating and label each frame already carries, sidecar first.
 
-    Reads through culling.read_culls rather than repeating it. A RAW is not
-    where Lightroom puts a rating -- it writes an .xmp beside the file and
-    leaves the original untouched -- and read_culls already knows that, along
-    with the XMP:Rating fallback and the chunking that keeps a 6,000-frame
-    read from looking hung. Measured on one shoot: all 1,833 CR3s reported 0
-    and their sidecars held 310 fives and nine ones, so a reader that asks
-    the RAW alone finds nothing on a shoot that has been rated for weeks.
+    A RAW is not where Lightroom puts a rating -- it writes an .xmp beside
+    the file and leaves the original untouched. Measured on one shoot: all
+    1,833 CR3s reported 0 while their sidecars held 310 fives and nine ones,
+    so a reader that asks only the RAW finds nothing on a shoot that has been
+    rated for weeks.
+
+    ``rows`` is what the burst pass already read off the images themselves,
+    and the mark tags were asked for in that same call -- so a frame with no
+    sidecar is already answered and does not need opening twice. Only the
+    files that actually have a sidecar are read again, through
+    culling.read_culls, which knows the sidecar rule and the XMP:Rating
+    fallback. On a shoot straight off the card that is no second pass at all;
+    on one that has been through Lightroom it is a pass over small text files
+    rather than over six thousand RAWs.
     """
+    marks = {}
+    for row in rows:                          # what the images said themselves
+        source = row.get("SourceFile")
+        if source:
+            marks[os.path.normcase(os.path.normpath(source))] = (
+                row.get("Rating"), row.get("Label"))
+
+    by_key = {os.path.normcase(os.path.normpath(str(f))): f for f in files}
+    out = {}
+    for key, path in by_key.items():
+        rating, label = marks.get(key, (None, None))
+        out[str(path)] = (rating, label)
+
+    sidecars = [f for f in files if culling.sidecar_for(Path(f)).exists()]
+    if not sidecars:
+        return out
+
+    def tick(done: int, of: int) -> None:
+        on_progress({"stage": "cameras", "done": done, "total": of,
+                     "message": f"checked {done}/{of} sidecars for ratings"})
+
     try:
         with ExifTool() as tool:
-            found = culling.read_culls(list(files), tool)
+            found = culling.read_culls(sidecars, tool, tick)
     except Exception:            # worth having, not worth failing a scan over
-        return {}
-    return {str(path): (cull.rating, cull.label) for path, cull in found.items()}
+        return out
+    for path, cull in found.items():
+        out[str(path)] = (cull.rating, cull.label)
+    return out
 
 
 def _analysis_worker(work, settings: Settings, counters: dict,
