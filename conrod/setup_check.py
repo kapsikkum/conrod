@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import importlib.util
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -52,6 +53,34 @@ class Environment:
         }
 
 
+def _reader_check(key: str, label: str, wanted: bool,
+                  modules, detail: str) -> Check:
+    """Whether a reader can actually run, rather than whether it is switched on.
+
+    ``modules`` is (import name, what it does) pairs. Checked by importlib
+    rather than by importing them: this runs on the way to the first screen
+    and some of these pull onnxruntime with them, which is not a cost worth
+    paying to answer a question about whether a file exists.
+
+    Never required. A shoot still scans, rates and identifies without any of
+    this -- it just will not read plates or numbers, which is a thing to say
+    plainly rather than to leave someone to infer from an empty column.
+    """
+    if not wanted:
+        return Check(key, label, True, "turned off in settings", required=False)
+
+    missing = [(name, does) for name, does in modules
+               if importlib.util.find_spec(name) is None]
+    if not missing:
+        return Check(key, label, True, detail, required=False)
+    return Check(
+        key, label, False,
+        "not installed: " + ", ".join(f"{name} ({does})" for name, does in missing)
+        + ". Nothing will be read off a plate until it is there —"
+        " pip install -r requirements.txt",
+        required=False)
+
+
 def inspect(settings: Settings) -> Environment:
     """Everything the app needs, and whether it is here."""
     env = Environment()
@@ -80,11 +109,24 @@ def inspect(settings: Settings) -> Environment:
            else " — will download on first run, about 19 MB"),
         required=False, fix=None if weights.exists() else "download_weights"))
 
-    # --- plate detector: downloaded by its own package on first use ---
-    env.checks.append(Check(
-        "plates", "Plate detector", True,
-        f"{settings.plate_model} — 7.5 MB, downloads on first use",
-        required=False))
+    # --- plate and text reading: the packages are what decide this ---
+    #
+    # This used to report True unconditionally, which made it worse than no
+    # check at all. The imports behind plates and OCR are deliberately lazy,
+    # so a missing one does not break the build or raise anywhere a person
+    # would see it -- reading simply stops happening, and the app goes on
+    # saying "Plate detector: downloads on first use" while returning nothing
+    # on every frame of the shoot. That is how 0.1.0 shipped without plate
+    # reading, and requirements.txt has a note about it.
+    env.checks.append(_reader_check(
+        "plates", "Plate reading", settings.read_plates,
+        (("open_image_models", "finding the plate"),
+         ("fast_plate_ocr", "reading the characters")),
+        f"{settings.plate_model} — 7.5 MB, downloads on first use"))
+    env.checks.append(_reader_check(
+        "ocr", "Number and text reading", settings.read_numbers or settings.read_text,
+        (("rapidocr_onnxruntime", "reading numbers and livery text"),),
+        "PaddleOCR models on onnxruntime"))
 
     # --- The vision model: optional, but this is the good part ---
     if not settings.use_vlm:

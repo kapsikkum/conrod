@@ -17,7 +17,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from conrod import pipeline
+from conrod import grouping, pipeline
 from conrod.config import Settings
 
 
@@ -72,3 +72,53 @@ class TheCheckpoint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheOwnReadingSnapshot(unittest.TestCase):
+    """What each frame's own reader said, kept safe from the group's answer.
+
+    Grouping records own_make before it overwrites make, so a bad merge can
+    be undone. Once grouping started running at checkpoints *during* a scan
+    rather than only at the end, the first checkpoint fired before anything
+    had been identified -- and a plain setdefault froze own_make=None onto
+    every detection in the album. The key then existed, so no later pass
+    replaced it, and every regroup afterwards voted on blanks: 46 frames
+    that all said Kawasaki Ninja ZX-6R reported nothing agreed.
+    """
+
+    def test_a_blank_is_not_recorded_as_a_reading(self) -> None:
+        """The snapshot has to wait until there is something to snapshot."""
+        current = {"make": None, "model": None, "colour": None}
+        grouping.remember_own_reading(current)
+        self.assertNotIn("own_make", current)
+
+        current["make"] = "Kawasaki"
+        grouping.remember_own_reading(current)
+        self.assertEqual(current["own_make"], "Kawasaki")
+
+    def test_a_real_reading_is_never_overwritten(self) -> None:
+        """The whole point of the snapshot: the group must not eat it."""
+        current = {"make": "Hyundai", "own_make": "Hyundai"}
+        current["make"] = "Kawasaki"          # a bad merge writes its answer
+        grouping.remember_own_reading(current)
+        self.assertEqual(current["own_make"], "Hyundai")
+
+    def test_a_group_that_all_says_the_same_thing_agrees_completely(self) -> None:
+        members = [{"make": "Kawasaki", "model": "Ninja ZX-6R"} for _ in range(46)]
+        self.assertEqual(grouping.consensus(members).agreement, 1.0)
+
+    def test_a_poisoned_blank_does_not_silence_a_named_frame(self) -> None:
+        """Albums written before the fix carry own_make=None on every row.
+
+        Reading that back as the frame's opinion is what has to stop, or the
+        shoot stays stuck at nothing-agreed even once it is identified.
+        """
+        parsed = {"make": "Kawasaki", "own_make": None}
+        grouping.use_own_reading(parsed)
+        self.assertEqual(parsed["make"], "Kawasaki")
+
+    def test_a_real_own_reading_still_wins_over_a_group_answer(self) -> None:
+        """The protection this was built for has to survive the fix."""
+        parsed = {"make": "Kawasaki", "own_make": "Hyundai"}
+        grouping.use_own_reading(parsed)
+        self.assertEqual(parsed["make"], "Hyundai")

@@ -517,6 +517,47 @@ def _vote(values: list[str | None]) -> tuple[str | None, float]:
     return None, 0.0
 
 
+# The fields a frame reads for itself and a group can later overrule.
+OWN_FIELDS = ("make", "model", "colour")
+
+
+def remember_own_reading(current: dict) -> None:
+    """Keep what this frame's own reader said, before the group overwrites it.
+
+    Only ever records an answer, never the absence of one. A plain setdefault
+    was wrong the moment grouping started running at checkpoints during a
+    scan rather than once at the end: the first checkpoint fires before
+    anything has been identified, so it wrote own_make=None onto every
+    detection in the album -- and because the key then existed, no later pass
+    replaced it. Every regroup afterwards read that None back as "this frame
+    saw nothing", so 46 frames that all said Kawasaki Ninja ZX-6R voted on 46
+    blanks and the group reported nothing agreed.
+
+    A reading already stored is never overwritten. That is the point of it:
+    once a motorbike and a silver SUV were wrongly grouped, the bike's name
+    was written into the SUV's own record and no amount of regrouping could
+    get "Hyundai" back, because the evidence was gone.
+    """
+    for field in OWN_FIELDS:
+        value = current.get(field)
+        if value and not current.get(f"own_{field}"):
+            current[f"own_{field}"] = value
+
+
+def use_own_reading(parsed: dict) -> None:
+    """Vote on what each frame read, not on a previous round's group answer.
+
+    Otherwise a bad merge reinforces itself. An own_ value of None is not a
+    reading though, it is the absence of one, and substituting it silences a
+    frame that has since been identified -- so a blank falls through to what
+    the frame currently says. That is also what heals an album written before
+    remember_own_reading stopped recording blanks.
+    """
+    for field in OWN_FIELDS:
+        if parsed.get(f"own_{field}"):
+            parsed[field] = parsed[f"own_{field}"]
+
+
 def consensus(members: list[dict]) -> Consensus:
     """The group's agreed identity.
 
@@ -665,11 +706,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
             conn.execute("UPDATE detections SET signature=? WHERE id=?",
                          (sig, row["id"]))
         parsed = json.loads(row["attributes"] or "{}")
-        # Vote on what each frame's own reader said, not on a previous
-        # round's group answer, or a bad merge would reinforce itself.
-        for field_name in ("make", "model", "colour"):
-            if f"own_{field_name}" in parsed:
-                parsed[field_name] = parsed[f"own_{field_name}"]
+        use_own_reading(parsed)
         parsed["colour_hex"] = row["colour_hex"]
         attributes[row["id"]] = parsed
         crops[row["id"]] = (row["crop_path"], row["sharpness"] or 0.0)
@@ -745,9 +782,7 @@ def consolidate(conn, job_id: int, settings=None) -> dict:
             # wrongly grouped, the bike's name was written into the SUV's
             # own record, and no amount of regrouping afterwards could get
             # "Hyundai" back, because the evidence was gone.
-            current.setdefault("own_make", current.get("make"))
-            current.setdefault("own_model", current.get("model"))
-            current.setdefault("own_colour", current.get("colour"))
+            remember_own_reading(current)
             current["group_make"] = agreed.make
             current["group_model"] = agreed.model
             current["make"] = agreed.make or current.get("own_make")

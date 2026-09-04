@@ -42,9 +42,26 @@ from PIL import Image
 # them, few enough that each still holds real detail at thumbnail sizes.
 TILE_GRID = 6
 
-# The background is measured on a finer grid, because the crop is padded by
-# less than a fifth and a coarse tile almost always catches some of the car.
-BACKGROUND_GRID = 16
+# The background is measured in tiles the same size as the subject's, not on
+# a grid of its own. This used to be a fixed sixteen, which sounds harmless
+# and was not: the per-tile figure is gradient energy over contrast squared,
+# and that ratio depends on tile size. A small tile holds a higher fraction
+# of whatever edge is in it, so a fine grid reports a systematically higher
+# number than a coarse one for the same content, and comparing a 16-grid
+# background against a 6-grid subject compares two different scales.
+#
+# It made the background of a panning shot score *above* its subject --
+# median margin -0.126 where a held pan is supposed to run well positive --
+# so pan detection had been dead for as long as it had existed: two frames
+# in 1,720 of a shoot that is almost entirely panning. Sized to match, the
+# same frames run +0.223 and 72 of 120 read as pans.
+#
+# The fixed grid was introduced because the crop is padded by less than a
+# fifth, so a coarse tile almost always catches some of the car and nothing
+# survives the overlap rule. That is still true and is still the constraint:
+# where too few tiles survive the background is reported as unmeasured,
+# which is honest, rather than measured on a scale that does not match.
+BACKGROUND_MIN_TILES = 2
 
 # Which tile speaks for the crop. The maximum is too eager -- one specular
 # highlight or a sharp-edged sticker on an otherwise soft car will hit it --
@@ -61,9 +78,9 @@ TILE_PERCENTILE = 80
 # never useful.
 MIN_TILE_CONTRAST = 1.5
 
-# The crop is resized so the measure means the same thing on a 300px crop and
-# a 3000px one. Without it a big crop scores higher for being big.
-# How big the crop is when it is measured. Raised from 512, which was
+# How big the crop is when it is measured. Resized so the measure means the
+# same thing on a 300px crop and a 3000px one; without it a big crop scores
+# higher for being big. Raised from 512, which was
 # quietly the largest fault in the cull: a saved crop runs to 2048px, so the
 # vehicle inside it was being shrunk by four before anything looked at it,
 # and a smear of twenty pixels came back as five. Two real frames of one
@@ -277,17 +294,19 @@ def _background_score(data: np.ndarray, inner) -> float:
     they hold both the car and what is behind it, and on a pan that is the
     one place the two cannot be told apart.
 
-    On a finer grid than the subject uses, and for a reason found by running
-    it: the crop is padded by less than a fifth, so on a six by six grid
-    almost every tile touches the vehicle, nothing survives the overlap rule
-    and the background comes back unmeasured on every frame. That silently
-    turned off pan detection altogether -- it was reporting "no background"
-    for all seventeen vehicles of a test shoot.
+    In tiles the size of the subject's, so that the two numbers mean the
+    same thing and can be subtracted -- see BACKGROUND_MIN_TILES for what
+    went wrong when they were not.
     """
     x1, y1, x2, y2 = inner
     height, width = data.shape
-    rows = np.array_split(np.arange(height), BACKGROUND_GRID)
-    cols = np.array_split(np.arange(width), BACKGROUND_GRID)
+    # The subject's own tile size, in pixels, which is the unit the two
+    # scores have to share.
+    tile_px = max(y2 - y1, x2 - x1) / TILE_GRID
+    if tile_px <= 0:
+        return -1.0
+    rows = np.array_split(np.arange(height), max(2, round(height / tile_px)))
+    cols = np.array_split(np.arange(width), max(2, round(width / tile_px)))
     energy = _focus_map(data)
 
     scores: list[float] = []
@@ -306,7 +325,7 @@ def _background_score(data: np.ndarray, inner) -> float:
             scores.append(float(energy[r0:r1, c0:c1].mean())
                           / (contrast * contrast))
 
-    if len(scores) < 2:
+    if len(scores) < BACKGROUND_MIN_TILES:
         return -1.0
     return _normalise(float(np.percentile(scores, TILE_PERCENTILE)))
 

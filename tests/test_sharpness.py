@@ -185,11 +185,15 @@ class PanningShots(unittest.TestCase):
 
     @staticmethod
     def _frame(subject_sharp: bool, background_sharp: bool, size=(600, 400)):
-        """A crop with a vehicle-sized box in it, each part blurred or not."""
+        """A crop with a vehicle-sized box in it, each part blurred or not.
+
+        On the photographic fixture, not white noise: noise carries energy up
+        to the sampling limit, so six pixels of blur still measured 1.0 and
+        the smeared background scored exactly as high as the sharp car. See
+        _photo_texture.
+        """
         from PIL import ImageFilter
-        rng = np.random.default_rng(7)
-        noise = rng.integers(0, 255, (size[1], size[0]), dtype=np.uint8)
-        img = Image.fromarray(noise, "L").convert("RGB")
+        img = _photo_texture(size[0], size[1])
         box = (150, 100, 450, 300)
 
         def maybe_blur(part, sharp):
@@ -217,6 +221,29 @@ class PanningShots(unittest.TestCase):
     def test_a_sharp_car_against_a_sharp_background_is_not_a_pan(self) -> None:
         image, box = self._frame(subject_sharp=True, background_sharp=True)
         self.assertFalse(sharpness.measure(image, box).panning)
+
+    def test_subject_and_background_are_measured_on_the_same_scale(self) -> None:
+        """The two are subtracted, so they have to mean the same thing.
+
+        The per-tile figure is gradient energy over contrast squared, and
+        that ratio depends on tile size: a smaller tile holds a higher
+        fraction of whatever edge is in it. Measuring the background on a
+        fixed 16-grid against a 6-grid subject therefore compared two
+        different scales, and did it silently -- the background of a pan
+        scored above its own subject, and pan detection was dead for two
+        frames in 1,720 of a shoot that is almost entirely panning.
+
+        Checked on identical content either side of the box: same picture,
+        same blur, so any gap between the two numbers is the measurement
+        disagreeing with itself.
+        """
+        image, box = self._frame(subject_sharp=True, background_sharp=True)
+        out = sharpness.measure(image, box)
+        self.assertGreaterEqual(out.background, 0.0, "background not measured")
+        self.assertLess(
+            abs(out.score - out.background), sharpness.PAN_MARGIN,
+            f"same content scored {out.score} as subject and "
+            f"{out.background} as background")
 
     def test_the_background_does_not_decide_the_subject_score(self) -> None:
         """The complaint this was built for.
