@@ -893,8 +893,31 @@ _watcher: watch.Watcher | None = None
 _watch_wake = threading.Event()
 
 
+def _album_exists(job_id) -> bool:
+    if job_id is None:
+        return False
+    try:
+        conn = store.connect()
+        try:
+            return conn.execute("SELECT 1 FROM jobs WHERE id=?",
+                                (job_id,)).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        # Not knowing is not proof it is gone, and turning a watch off on a
+        # locked database would be worse than one wasted pass.
+        return True
+
+
 def _stage_for_album(job_id: int) -> str:
-    """How far a watched album is being taken, so new frames match the rest."""
+    """How far a watched album is being taken, so new frames match the rest.
+
+    An album nobody recognises gets the *cheapest* answer, not the most
+    expensive one. This used to fall through to "all" for a missing job,
+    which meant the one case where the watch had lost track of what it was
+    watching was also the case where it committed the machine to a full
+    scan, vision model and all.
+    """
     try:
         conn = store.connect()
         try:
@@ -903,7 +926,9 @@ def _stage_for_album(job_id: int) -> str:
         finally:
             conn.close()
     except Exception:
-        return "all"
+        return "index"
+    if row is None:
+        return "index"
     status = (row["status"] if row else "") or ""
     if status == "indexed":
         return "index"
@@ -932,6 +957,20 @@ def _watch_loop(generation: int) -> None:
             break
         if _run["active"] or _watcher is None:
             continue                     # a scan is already using the folder
+        # The album this watch belongs to. Deleted albums were the whole of
+        # a real runaway: the job was gone, so _known_frames returned an
+        # empty set, so every one of 6,578 frames looked new on every pass,
+        # and the watch launched a fresh full scan of the folder once a
+        # minute for ever -- reporting "6578 new frames" each time and
+        # counting 13,156 added. A watch with nothing to add to is finished,
+        # not idle.
+        if not _album_exists(_watch["job_id"]):
+            _watch["active"] = False
+            _watch["message"] = ("the album this was watching has been "
+                                 "deleted, so watching stopped")
+            note(f"watch: {_watch['message']}", "warn")
+            _forget_watch_setting()
+            break
         try:
             found = _watcher.poll(known=_known_frames(_watch["job_id"]))
             _watch["checked"] = time.time()
@@ -956,6 +995,21 @@ def _watch_loop(generation: int) -> None:
         except Exception as exc:         # a watch must not die on one bad pass
             _watch["message"] = f"{type(exc).__name__}: {exc}"
             note(f"watch: {_watch['message']}", "warn")
+
+
+def _forget_watch_setting() -> None:
+    """Take a dead watch out of settings.json as well as out of memory.
+
+    Otherwise it comes straight back on the next launch: _restore_watch reads
+    it, starts the loop, and the same minute-by-minute rescan begins again on
+    an album that has not existed for days.
+    """
+    try:
+        settings: Settings = _state["settings"]
+        if settings.extra.pop("watch", None) is not None:
+            settings.save()
+    except Exception:
+        pass
 
 
 class WatchRequest(BaseModel):
@@ -1462,6 +1516,16 @@ def reset_everything() -> dict:
         # ON DELETE CASCADE clears images and detections with the jobs.
         conn.execute("DELETE FROM jobs")
 
+    # Every album is gone, so any watch is watching nothing. Same reasoning
+    # as delete_job: a watch that outlives its album re-adds the whole
+    # folder once a minute, for ever.
+    if _watch.get("active"):
+        _watch["active"] = False
+        _watch["generation"] = _watch.get("generation", 0) + 1
+        _watch["message"] = "every album was reset, so watching stopped"
+        _watch_wake.set()
+        _forget_watch_setting()
+
     removed = 0
     for path in crops:
         for candidate in (Path(path), *Path(path).parent.glob(
@@ -1499,6 +1563,16 @@ def delete_job(job_id: int) -> dict:
                 WHERE i.job_id = ? AND d.crop_path IS NOT NULL""", (job_id,))]
         # ON DELETE CASCADE clears images and detections with the job.
         conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    # A watch outliving the album it was watching is how a folder came to be
+    # re-added every sixty seconds for ever. Stop it here as well as in the
+    # loop, so it never gets even one pass on a job that is gone.
+    if _watch.get("job_id") == job_id and _watch.get("active"):
+        _watch["active"] = False
+        _watch["generation"] = _watch.get("generation", 0) + 1
+        _watch["message"] = "the album this was watching was deleted"
+        _watch_wake.set()
+        _forget_watch_setting()
 
     removed = 0
     for path in crops:
