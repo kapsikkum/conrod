@@ -76,6 +76,25 @@ class WhatItDoesAndDoesNot(unittest.TestCase):
                               "scan("):
             self.assertNotIn(reading_files, source)
 
+    def test_it_also_measures_frames_with_no_vehicle(self) -> None:
+        """They have no crop, so a pass that only walks crops skips them
+        entirely -- and on an album culled before the whole-frame fallback
+        existed there were 149 such frames carrying no rating at all, with
+        no way to fill them in short of scanning the photographs again.
+
+        This is where a detail shot lands when the detector does not
+        recognise it as a car: a close-up of a wheel, a badge, an exhaust.
+        """
+        source = inspect.getsource(pipeline.rescore)
+        self.assertIn("_rate_whole_frame", source)
+        self.assertIn("NOT EXISTS", source)
+
+    def test_it_leaves_frames_that_already_have_one(self) -> None:
+        """Re-running must not undo a whole-frame rating, and must not cost
+        a re-read of every empty frame in the album each time."""
+        source = inspect.getsource(pipeline.rescore)
+        self.assertIn("i.rating IS NULL", source)
+
     def test_a_star_given_by_hand_is_not_touched(self) -> None:
         """It is in a different column and was never on this scale."""
         source = inspect.getsource(pipeline.rescore)

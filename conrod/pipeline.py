@@ -567,8 +567,36 @@ def rescore(job_id: int | None, settings: Settings, *,
                 on_progress({"stage": "rescore", "done": done, "total": total,
                              "message": f"re-measured {done}/{total}"})
         conn.commit()
+
+        # And the frames with no vehicle in them at all, which have no crop
+        # to re-measure and so were skipped entirely. A detail shot the
+        # detector does not recognise as a car lands here, as does every
+        # trackside frame -- and on an album culled before the whole-frame
+        # fallback existed there were 149 of them carrying no rating, no
+        # verdict and no colour, with no way to fill them in short of
+        # scanning the photographs again.
+        empty = conn.execute(
+            f"""SELECT i.id, COALESCE(i.preview_path, i.path) AS source
+                  FROM images i {where}
+                   {'AND' if where else 'WHERE'} i.status = 'detected'
+                   AND i.rating IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM detections d
+                                    WHERE d.image_id = i.id)""", args).fetchall()
+        for n, row in enumerate(empty, start=1):
+            if should_stop and should_stop():
+                break
+            _rate_whole_frame(conn, row["id"], row["source"], settings)
+            if n % 50 == 0:
+                conn.commit()
+                on_progress({"stage": "rescore", "done": n, "total": len(empty),
+                             "message": f"measuring frames with no vehicle "
+                                        f"{n}/{len(empty)}"})
+        conn.commit()
+
         on_progress({"stage": "rescore", "done": done, "total": total,
-                     "message": f"re-measured {done} crops"})
+                     "message": f"re-measured {done} crops"
+                                + (f" and {len(empty)} frames with no vehicle"
+                                   if empty else "")})
         return done
     finally:
         conn.close()
