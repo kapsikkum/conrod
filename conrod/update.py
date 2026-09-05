@@ -283,6 +283,46 @@ def download(release: Release, into: Path, on_progress=None) -> Path:
     return target
 
 
+def _clear_staging(beside: Path) -> Path:
+    """An empty folder to unpack into, whatever is left over from last time.
+
+    This used to be `rmtree(ignore_errors=True)` followed by `mkdir()`, which
+    is two statements that disagree: the first says the folder might refuse
+    to go, the second insists it did. On a copy installed inside OneDrive --
+    which is where people put it, because that is where their Desktop is --
+    the sync client holds handles open, the delete quietly fails and the
+    update dies on
+
+        [WinError 183] Cannot create a file when that file already
+        exists: '...Desktop/Conrod-win64/Conrod-update'
+
+    with a 305 MB download already on disk and nothing wrong with it.
+
+    So: try to clear the usual folder, and if something is still holding it,
+    step aside to a fresh one rather than refusing to update. The swap script
+    is told which folder to use and removes it at the end, so a stale one
+    costs disk until the next attempt tidies it, and never costs the update.
+    """
+    preferred = beside / "Conrod-update"
+    for candidate in [preferred] + [beside / f"Conrod-update-{n}"
+                                    for n in range(2, 12)]:
+        if candidate.exists():
+            shutil.rmtree(candidate, ignore_errors=True)
+        if candidate.exists():
+            continue                     # something still has it open
+        try:
+            candidate.mkdir(parents=True)
+        except OSError:
+            continue
+        return candidate
+    raise RuntimeError(
+        f"Could not clear a folder to unpack into beside {beside}. Something "
+        f"is holding {preferred.name} open -- OneDrive or a file browser "
+        f"sitting in it are the usual causes. Close them, or delete that "
+        f"folder by hand, and try again."
+    )
+
+
 def install(archive: Path, on_progress=None) -> str:
     """Unpack the new build and hand the swap to a script, then quit."""
     if not getattr(sys, "frozen", False):
@@ -294,10 +334,7 @@ def install(archive: Path, on_progress=None) -> str:
         raise RuntimeError("that archive does not contain a Conrod build")
 
     current = Path(sys.executable).parent            # ...\Conrod
-    staging = current.parent / "Conrod-update"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True)
+    staging = _clear_staging(current.parent)
 
     if on_progress:
         on_progress("unpacking")
