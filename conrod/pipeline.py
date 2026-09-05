@@ -35,7 +35,7 @@ from . import store, vlm, vlm_providers
 from .analyze import VehicleAnalysis, analyze
 from .config import (BIKE_CLASS_NAMES, CACHE_DIR, IMAGE_SUFFIXES, JPEG_SUFFIXES,
                      RAW_SUFFIXES, Settings)
-from .exif import ExifTool, extract_previews
+from .exif import ExifTool, extract_previews, read_tags_many
 from .mapping import NumberMap
 from .writer import write_keywords
 
@@ -1337,20 +1337,22 @@ def _record_origins(conn, job_id: int, files, on_progress, settings,
     # exactly this reason; this pass did not, and neither did the ratings
     # pass that was added beside it.
     total = len(files)
-    rows = []
+
+    def tick(done: int, of: int) -> None:
+        on_progress({"stage": "cameras", "done": done, "total": of,
+                     "message": f"read {done}/{of} frames"})
+
     try:
-        with ExifTool() as tool:
-            for start in range(0, total, culling.CULL_CHUNK):
-                if should_stop and should_stop():
-                    return
-                batch = files[start:start + culling.CULL_CHUNK]
-                rows += tool.read_tags(batch, wanted)
-                done = min(start + culling.CULL_CHUNK, total)
-                on_progress({"stage": "cameras", "done": done, "total": total,
-                             "message": f"read {done}/{total} frames"})
+        rows = read_tags_many(
+            files, wanted,
+            workers=max(1, getattr(settings, "preview_workers", 4)),
+            chunk=culling.CULL_CHUNK,
+            on_progress=tick, should_stop=should_stop)
     except Exception as exc:                      # exiftool missing or unhappy
         on_progress({"stage": "cameras",
                      "message": f"could not read capture times: {exc}"})
+        return
+    if should_stop and should_stop():
         return
 
     said = _store_origins(conn, job_id, files, rows, settings,
@@ -1380,8 +1382,7 @@ def fill_frames(conn, job_id: int, files, settings, *,
     wanted = list(bursts.TAGS)
     wanted += [tag for tag in EXISTING_MARK_TAGS if tag not in wanted]
     try:
-        with ExifTool() as tool:
-            rows = tool.read_tags(files, wanted)
+        rows = read_tags_many(files, wanted, workers=1)
     except Exception as exc:
         on_progress({"stage": "filling",
                      "message": f"could not read capture times: {exc}"})

@@ -39,7 +39,22 @@ class TheReadReportsItself(unittest.TestCase):
         self.assertNotIn("rows = tool.read_tags(files, wanted)", self.body())
 
     def test_it_says_how_far_through_it_is(self) -> None:
-        self.assertIn('"done": done, "total": total', self.body())
+        """Behaviour, not the exact words: the read reports a count and a
+        total as it goes. Pinning the literal broke the moment the read
+        moved to several exiftool processes and started reporting as
+        batches landed rather than as they were handed out."""
+        called = []
+        rows = pipeline.read_tags_many(
+            [Path(f"nowhere/{n}.CR3") for n in range(5)], ["Model"],
+            workers=2, chunk=2,
+            on_progress=lambda done, of: called.append((done, of)))
+        self.assertTrue(called, "nothing reported progress")
+        for done, of in called:
+            self.assertLessEqual(done, of)
+        self.assertEqual(called[-1][1], 5)
+
+    def test_the_pass_hands_the_reader_a_progress_callback(self) -> None:
+        self.assertIn("on_progress=tick", self.body())
 
     def test_a_stop_is_heard_between_chunks(self) -> None:
         self.assertIn("should_stop()", self.body())
