@@ -1191,3 +1191,14 @@ button.danger:hover { color: #ff7b7b; border-color: var(--bad); }
 .known-head { font-size: 10px; text-transform: uppercase;
               letter-spacing: .05em; color: var(--muted); padding-bottom: 2px; }
 .known-plate { font-weight: 600; }
+
+/* A frame whose preview has not been pulled out of the RAW yet. Adding an
+   album is a folder walk now, so most tiles start like this and fill in as
+   they are scrolled to -- a tile that is coming has to look different from
+   one that is broken. */
+.tile.waiting { background: linear-gradient(100deg,
+  rgba(255,255,255,.03) 30%, rgba(255,255,255,.07) 50%, rgba(255,255,255,.03) 70%);
+  background-size: 200% 100%; animation: tile-wait 1.4s ease-in-out infinite; }
+.tile.waiting img { opacity: 0; }
+.tile.unreadable { background: rgba(220,80,80,.08); }
+@keyframes tile-wait { to { background-position: -200% 0; } }

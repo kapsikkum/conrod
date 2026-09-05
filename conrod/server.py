@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +25,11 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from . import keywords as keywords_mod
-from . import pipeline, setup_check, store, vlm, watch
+from . import exif, pipeline, setup_check, store, vlm, watch
 from . import sharpness as sharpness_mod
 from .analyze import VehicleAnalysis
 from .config import (CACHE_DIR, DATA_ROOT, DEFAULTS, IMAGE_SUFFIXES,
-                     LOG_PATH, Settings)
+                     JPEG_SUFFIXES, LOG_PATH, RAW_SUFFIXES, Settings)
 from .exif import _mirror_name
 from .mapping import NumberMap
 
@@ -1628,8 +1629,16 @@ def job_frames(job_id: int, offset: int = 0,
             "id": row["id"],
             "name": Path(row["path"]).name,
             "status": row["status"],
-            # Only a JPEG preview can be shown; a RAW with none yet cannot.
-            "viewable": preview.lower().endswith((".jpg", ".jpeg")),
+            # Whether a thumbnail can be asked for. A frame with a preview
+            # already can; so can one with none *yet*, because asking is now
+            # what fills it in -- the album is the file list and the frames
+            # arrive empty. Only a frame that has been tried and gave nothing
+            # is unviewable, which preview_path records as an empty string.
+            "viewable": (preview.lower().endswith((".jpg", ".jpeg"))
+                         or row["preview_path"] is None),
+            # Whether it is there now, so the tile can show it is coming
+            # rather than pretending it is missing.
+            "filled": preview.lower().endswith((".jpg", ".jpeg")),
             "vehicles": vehicles,
             "kept": kept,
             "verdict": row["verdict"],
@@ -2327,6 +2336,247 @@ THUMB_EDGE = 420
 THUMB_DIR = CACHE_DIR / "thumbs"
 
 
+# How many frames are filled in at once. Measured on a real shoot: 137 ms a
+# frame in a batch of 32, 231 ms at 8, and 1,364 ms on its own -- almost all
+# of which is starting exiftool. So the unit of work is a run of neighbours,
+# never a single frame, and a request for one thumbnail pulls in the frames
+# around it because that is what makes it ten times cheaper.
+FILL_CHUNK = 32
+
+# What one thumbnail request fills. Smaller than the background chunk on
+# purpose: this one is blocking a tile somebody is looking at, and 32 frames
+# is about five seconds of exiftool. Eight is about one, which is the
+# difference between a tile that appears and a tile that hangs. The
+# background pass picks up the rest at the larger size, where throughput is
+# what matters and nothing is waiting.
+ON_DEMAND_CHUNK = 8
+
+# One lock per run of frames, so two requests for neighbouring thumbnails do
+# not both start exiftool on the same files.
+_fill_locks: dict[tuple, threading.Lock] = {}
+_fill_locks_guard = threading.Lock()
+
+_filling: dict[str, Any] = {"job_id": None, "done": 0, "total": 0,
+                            "active": False, "message": ""}
+_fill_wake = threading.Event()
+_fill_generation = 0
+
+# How many thumbnail requests are filling frames in right now. The background
+# pass stands aside while any of them are, because they are the ones with a
+# tile waiting on them: unchecked, it fills about eight frames a second and
+# turns a one-second request into four, which is the difference between a
+# gallery that fills in and one that stalls wherever you scroll.
+_foreground = 0
+_foreground_lock = threading.Lock()
+_foreground_idle = threading.Event()
+_foreground_idle.set()
+
+
+@contextmanager
+def _in_foreground():
+    global _foreground
+    with _foreground_lock:
+        _foreground += 1
+        _foreground_idle.clear()
+    try:
+        yield
+    finally:
+        with _foreground_lock:
+            _foreground -= 1
+            if _foreground <= 0:
+                _foreground = 0
+                _foreground_idle.set()
+
+
+def _fill_lock(job_id: int, first_id: int) -> threading.Lock:
+    with _fill_locks_guard:
+        return _fill_locks.setdefault((job_id, first_id), threading.Lock())
+
+
+def _fill_run(job_id: int, around_id: int, *, size: int = FILL_CHUNK,
+              tags: bool = True) -> int:
+    """Fill in the frames from this one on: preview, and optionally the EXIF.
+
+    A run of neighbours in album order rather than the one frame asked for.
+    Opening the files is the cost and starting exiftool is most of it, so a
+    frame on its own is 1.4 seconds where a batch is a fraction of that each.
+
+    ``tags`` is off for the on-demand path. A tile needs the picture and
+    nothing else; the camera, capture time and existing rating are wanted by
+    the cull, which is minutes away, so making somebody wait for them while
+    they scroll is spending their time on the wrong thing.
+
+    Returns how many frames were filled. Safe to call over a region already
+    done -- it selects only what is missing.
+    """
+    # A bounded neighbourhood: this frame and the next few in album order,
+    # whatever state they are in. Selecting "the next `size` frames that
+    # still need doing" instead would wander -- a request for a frame the
+    # background pass had already reached would go off and fill somewhere
+    # else entirely, which is work nobody asked for.
+    with store.session() as conn:
+        window = conn.execute(
+            """SELECT id, path, preview_path FROM images
+                WHERE job_id = ? AND id >= ? ORDER BY id LIMIT ?""",
+            (job_id, around_id, size)).fetchall()
+    rows = [r for r in window if r["preview_path"] is None]
+    if not rows:
+        return 0
+
+    lock = _fill_lock(job_id, rows[0]["id"])
+    with lock:
+        # Asked again while we waited: whoever held the lock may have done
+        # exactly these frames.
+        with store.session() as conn:
+            todo = [Path(r["path"]) for r in conn.execute(
+                f"""SELECT path FROM images
+                     WHERE id IN ({','.join('?' * len(rows))})
+                       AND preview_path IS NULL ORDER BY id""",
+                [r["id"] for r in rows])]
+        if not todo:
+            return 0
+
+        settings: Settings = _state["settings"]
+        previews = exif.extract_previews(
+            [f for f in todo if f.suffix.lower() in RAW_SUFFIXES],
+            CACHE_DIR / "previews",
+            workers=max(1, settings.preview_workers))
+        with store.session() as conn:
+            for source in todo:
+                # A JPEG is its own preview; a RAW has one only if it came out.
+                shown = previews.get(source)
+                if shown is None and source.suffix.lower() in JPEG_SUFFIXES:
+                    shown = source
+                if shown is None:
+                    continue
+                conn.execute("UPDATE images SET preview_path=? "
+                             "WHERE job_id=? AND path=?",
+                             (str(shown), job_id, str(source)))
+            if tags:
+                pipeline.fill_frames(conn, job_id, todo, settings)
+    return len(todo)
+
+
+def _fill_loop(job_id: int, generation: int) -> None:
+    """Work through an album's unfilled frames while it is open.
+
+    The other half of filling on demand. Scrolling steers this -- a thumbnail
+    request fills its own run and wakes the loop to carry on from there --
+    but an album left open should end up warm without being scrolled through
+    end to end, so this walks whatever is still missing.
+
+    Stands aside for a scan: a cull wants the whole machine and extracts the
+    previews it needs anyway.
+    """
+    while _filling["active"] and _fill_generation == generation:
+        if _run.get("active") or _index.get("active"):
+            _fill_wake.wait(timeout=5.0)
+            _fill_wake.clear()
+            continue
+        # Somebody is looking at a tile. Let them have the disk.
+        if not _foreground_idle.wait(timeout=10.0):
+            continue
+        try:
+            with store.session() as conn:
+                nxt = conn.execute(
+                    """SELECT id FROM images
+                        WHERE job_id = ? AND preview_path IS NULL
+                        ORDER BY id LIMIT 1""", (job_id,)).fetchone()
+                left = conn.execute(
+                    "SELECT COUNT(*) FROM images WHERE job_id=? "
+                    "AND preview_path IS NULL", (job_id,)).fetchone()[0]
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM images WHERE job_id=?",
+                    (job_id,)).fetchone()[0]
+                # Frames a thumbnail request filled: they have a picture but
+                # no camera, capture time or rating, because the on-demand
+                # path deliberately skips those to keep a tile quick. Nothing
+                # else would ever come back for them.
+                untagged = conn.execute(
+                    """SELECT path FROM images
+                        WHERE job_id = ? AND taken_at IS NULL
+                          AND preview_path IS NOT NULL AND preview_path != ''
+                        ORDER BY id LIMIT ?""", (job_id, FILL_CHUNK)).fetchall()
+            _filling.update({"done": total - left, "total": total,
+                             "message": f"reading {total - left} of {total} frames"})
+            if nxt is None and not untagged:
+                # Everything is filled. Settle the burst numbers, which the
+                # chunks could only guess at, and stop.
+                with store.session() as conn:
+                    pipeline.rebuild_bursts(conn, job_id, _state["settings"])
+                _filling.update({"active": False,
+                                 "message": f"all {total} frames read"})
+                break
+            if untagged:
+                with store.session() as conn:
+                    pipeline.fill_frames(
+                        conn, job_id, [Path(r["path"]) for r in untagged],
+                        _state["settings"])
+                continue
+            before = left
+            _fill_run(job_id, nxt["id"])
+            with store.session() as conn:
+                after = conn.execute(
+                    "SELECT COUNT(*) FROM images WHERE job_id=? "
+                    "AND preview_path IS NULL", (job_id,)).fetchone()[0]
+            if after >= before:
+                # That run produced nothing -- a corrupt RAW, a file that has
+                # gone, a preview exiftool will not give up. Left alone it
+                # would be retried for ever and the loop would never reach
+                # the frames past it, so the run is marked as tried. An empty
+                # string is "looked at and there is nothing", which the thumb
+                # endpoint already reads as no preview.
+                _mark_unfillable(job_id, nxt["id"])
+        except Exception as exc:          # one bad run must not end the pass
+            _filling["message"] = f"{type(exc).__name__}: {exc}"
+            _fill_wake.wait(timeout=5.0)
+            _fill_wake.clear()
+
+
+def _mark_unfillable(job_id: int, first_id: int) -> None:
+    """Record that this run of frames has been tried and gave nothing."""
+    with store.session() as conn:
+        ids = [r["id"] for r in conn.execute(
+            """SELECT id FROM images
+                WHERE job_id = ? AND id >= ? AND preview_path IS NULL
+                ORDER BY id LIMIT ?""", (job_id, first_id, FILL_CHUNK))]
+        for image_id in ids:
+            conn.execute("UPDATE images SET preview_path = '' WHERE id = ?",
+                         (image_id,))
+
+
+def start_filling(job_id: int) -> None:
+    """Begin filling this album in, replacing any album being filled."""
+    global _fill_generation
+    if _filling.get("active") and _filling.get("job_id") == job_id:
+        _fill_wake.set()
+        return
+    _fill_generation += 1
+    generation = _fill_generation
+    _filling.update({"job_id": job_id, "active": True, "done": 0, "total": 0,
+                     "message": "reading the frames"})
+    _fill_wake.set()
+    threading.Thread(target=_fill_loop, args=(job_id, generation),
+                     daemon=True).start()
+
+
+@app.get("/api/jobs/{job_id}/filling")
+def filling_status(job_id: int) -> dict:
+    """How far through filling this album's frames in we are.
+
+    Opening an album starts it, so the album screen asking is also what makes
+    it happen -- an album nobody is looking at does not need reading.
+    """
+    if _filling.get("job_id") != job_id or not _filling.get("active"):
+        with store.session() as conn:
+            left = conn.execute(
+                "SELECT COUNT(*) FROM images WHERE job_id=? "
+                "AND preview_path IS NULL", (job_id,)).fetchone()[0]
+        if left:
+            start_filling(job_id)
+    return dict(_filling)
+
+
 @app.get("/api/thumb/{image_id}")
 def thumb(image_id: int) -> FileResponse:
     """A contact-sheet sized copy of a frame.
@@ -2346,6 +2596,26 @@ def thumb(image_id: int) -> FileResponse:
     if not row:
         raise HTTPException(404, "no such image")
     source = Path(row["preview_path"] or row["path"])
+    if row["preview_path"] is None and source.suffix.lower() not in JPEG_SUFFIXES:
+        # Not filled in yet. Adding an album is now a folder walk and nothing
+        # else, so the frames arrive empty and are filled as they are looked
+        # at -- this is that, for the frame somebody is looking at.
+        with store.session() as conn:
+            owner = conn.execute("SELECT job_id FROM images WHERE id=?",
+                                 (image_id,)).fetchone()
+        if owner:
+            with _in_foreground():
+                _fill_run(owner["job_id"], image_id, size=ON_DEMAND_CHUNK,
+                          tags=False)
+            # And make sure the background pass is going, so the rest of the
+            # album arrives without having to be scrolled to.
+            start_filling(owner["job_id"])
+            with store.session() as conn:
+                again = conn.execute(
+                    "SELECT preview_path FROM images WHERE id=?",
+                    (image_id,)).fetchone()
+            if again and again["preview_path"]:
+                source = Path(again["preview_path"])
     if not source.exists() or source.suffix.lower() not in {".jpg", ".jpeg"}:
         raise HTTPException(404, "no viewable preview")
 

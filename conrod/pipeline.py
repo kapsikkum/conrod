@@ -90,9 +90,34 @@ def _noop(_event: dict) -> None:
 
 
 def scan(root: Path, recursive: bool = True) -> list[Path]:
-    """Every frame under a folder, in a stable order."""
-    walker = root.rglob("*") if recursive else root.glob("*")
-    files = [p for p in walker if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
+    """Every frame under a folder, in a stable order.
+
+    Walked with os.walk rather than rglob because rglob asks the filesystem
+    whether each entry is a file, one stat at a time, and a directory listing
+    already knows. On a 7,337-frame folder on an external drive that was 33
+    seconds against about four -- and since adding an album is now this walk
+    and nothing else, it was most of the wait.
+
+    The suffix is checked on the name before a Path is built, so the
+    thousands of sidecars and stray files beside a shoot cost a string
+    comparison rather than an object.
+    """
+    files: list[Path] = []
+    if recursive:
+        for base, _dirs, names in os.walk(root):
+            here = Path(base)
+            for name in names:
+                if os.path.splitext(name)[1].lower() in IMAGE_SUFFIXES:
+                    files.append(here / name)
+    else:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if (os.path.splitext(entry.name)[1].lower() in IMAGE_SUFFIXES
+                            and entry.is_file()):
+                        files.append(Path(entry.path))
+        except OSError:
+            return []
     files.sort(key=lambda p: (str(p.parent).lower(), p.name.lower()))
     return files
 
@@ -167,7 +192,12 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
     if not files:
         raise SystemExit(f"No supported images under {root}")
 
-    if settings.respect_culling:
+    # Reading every frame's existing rating takes about two minutes on a
+    # seven-thousand-frame folder, and adding an album should not wait for
+    # it: the answer only matters when something is about to be culled or
+    # written, and by then the frames have been filled in. An album is
+    # therefore the folder, and the rating read happens where it is used.
+    if settings.respect_culling and stop_after != "index":
         found = len(files)
         # "ratings", not "cull": this reads the stars and labels already on
         # the frames to decide what to skip. Nothing is culled here, and
@@ -222,22 +252,45 @@ def run(root: Path, settings: Settings, *, label: str | None = None,
             conn.commit()
             return JobSummary(job_id, 0, 0, 0)
 
-        _record_origins(conn, job_id, files, on_progress, settings,
-                        should_stop)
-
-        previews = _prepare_previews(files, on_progress, settings,
-                                     should_stop)
-
         if stop_after == "index":
-            # The album exists, its frames are known and every one of them has
-            # a preview to show. Nothing has looked for a vehicle yet, which
-            # is the point: adding a folder should cost minutes, not a night.
+            # The album is the file list, and that is all adding one does.
+            #
+            # It used to also read every rating, every camera and capture
+            # time, every sidecar, and extract every preview -- four walks of
+            # the whole folder before the first thumbnail could appear. On a
+            # 7,337-frame shoot that was about twenty-five minutes of nothing
+            # to look at, and at an event every hour counts. Walking the
+            # folder is 4.8 seconds of it.
+            #
+            # None of that work was wrong, only scheduled wrong: it is 137 ms
+            # a frame to extract a preview in a batch of thirty-two and 28 ms
+            # to read its tags, so it belongs behind the album rather than in
+            # front of it. server.py fills the frames in as they are looked
+            # at, and the cull does whatever is still missing.
             store.set_job_status(conn, job_id, "indexed")
             conn.commit()
             on_progress({"stage": "indexed", "done": len(files),
                          "total": len(files),
-                         "message": f"{len(files)} frames ready to cull"})
+                         "message": f"{len(files)} frames found"})
             return JobSummary(job_id, len(files), 0, 0)
+
+        _record_origins(conn, job_id, files, on_progress, settings,
+                        should_stop)
+
+        # Settle the burst numbers before anything leans on them. Frames
+        # filled in while the album was being browsed carry provisional ones
+        # -- a chunk of thirty-two cannot see the gaps either side of it --
+        # and grouping, the keeper of each pass and the burst read all take
+        # them at face value. Arithmetic over stored times; costs nothing.
+        if settings.group_by_burst:
+            runs = rebuild_bursts(conn, job_id, settings)
+            if runs:
+                on_progress({"stage": "cameras",
+                             "message": f"{runs} burst{'' if runs == 1 else 's'} "
+                                        f"across the album"})
+
+        previews = _prepare_previews(files, on_progress, settings,
+                                     should_stop)
 
         work: "queue.Queue" = queue.Queue(maxsize=64)
         errors: list[str] = []
@@ -1300,6 +1353,87 @@ def _record_origins(conn, job_id: int, files, on_progress, settings,
                      "message": f"could not read capture times: {exc}"})
         return
 
+    said = _store_origins(conn, job_id, files, rows, settings,
+                          want_bursts=want_bursts, want_marks=want_marks,
+                          on_progress=on_progress, should_stop=should_stop)
+    if said:
+        on_progress({"stage": "cameras", "message": ", ".join(said)})
+
+
+def fill_frames(conn, job_id: int, files, settings, *,
+                on_progress: Progress = _noop, should_stop=None) -> list[str]:
+    """Read the camera, capture time and existing rating off some frames.
+
+    The same work ``_record_origins`` does over a whole shoot, on whatever
+    list it is handed. Adding an album no longer walks the folder four times
+    before the first thumbnail appears: the album opens on the file list
+    alone, and this fills the frames in behind it -- a chunk at a time, the
+    ones being looked at first.
+
+    Reads in one exiftool call for the lot, because the cost is opening the
+    files and not which tags are asked for. Measured on a real shoot: 28 ms
+    a frame in a batch of 32, against most of a second on its own.
+    """
+    files = list(files)
+    if not files:
+        return []
+    wanted = list(bursts.TAGS)
+    wanted += [tag for tag in EXISTING_MARK_TAGS if tag not in wanted]
+    try:
+        with ExifTool() as tool:
+            rows = tool.read_tags(files, wanted)
+    except Exception as exc:
+        on_progress({"stage": "filling",
+                     "message": f"could not read capture times: {exc}"})
+        return []
+    # The burst numbers this writes are provisional: a burst spans whatever
+    # frames are close together in time, and a chunk of thirty-two cannot
+    # know what came before or after it. rebuild_bursts settles them once the
+    # times are on record -- the caller runs it when a run of frames is done.
+    return _store_origins(
+        conn, job_id, files, rows, settings,
+        want_bursts=bool(getattr(settings, "group_by_burst", True)),
+        want_marks=bool(getattr(settings, "import_existing_ratings", True)),
+        on_progress=on_progress, should_stop=should_stop)
+
+
+def rebuild_bursts(conn, job_id: int, settings) -> int:
+    """Number the album's bursts again from the capture times on record.
+
+    A burst is "consecutive frames from one camera with no long gap", which
+    is a fact about the whole album and cannot be settled from part of it.
+    Filling frames in a chunk at a time therefore produces provisional
+    numbers -- correct within the chunk, meaningless across it -- and this is
+    what makes them right: one pass over the stored times, which is
+    arithmetic and costs nothing next to opening the files did.
+
+    Run whenever a run of frames has been filled, and once more before a cull,
+    which is the first thing that depends on the answer.
+    """
+    rows = conn.execute(
+        """SELECT path, camera, taken_at FROM images
+            WHERE job_id = ? AND taken_at IS NOT NULL""", (job_id,)).fetchall()
+    if not rows:
+        return 0
+    frames = [bursts.Frame(path=row["path"],
+                           camera=row["camera"] or "camera",
+                           taken=row["taken_at"])
+              for row in rows]
+    numbered = bursts.assign_bursts(
+        frames, gap=getattr(settings, "burst_gap", bursts.BURST_GAP_SECONDS))
+    store.set_frame_origin(conn, job_id, numbered)
+    return len({f.burst for f in numbered})
+
+
+def _store_origins(conn, job_id: int, files, rows, settings, *,
+                   want_bursts: bool, want_marks: bool,
+                   on_progress: Progress = _noop, should_stop=None) -> list[str]:
+    """Turn a batch of exiftool rows into cameras, bursts and existing marks.
+
+    Shared by the whole-album pass and the one that fills frames in as they
+    are looked at, so the two cannot drift into disagreeing about what a
+    burst is or where a rating comes from.
+    """
     said = []
     if want_bursts:
         frames = bursts.describe(
@@ -1316,9 +1450,7 @@ def _record_origins(conn, job_id: int, files, on_progress, settings,
         rated = store.set_existing_marks(conn, job_id, marks)
         if rated:
             said.append(f"{rated} frame{'' if rated == 1 else 's'} already rated")
-
-    if said:
-        on_progress({"stage": "cameras", "message": ", ".join(said)})
+    return said
 
 
 def _existing_marks(files, rows, on_progress=_noop, should_stop=None) -> dict:

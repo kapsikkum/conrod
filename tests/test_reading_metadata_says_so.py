@@ -12,6 +12,7 @@ burst pass did not, and the ratings pass added beside it did not either.
 
 from __future__ import annotations
 
+import inspect
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -20,24 +21,28 @@ from conrod import pipeline
 
 
 class TheReadReportsItself(unittest.TestCase):
+    """About the whole-album pass specifically.
+
+    Bounded with inspect rather than by slicing between two names in the
+    file: functions got added between those names and the slice quietly
+    started covering them, which failed the assertion for a reason that had
+    nothing to do with what it is checking. fill_frames next door reads in
+    one call on purpose -- it is handed a chunk of thirty-two and is the
+    thing doing the chunking.
+    """
+
+    def body(self) -> str:
+        return inspect.getsource(pipeline._record_origins)
+
     def test_it_reads_in_chunks_rather_than_one_call(self) -> None:
-        source = Path(pipeline.__file__).read_text(encoding="utf-8")
-        body = source[source.index("def _record_origins"):
-                      source.index("def _existing_marks")]
-        self.assertIn("culling.CULL_CHUNK", body)
-        self.assertNotIn("rows = tool.read_tags(files, wanted)", body)
+        self.assertIn("culling.CULL_CHUNK", self.body())
+        self.assertNotIn("rows = tool.read_tags(files, wanted)", self.body())
 
     def test_it_says_how_far_through_it_is(self) -> None:
-        source = Path(pipeline.__file__).read_text(encoding="utf-8")
-        body = source[source.index("def _record_origins"):
-                      source.index("def _existing_marks")]
-        self.assertIn('"done": done, "total": total', body)
+        self.assertIn('"done": done, "total": total', self.body())
 
     def test_a_stop_is_heard_between_chunks(self) -> None:
-        source = Path(pipeline.__file__).read_text(encoding="utf-8")
-        body = source[source.index("def _record_origins"):
-                      source.index("def _existing_marks")]
-        self.assertIn("should_stop()", body)
+        self.assertIn("should_stop()", self.body())
 
 
 class TheFilesAreNotOpenedTwice(unittest.TestCase):

@@ -1746,6 +1746,36 @@ function offer(card, enabled, run, why) {
   card.onclick = enabled ? run : null;
 }
 
+/* An album is the file list and nothing else the moment it is added, and
+   the frames fill in behind it -- preview, capture time, existing rating.
+   Asking how far through says so on screen, and asking is also what starts
+   it: an album nobody has open does not need reading. */
+let fillingTimer;
+async function pollFilling() {
+  clearInterval(fillingTimer);
+  const line = $("#album-filling");
+  if (!line) return;
+  const tick = async () => {
+    let state_;
+    try {
+      state_ = await api(`/api/jobs/${state.jobId}/filling`);
+    } catch {
+      clearInterval(fillingTimer);
+      return;
+    }
+    if (!state_.active) {
+      line.textContent = "";
+      clearInterval(fillingTimer);
+      // The last frames to arrive are the ones on screen waiting for them.
+      if (state_.total) loadSheet(true);
+      return;
+    }
+    line.textContent = state_.message || "";
+  };
+  await tick();
+  fillingTimer = setInterval(tick, 2000);
+}
+
 async function loadSheet(reset) {
   const id = state.jobId;
   const data = await api(
@@ -1753,8 +1783,21 @@ async function loadSheet(reset) {
   const tiles = data.frames.map((f) => {
     const tile = el("div", { className: "tile" });
     if (f.viewable) {
-      tile.append(el("img", { src: `/api/thumb/${f.id}`, alt: "",
-                              loading: "lazy", decoding: "async" }));
+      // Asking for the thumbnail is what fills the frame in: adding an album
+      // is a folder walk and nothing else now, so most of these have no
+      // preview extracted yet and the request is what extracts it. Lazy, so
+      // only the frames actually scrolled to are asked for.
+      const img = el("img", { src: `/api/thumb/${f.id}`, alt: "",
+                              loading: "lazy", decoding: "async" });
+      if (!f.filled) {
+        tile.classList.add("waiting");
+        img.onload = () => tile.classList.remove("waiting");
+        img.onerror = () => {
+          tile.classList.remove("waiting");
+          tile.classList.add("unreadable");
+        };
+      }
+      tile.append(img);
     } else {
       tile.append(el("div", { className: "blank",
                               textContent: f.status === "pending"
@@ -1776,6 +1819,7 @@ async function loadSheet(reset) {
   const sheet = $("#album-sheet");
   if (reset) sheet.replaceChildren(...tiles); else sheet.append(...tiles);
   $("#album-count").textContent = `${sheet.children.length} of ${data.total}`;
+  pollFilling();
   $("#album-empty").hidden = data.total > 0;
   $("#album-more").hidden = sheet.children.length >= data.total;
 }
