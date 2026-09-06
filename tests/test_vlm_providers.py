@@ -10,6 +10,7 @@ network call.
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -217,6 +218,136 @@ class DescribeDispatchesByProvider(unittest.TestCase):
         for provider in ("openai", "anthropic", "gemini"):
             with self.assertRaises(vlm.VLMUnavailable):
                 vlm.check_available(Settings(vlm_provider=provider, vlm_api_key=""))
+
+
+class OllamaHostList(unittest.TestCase):
+    """Settings.ollama_hosts() is what everything below reads -- vlm_host
+    stays the whole story for anyone who has never touched vlm_extra_hosts."""
+
+    def test_default_settings_have_just_the_one_host(self) -> None:
+        self.assertEqual(Settings().ollama_hosts(), ["http://127.0.0.1:11434"])
+
+    def test_extra_hosts_are_appended_after_the_primary(self) -> None:
+        settings = Settings(vlm_host="http://a:11434",
+                            vlm_extra_hosts="http://b:11434, http://c:11434")
+        self.assertEqual(settings.ollama_hosts(),
+                         ["http://a:11434", "http://b:11434", "http://c:11434"])
+
+    def test_duplicates_and_trailing_slashes_collapse(self) -> None:
+        """The primary host repeated as an extra is one host, not a second
+        slot for the same GPU."""
+        settings = Settings(vlm_host="http://a:11434/",
+                            vlm_extra_hosts="http://a:11434, http://b:11434")
+        self.assertEqual(settings.ollama_hosts(),
+                         ["http://a:11434", "http://b:11434"])
+
+    def test_blank_and_stray_commas_are_ignored(self) -> None:
+        settings = Settings(vlm_host="http://a:11434",
+                            vlm_extra_hosts=" , http://b:11434 ,, ")
+        self.assertEqual(settings.ollama_hosts(),
+                         ["http://a:11434", "http://b:11434"])
+
+
+class HostPoolTests(unittest.TestCase):
+    """The pool that lets several workers use several GPUs without two of
+    them ever landing on the same busy host."""
+
+    def test_acquire_returns_a_configured_host(self) -> None:
+        pool = vlm_providers.HostPool(["http://a:11434"])
+        self.assertEqual(pool.acquire(), "http://a:11434")
+
+    def test_each_host_is_handed_out_once_before_any_repeats(self) -> None:
+        pool = vlm_providers.HostPool(["http://a:11434", "http://b:11434"])
+        first, second = pool.acquire(), pool.acquire()
+        self.assertEqual({first, second}, {"http://a:11434", "http://b:11434"})
+
+    def test_a_third_acquire_blocks_until_one_is_released(self) -> None:
+        pool = vlm_providers.HostPool(["http://a:11434", "http://b:11434"])
+        pool.acquire()
+        pool.acquire()
+
+        got = []
+        waiter = threading.Thread(target=lambda: got.append(pool.acquire()))
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive(), "acquired a host that was not free")
+
+        pool.release("http://a:11434")
+        waiter.join(timeout=5)
+        self.assertEqual(got, ["http://a:11434"])
+
+    def test_release_makes_a_host_available_again(self) -> None:
+        pool = vlm_providers.HostPool(["http://a:11434"])
+        host = pool.acquire()
+        pool.release(host)
+        self.assertEqual(pool.acquire(), "http://a:11434")
+
+
+class OllamaRequestWiring(unittest.TestCase):
+    """ollama_request() is what _ollama() and normalise.canonical() both go
+    through -- checked directly so a change to either caller cannot lose the
+    pooling without a test noticing."""
+
+    def test_a_single_configured_host_is_used_exactly_as_before(self) -> None:
+        client, _ = _client({"response": "{}"})
+        settings = Settings(vlm_host="http://solo-host:11434", vlm_extra_hosts="")
+        vlm_providers.ollama_request(settings, {"model": "m"}, client)
+        self.assertEqual(client.post.call_args[0][0],
+                         "http://solo-host:11434/api/generate")
+
+    def test_the_slot_is_released_even_when_the_request_fails(self) -> None:
+        """A crop that fails must not permanently take a GPU out of
+        rotation -- the next crop still needs it."""
+        client = MagicMock()
+        client.post.side_effect = RuntimeError("connection refused")
+        settings = Settings(vlm_host="http://flaky-host:11434", vlm_extra_hosts="")
+
+        with self.assertRaises(RuntimeError):
+            vlm_providers.ollama_request(settings, {"model": "m"}, client)
+
+        pool = vlm_providers._pool_for(settings)
+        self.assertEqual(pool.acquire(), "http://flaky-host:11434",
+                         "the host never came back after the failed call")
+
+    def test_two_configured_hosts_both_get_used(self) -> None:
+        """Two callers in flight at once land on two different hosts. If the
+        pool handed the same host to both, only one distinct URL would ever
+        appear in `seen`, however many times each side recorded one."""
+        settings = Settings(vlm_host="http://pair-a:11434",
+                            vlm_extra_hosts="http://pair-b:11434")
+        seen: list[str] = []
+        lock = threading.Lock()
+        both_in_flight = threading.Event()
+        release = threading.Event()
+
+        def slow_post(url, **kwargs):
+            with lock:
+                seen.append(url)
+                if len(seen) == 2:
+                    both_in_flight.set()
+            release.wait(timeout=5)
+            _, resp = _client({"response": "{}"})
+            return resp
+
+        client = MagicMock()
+        client.post.side_effect = slow_post
+
+        threads = [threading.Thread(target=vlm_providers.ollama_request,
+                                    args=(settings, {"model": "m"}, client))
+                  for _ in range(2)]
+        for t in threads:
+            t.start()
+
+        self.assertTrue(both_in_flight.wait(timeout=5),
+                        "both calls should be able to start without either "
+                        "waiting on the other")
+        release.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(set(seen),
+                         {"http://pair-a:11434/api/generate",
+                          "http://pair-b:11434/api/generate"})
 
 
 if __name__ == "__main__":

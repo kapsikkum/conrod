@@ -199,6 +199,12 @@ class Settings:
     vlm_provider: str = "ollama"
     vlm_model: str = "qwen2.5vl:7b"
     vlm_host: str = "http://127.0.0.1:11434"
+    # More Ollama machines to spread crops across, comma separated. Only
+    # meaningful for vlm_provider == "ollama" -- the cloud providers are one
+    # endpoint each with nothing to spread across. vlm_host is always the
+    # first one; this is what else to add beside it, e.g. a second GPU on the
+    # network running its own Ollama.
+    vlm_extra_hosts: str = ""
     vlm_api_key: str = ""
     # Anthropic takes two kinds of credential on two different headers, and
     # they cannot be told apart reliably enough to guess: a console API key
@@ -363,6 +369,18 @@ class Settings:
     extra: dict = field(default_factory=dict)
 
     # -- persistence ------------------------------------------------------
+
+    def ollama_hosts(self) -> list[str]:
+        """Every configured Ollama endpoint, vlm_host first, deduplicated."""
+        raw = [self.vlm_host] + self.vlm_extra_hosts.split(",")
+        seen: set[str] = set()
+        hosts: list[str] = []
+        for host in raw:
+            host = host.strip().rstrip("/")
+            if host and host not in seen:
+                seen.add(host)
+                hosts.append(host)
+        return hosts
 
     def active_classes(self) -> list[int]:
         """COCO ids to ask the detector for, per the include_* switches."""

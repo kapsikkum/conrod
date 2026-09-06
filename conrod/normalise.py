@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from . import marques
+from . import marques, vlm_providers
 from .config import Settings
 
 PROMPT = """You are tidying up vehicle identifications made by a computer
@@ -309,9 +309,10 @@ def canonical(readings, settings: Settings, *,
     owns_client = client is None
     client = client or httpx.Client(timeout=settings.vlm_timeout)
     try:
-        resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
-                           timeout=settings.vlm_timeout)
-        resp.raise_for_status()
+        # Through the same host pool describe() uses, so a reconciliation
+        # call and a per-crop call never both land on a busy host while an
+        # idle second GPU sits unused.
+        resp = vlm_providers.ollama_request(settings, payload, client)
         data = resp.json()
         body = (data.get("response") or "").strip() or (data.get("thinking") or "")
         parsed = json.loads(body)

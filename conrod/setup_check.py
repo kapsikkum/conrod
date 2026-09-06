@@ -174,33 +174,57 @@ def inspect(settings: Settings) -> Environment:
                 f"{settings.vlm_model} via {name}", required=False))
         return env
 
-    reachable, models = _ollama_status(settings)
+    status = _ollama_status(settings)
+    hosts = list(status)
+    reachable = [h for h in hosts if status[h] is not None]
+    unreachable = [h for h in hosts if status[h] is None]
+
     if not reachable:
         env.checks.append(Check(
             "ollama", "Ollama", False,
-            f"not reachable at {settings.vlm_host}. Without it the app still "
+            f"not reachable at {', '.join(hosts)}. Without it the app still "
             "reads plates, numbers and text, but cannot identify make, model, "
             "colour or team.",
             required=False, link=OLLAMA_DOWNLOAD))
         return env
 
-    env.checks.append(Check("ollama", "Ollama", True, "running"))
-    has_model = settings.vlm_model in models or f"{settings.vlm_model}:latest" in models
+    if unreachable:
+        # Some, not all -- the scan can still run, just on fewer GPUs than
+        # configured, and that is worth saying rather than reading as
+        # "everything is fine" next to a scan that is slower than expected.
+        env.checks.append(Check(
+            "ollama", "Ollama", True,
+            f"running on {', '.join(reachable)} -- not reachable at "
+            f"{', '.join(unreachable)}, so crops will not be sent there"))
+    else:
+        env.checks.append(Check(
+            "ollama", "Ollama", True,
+            "running" if len(hosts) == 1 else f"running on {', '.join(hosts)}"))
+
+    missing = [h for h in reachable
+              if settings.vlm_model not in status[h]
+              and f"{settings.vlm_model}:latest" not in status[h]]
+    has_model = not missing
     env.checks.append(Check(
         "vlm", "Vision model", has_model,
         f"{settings.vlm_model}" if has_model
-        else f"{settings.vlm_model} not installed — about 6 GB to download",
+        else f"{settings.vlm_model} missing on {', '.join(missing)} — about 6 GB to download",
         required=False, fix=None if has_model else "pull_model"))
     return env
 
 
-def _ollama_status(settings: Settings) -> tuple[bool, set[str]]:
-    try:
-        resp = httpx.get(f"{settings.vlm_host}/api/tags", timeout=4.0)
-        resp.raise_for_status()
-        return True, {m.get("name", "") for m in resp.json().get("models", [])}
-    except Exception:
-        return False, set()
+def _ollama_status(settings: Settings) -> dict[str, set[str] | None]:
+    """Every configured host's installed models, or None where it could not
+    be reached at all."""
+    status: dict[str, set[str] | None] = {}
+    for host in settings.ollama_hosts():
+        try:
+            resp = httpx.get(f"{host}/api/tags", timeout=4.0)
+            resp.raise_for_status()
+            status[host] = {m.get("name", "") for m in resp.json().get("models", [])}
+        except Exception:
+            status[host] = None
+    return status
 
 
 def ollama_binary() -> str | None:
@@ -212,33 +236,45 @@ def ollama_binary() -> str | None:
 
 
 def pull_model(settings: Settings, on_progress=None) -> bool:
-    """Pull the vision model, reporting progress lines as they arrive."""
-    try:
-        with httpx.stream("POST", f"{settings.vlm_host}/api/pull",
-                          json={"model": settings.vlm_model},
-                          timeout=None) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line or not on_progress:
-                    continue
-                import json
+    """Pull the vision model onto every configured Ollama host.
 
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                status = event.get("status", "")
-                total, done = event.get("total"), event.get("completed")
-                if total and done:
-                    on_progress({"status": status,
-                                 "percent": round(done / total * 100, 1)})
-                else:
-                    on_progress({"status": status})
-        return True
-    except Exception as exc:
-        if on_progress:
-            on_progress({"status": f"failed: {exc}", "error": True})
-        return False
+    A model pulled to vlm_host only and never to a newly added extra host
+    would fail every crop sent there with "model not found" -- indistinguishable,
+    from the Analyse screen, from that host being broken. Progress is
+    prefixed with the host once there is more than one, so which is still
+    downloading is visible rather than one bar that means nothing until
+    every host is done.
+    """
+    hosts = settings.ollama_hosts()
+    ok = True
+    for host in hosts:
+        prefix = f"{host}: " if len(hosts) > 1 else ""
+        try:
+            with httpx.stream("POST", f"{host}/api/pull",
+                              json={"model": settings.vlm_model},
+                              timeout=None) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line or not on_progress:
+                        continue
+                    import json
+
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    status = event.get("status", "")
+                    total, done = event.get("total"), event.get("completed")
+                    if total and done:
+                        on_progress({"status": prefix + status,
+                                     "percent": round(done / total * 100, 1)})
+                    else:
+                        on_progress({"status": prefix + status})
+        except Exception as exc:
+            ok = False
+            if on_progress:
+                on_progress({"status": f"{prefix}failed: {exc}", "error": True})
+    return ok
 
 
 def download_weights(settings: Settings, on_progress=None) -> bool:

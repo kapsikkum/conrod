@@ -207,20 +207,29 @@ def check_available(settings: Settings) -> None:
 
 
 def _check_ollama(settings: Settings) -> None:
-    try:
-        resp = httpx.get(f"{settings.vlm_host}/api/tags", timeout=5.0)
-        resp.raise_for_status()
-    except Exception as exc:
-        raise VLMUnavailable(
-            f"Cannot reach Ollama at {settings.vlm_host}. Is it running?"
-        ) from exc
+    """Every configured host, not just the first.
 
-    names = {m.get("name", "") for m in resp.json().get("models", [])}
-    if settings.vlm_model not in names and f"{settings.vlm_model}:latest" not in names:
-        raise VLMUnavailable(
-            f"Ollama has no model '{settings.vlm_model}'. "
-            f"Pull it with:  ollama pull {settings.vlm_model}"
-        )
+    A host silently sitting out a scan looks identical to it doing its
+    share -- the crops it should have taken just go to the others instead,
+    slower than expected and with no error anywhere. Checked up front so
+    that is a message now, not a shoot that quietly ran on one GPU instead
+    of two.
+    """
+    problems = []
+    for host in settings.ollama_hosts():
+        try:
+            resp = httpx.get(f"{host}/api/tags", timeout=5.0)
+            resp.raise_for_status()
+        except Exception:
+            problems.append(f"{host}: not reachable. Is Ollama running there?")
+            continue
+        names = {m.get("name", "") for m in resp.json().get("models", [])}
+        if settings.vlm_model not in names and f"{settings.vlm_model}:latest" not in names:
+            problems.append(
+                f"{host}: no model '{settings.vlm_model}'. "
+                f"Pull it there with:  ollama pull {settings.vlm_model}")
+    if problems:
+        raise VLMUnavailable("; ".join(problems))
 
 
 # What each kind of Anthropic credential looks like. Used to catch the

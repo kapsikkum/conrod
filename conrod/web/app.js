@@ -388,6 +388,12 @@ const SETTING_GROUPS = [
            + `e.g. ${MODEL_EXAMPLES[s.vlm_provider] || "qwen2.5vl:7b"}.`],
     ["vlm_host", "Ollama address", "text", null, "Where Ollama is listening.",
       (s) => s.vlm_provider === "ollama"],
+    ["vlm_extra_hosts", "More Ollama machines", "text", null,
+      "Comma separated, e.g. a second GPU on the network: " +
+      "http://squareeyes:11434. A crop goes to whichever configured host is " +
+      "free, so a second GPU adds real throughput -- how much depends on how " +
+      "fast it is next to the first.",
+      (s) => s.vlm_provider === "ollama"],
     ["vlm_api_key", "API key", "password", null,
       (s) => `Your ${PROVIDER_NAMES[s.vlm_provider]} key. Kept locally, in settings.json.`,
       (s) => s.vlm_provider && s.vlm_provider !== "ollama"],
@@ -428,7 +434,9 @@ const SETTING_GROUPS = [
     ["write_caption", "Also write a caption", "bool", null, ""],
     ["keyword_prefix", "Keyword prefix", "text", null, "e.g. TA: to mark machine-written keywords."],
     ["analysis_workers", "Analysis threads", "number", null,
-      "3 measured 1.6x faster than 1. More than 4 wins nothing on 8 GB of VRAM."],
+      "3 measured 1.6x faster than 1. More than 4 wins nothing on one GPU with " +
+      "8 GB of VRAM -- with more than one Ollama machine configured, set this " +
+      "to at least the number of machines so more than one can work at once."],
   ]],
 ];
 

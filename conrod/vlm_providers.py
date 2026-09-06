@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import email.utils
 import json
+import queue
 import random
 import threading
 import time
@@ -284,6 +285,85 @@ def call(settings: Settings, *, prompt: str, images: list[str], schema: dict,
     return answer
 
 
+# ── multiple Ollama hosts ────────────────────────────────────────
+# One machine's GPU is the common case, and vlm_host alone still describes
+# it exactly as before. vlm_extra_hosts adds more -- typically a second GPU
+# elsewhere on the network -- and everything below is what lets several
+# analysis workers actually use them at once instead of queuing behind one.
+
+
+class HostPool:
+    """Hands out an Ollama host to whichever worker asks, one at a time per
+    host.
+
+    Ollama serialises generation on a single instance (OLLAMA_NUM_PARALLEL
+    defaults to 1), so a request already in flight to a host means that
+    host's GPU is busy. Backed by a queue pre-loaded with one token per host:
+    acquire() blocks until a host's token is available, release() puts it
+    back. A faster host's token comes back sooner and is handed out again
+    sooner, so it naturally does more of the work than a slow one -- nothing
+    here needs to know or be told which host that is.
+    """
+
+    def __init__(self, hosts: list[str]) -> None:
+        self._free: "queue.Queue[str]" = queue.Queue()
+        for host in hosts:
+            self._free.put(host)
+
+    def acquire(self) -> str:
+        return self._free.get()
+
+    def release(self, host: str) -> None:
+        self._free.put(host)
+
+
+_host_pools: dict[tuple[str, ...], HostPool] = {}
+_host_pools_lock = threading.Lock()
+
+
+def _pool_for(settings: Settings) -> HostPool:
+    """The shared pool for this exact set of hosts.
+
+    Keyed by the host list itself, not created fresh per call: the whole
+    point is that concurrent workers contend over the *same* pool of tokens,
+    so a rebuild-per-call would let every worker think every host was free.
+    """
+    hosts = tuple(settings.ollama_hosts())
+    with _host_pools_lock:
+        pool = _host_pools.get(hosts)
+        if pool is None:
+            pool = HostPool(list(hosts))
+            _host_pools[hosts] = pool
+        return pool
+
+
+def ollama_request(settings: Settings, payload: dict, client: httpx.Client) -> httpx.Response:
+    """POST to whichever configured Ollama host is free.
+
+    Shared by every direct Ollama caller (per-crop describe, burst read, name
+    reconciliation) so they draw from one pool of hosts rather than each
+    picking on its own -- otherwise two callers could both land on a busy
+    host while an idle second GPU sat unused.
+
+    The connect timeout is short and separate from the read timeout: a host
+    that is merely slow to answer (loading a model, mid-generation) should
+    get the full vlm_timeout, but a host that is unreachable -- powered off,
+    off the network -- is a LAN round trip away from saying so and should not
+    hold a pool slot, and every other worker's crops, for the same long
+    timeout a real answer might need.
+    """
+    pool = _pool_for(settings)
+    host = pool.acquire()
+    try:
+        resp = client.post(
+            f"{host}/api/generate", json=payload,
+            timeout=httpx.Timeout(settings.vlm_timeout, connect=5.0))
+        resp.raise_for_status()
+        return resp
+    finally:
+        pool.release(host)
+
+
 def _ollama(settings: Settings, prompt: str, images: list[str], schema: dict,
            num_predict: int, client: httpx.Client) -> dict:
     payload = {
@@ -298,9 +378,7 @@ def _ollama(settings: Settings, prompt: str, images: list[str], schema: dict,
     # worker, and nothing meters a program talking to itself. Ollama blocks
     # while it loads a model rather than refusing, so there is nothing here
     # worth waiting out -- see OllamaIsLeftAlone in tests/test_rate_limits.
-    resp = client.post(f"{settings.vlm_host}/api/generate", json=payload,
-                       timeout=settings.vlm_timeout)
-    resp.raise_for_status()
+    resp = ollama_request(settings, payload, client)
     data = resp.json()
     # Reasoning models (qwen3-vl, for one) put the answer in "thinking" and
     # leave "response" empty even with think disabled.
